@@ -369,8 +369,10 @@ def cmd_send_usage(_args):
         config = load_config()
         secret = load_secret(config["kvmHost"])
         post(config["kvmHost"], "/push/v1/usage", build_usage_payload(), secret, config["deviceId"], timeout=10)
-    except Exception:
-        print("kvm-ai-monitor: usage push failed", file=sys.stderr)
+    except Exception as error:
+        # Exceptions reaching here are config/Keychain-lookup/transport errors whose text never
+        # contains payload or credential data.
+        print(f"kvm-ai-monitor: usage push failed: {error}", file=sys.stderr)
         sys.exit(1)
 
 
@@ -384,8 +386,8 @@ def cmd_send_activity(args):
         post(config["kvmHost"], "/push/v1/activity", payload, secret, config["deviceId"], timeout=3)
         if args.event == "active":
             mark_activity_sent()
-    except Exception:
-        print("kvm-ai-monitor: activity push failed", file=sys.stderr)
+    except Exception as error:
+        print(f"kvm-ai-monitor: activity push failed: {error}", file=sys.stderr)
         sys.exit(1)
 
 

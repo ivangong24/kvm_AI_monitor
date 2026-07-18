@@ -50,8 +50,10 @@ leave the monitored Mac; only whitelisted aggregate fields reach the KVM.
 ## Transport
 
 - Public URL: `https://<comet-address>/extras/ai-usage/push/v1/<endpoint>`.
-- nginx location `/extras/ai-usage/push/` proxies to the agent **without** `loc-login.conf`
-  (no Comet admin session); authentication is the HMAC signature below.
+- nginx location `/extras/ai-usage/push/` proxies to the agent **without** `loc-login.conf` and
+  with `auth_request off;` — the GL firmware's `gl.ctx-server.conf` enables `auth_request
+  /auth_check;` at the server level, so every unauthenticated location must opt out explicitly.
+  Authentication for pushes is the HMAC signature below.
 - The Comet uses a self-signed certificate; clients send `curl -k` style requests. HMAC provides
   integrity/authenticity independent of TLS; payloads contain only aggregate numbers.
 - The agent's HTTP server receives the path with the `/extras/ai-usage` prefix stripped, i.e.
