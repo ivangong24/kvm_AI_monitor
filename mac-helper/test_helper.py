@@ -184,10 +184,9 @@ class PayloadNonDisclosureTests(HomeIsolatedTestCase):
         with (project_dir / "a.jsonl").open("w") as stream:
             stream.write(json.dumps(fixture_event(DAY0, "msg-1", 100, 50)) + "\n")
 
-    @mock.patch("kvm_ai_push.claude_usage_cli_limits", return_value=[])
-    @mock.patch("kvm_ai_push.keychain_oauth_limits", return_value=[])
+    @mock.patch("kvm_ai_push.account_limits", return_value=[])
     @mock.patch("kvm_ai_push.claude_auth_status", return_value=(True, "Max"))
-    def test_payload_has_only_whitelisted_fields_and_no_planted_secrets(self, _auth, _keychain, _cli):
+    def test_payload_has_only_whitelisted_fields_and_no_planted_secrets(self, _auth, _limits):
         payload = helper.build_usage_payload()
         encoded = json.dumps(payload)
 
@@ -210,17 +209,58 @@ class PayloadNonDisclosureTests(HomeIsolatedTestCase):
                 {"date", "totalTokens", "inputTokens", "outputTokens", "cacheReadTokens", "cacheCreationTokens"},
             )
 
-    @mock.patch("kvm_ai_push.claude_usage_cli_limits", return_value=[])
-    @mock.patch("kvm_ai_push.keychain_oauth_limits", return_value=[])
+    @mock.patch("kvm_ai_push.account_limits", return_value=[])
     @mock.patch("kvm_ai_push.claude_auth_status", return_value=(None, None))
-    def test_optional_fields_are_omitted_when_unavailable(self, _auth, _keychain, _cli):
+    def test_optional_fields_are_omitted_when_unavailable(self, _auth, _limits):
         payload = helper.build_usage_payload()
         self.assertNotIn("loggedIn", payload)
         self.assertNotIn("plan", payload)
         self.assertNotIn("limits", payload)
 
 
+# Shape observed live from api.anthropic.com/api/oauth/usage on 2026-07-18: the structured
+# `limits` array is authoritative; the top-level five_hour/seven_day buckets are legacy.
+STRUCTURED_RESPONSE = {
+    "five_hour": {"utilization": 15.0, "resets_at": "2026-07-19T02:30:00+00:00"},
+    "seven_day": {"utilization": 13.0, "resets_at": "2026-07-21T12:00:00+00:00"},
+    "seven_day_opus": None,
+    "extra_usage": {"is_enabled": True, "utilization": 4.54},
+    "limits": [
+        {"kind": "session", "group": "session", "percent": 15, "severity": "normal",
+         "resets_at": "2026-07-19T02:30:00+00:00", "scope": None, "is_active": False},
+        {"kind": "weekly_all", "group": "weekly", "percent": 13, "severity": "normal",
+         "resets_at": "2026-07-21T12:00:00+00:00", "scope": None, "is_active": False},
+        {"kind": "weekly_scoped", "group": "weekly", "percent": 16, "severity": "normal",
+         "resets_at": "2026-07-21T12:00:00+00:00",
+         "scope": {"model": {"id": None, "display_name": "Fable"}, "surface": None},
+         "is_active": True},
+    ],
+    "spend": {"percent": 5, "enabled": True},
+}
+
+
 class OAuthUsageMappingTests(unittest.TestCase):
+    def test_structured_limits_array_is_preferred_and_fully_mapped(self):
+        limits = helper.oauth_usage_limits(STRUCTURED_RESPONSE)
+        by_label = {entry["label"]: entry for entry in limits}
+        self.assertEqual(set(by_label), {"Current session", "Weekly limit", "Weekly (Fable)"})
+        self.assertEqual(by_label["Current session"]["usedPercent"], 15)
+        self.assertEqual(by_label["Current session"]["windowMinutes"], 300)
+        self.assertEqual(by_label["Weekly limit"]["usedPercent"], 13)
+        self.assertEqual(by_label["Weekly limit"]["windowMinutes"], 10080)
+        self.assertEqual(by_label["Weekly limit"]["resetsAt"], "2026-07-21T12:00:00+00:00")
+        self.assertEqual(by_label["Weekly (Fable)"]["usedPercent"], 16)
+        self.assertEqual(by_label["Weekly (Fable)"]["windowMinutes"], 10080)
+
+    def test_structured_limits_skips_malformed_entries_and_clamps(self):
+        limits = helper.structured_limits({"limits": [
+            None, "text", {"kind": "session", "percent": None},
+            {"kind": "weekly_all", "group": "weekly", "percent": 250},
+            {"kind": "unknown_kind", "group": "monthly", "percent": 10},
+        ]})
+        self.assertEqual(limits, [{"label": "Weekly limit", "usedPercent": 100,
+                                   "windowMinutes": 10080}])
+
     def test_maps_session_and_weekly_buckets_defensively(self):
         limits = helper.oauth_usage_limits({
             "five_hour": {"utilization": 34.2, "resets_at": "2026-07-18T04:00:00Z"},
@@ -244,6 +284,53 @@ class OAuthUsageMappingTests(unittest.TestCase):
         self.assertEqual(helper.extract_access_token({"claudeAiOauth": {"accessToken": "tok-b"}}), "tok-b")
         self.assertIsNone(helper.extract_access_token({"nothing": "here"}))
         self.assertIsNone(helper.extract_access_token("not-a-dict"))
+
+
+class AccountLimitsCacheTests(HomeIsolatedTestCase):
+    LIMITS = [{"label": "Weekly limit", "usedPercent": 13, "windowMinutes": 10080}]
+
+    @mock.patch("kvm_ai_push.keychain_oauth_limits")
+    def test_successful_fetch_is_cached_and_not_refetched_within_window(self, fetch):
+        fetch.return_value = self.LIMITS
+        self.assertEqual(helper.account_limits(), self.LIMITS)
+        self.assertEqual(helper.account_limits(), self.LIMITS)
+        self.assertEqual(fetch.call_count, 1)
+
+    @mock.patch("kvm_ai_push.keychain_oauth_limits")
+    def test_failed_fetch_reuses_last_good_limits(self, fetch):
+        fetch.return_value = self.LIMITS
+        helper.account_limits()
+        cache = json.loads(helper.limits_cache_path().read_text())
+        cache["attemptedAt"] = time.time() - helper.LIMITS_MIN_FETCH_SECONDS - 1
+        helper.limits_cache_path().write_text(json.dumps(cache))
+        fetch.return_value = []  # e.g. HTTP 429 from the usage endpoint
+        self.assertEqual(helper.account_limits(), self.LIMITS)
+        self.assertEqual(fetch.call_count, 2)
+
+    @mock.patch("kvm_ai_push.keychain_oauth_limits")
+    def test_expired_cache_is_not_served(self, fetch):
+        fetch.return_value = self.LIMITS
+        helper.account_limits()
+        stale = time.time() - helper.LIMITS_MAX_AGE_SECONDS - 1
+        helper.limits_cache_path().write_text(
+            json.dumps({"fetchedAt": stale, "attemptedAt": stale, "limits": self.LIMITS}))
+        fetch.return_value = []
+        self.assertEqual(helper.account_limits(), [])
+
+    @mock.patch("kvm_ai_push.keychain_oauth_limits")
+    def test_failed_attempts_are_throttled_too(self, fetch):
+        fetch.return_value = []
+        self.assertEqual(helper.account_limits(), [])
+        self.assertEqual(helper.account_limits(), [])
+        self.assertEqual(fetch.call_count, 1)
+
+    def test_cache_file_contains_only_whitelisted_fields(self):
+        with mock.patch("kvm_ai_push.keychain_oauth_limits", return_value=self.LIMITS):
+            helper.account_limits()
+        cache = json.loads(helper.limits_cache_path().read_text())
+        self.assertEqual(set(cache), {"fetchedAt", "attemptedAt", "limits"})
+        for entry in cache["limits"]:
+            self.assertTrue(set(entry) <= {"label", "usedPercent", "windowMinutes", "resetsAt"})
 
 
 if __name__ == "__main__":

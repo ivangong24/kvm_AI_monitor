@@ -140,7 +140,7 @@ def claude_auth_status():
         return None, None
 
 
-# --- adapter b: optional non-interactive usage command (best-effort, may not exist) -----
+# --- adapter b: account limits from api.anthropic.com/api/oauth/usage -------------------
 
 def _bucket_percent(bucket):
     if not isinstance(bucket, dict):
@@ -164,12 +164,52 @@ def _bucket_reset(bucket):
 
 WEEKLY_KEY_HINTS = ("week", "seven_day", "sevenday", "7d", "7_day")
 SESSION_KEY_HINTS = ("session", "five_hour", "fivehour", "5h", "5_hour")
+WEEK_MINUTES = 7 * 24 * 60
+
+
+def structured_limits(payload):
+    """Parse the endpoint's `limits` array: the authoritative per-account session/weekly
+    entries (including model-scoped weekly limits) that the top-level buckets don't cover."""
+    entries = payload.get("limits") if isinstance(payload, dict) else None
+    if not isinstance(entries, list):
+        return []
+    limits = []
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        percent = number(item.get("percent"))
+        if percent is None:
+            continue
+        kind = item.get("kind")
+        group = item.get("group")
+        if kind == "session" or group == "session":
+            label, minutes = "Current session", 300
+        elif kind == "weekly_all":
+            label, minutes = "Weekly limit", WEEK_MINUTES
+        elif group == "weekly":
+            scope = item.get("scope") if isinstance(item.get("scope"), dict) else {}
+            model = scope.get("model") if isinstance(scope.get("model"), dict) else {}
+            name = model.get("display_name")
+            label = f"Weekly ({name})" if isinstance(name, str) and name else "Weekly (model)"
+            minutes = WEEK_MINUTES
+        else:
+            continue
+        entry = {"label": label, "usedPercent": max(0, min(100, percent)), "windowMinutes": minutes}
+        resets_at = item.get("resets_at")
+        if isinstance(resets_at, str) and resets_at:
+            entry["resetsAt"] = resets_at
+        limits.append(entry)
+    return limits
 
 
 def oauth_usage_limits(payload):
-    """Map an unknown-shaped usage payload onto the spec's limit labels, defensively."""
+    """Map a usage payload onto the spec's limit labels: the structured `limits` array when
+    present, otherwise the legacy top-level bucket keys, matched defensively by name."""
     if not isinstance(payload, dict):
         return []
+    limits = structured_limits(payload)
+    if limits:
+        return limits
     session_bucket = weekly_bucket = weekly_opus_bucket = None
     for key, value in payload.items():
         if not isinstance(value, dict) or not isinstance(key, str):
@@ -200,19 +240,6 @@ def oauth_usage_limits(payload):
             entry["resetsAt"] = resets_at
         limits.append(entry)
     return limits
-
-
-def claude_usage_cli_limits():
-    if not shutil.which("claude"):
-        return []
-    try:
-        raw = run(("claude", "usage", "--json"), 10)
-        if not raw.strip():
-            return []
-        data = json.loads(raw)
-    except Exception:
-        return []
-    return oauth_usage_limits(data)
 
 
 # --- adapter c: Keychain OAuth token -> api.anthropic.com/api/oauth/usage ----------------
@@ -258,6 +285,57 @@ def keychain_oauth_limits():
         # Best-effort scrub: the token and raw response live only in these locals and are
         # never printed, logged, or written anywhere.
         token = None
+
+
+# --- limits cache: the usage endpoint rate-limits aggressively (HTTP 429), so fetch at
+# --- most once per LIMITS_MIN_FETCH_SECONDS and reuse the last good result on failure.
+# --- The cache file holds only already-whitelisted limit entries plus timestamps.
+
+LIMITS_MIN_FETCH_SECONDS = 240
+LIMITS_MAX_AGE_SECONDS = 24 * 3600
+
+
+def limits_cache_path():
+    return config_dir() / "limits-cache.json"
+
+
+def read_limits_cache():
+    try:
+        data = json.loads(limits_cache_path().read_text())
+        if not isinstance(data, dict) or not isinstance(data.get("limits"), list):
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def write_limits_cache(cache):
+    try:
+        config_dir().mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = limits_cache_path()
+        path.write_text(json.dumps(cache))
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+
+
+def account_limits():
+    now = time.time()
+    cache = read_limits_cache()
+    if cache is not None:
+        fetched_age = now - (number(cache.get("fetchedAt")) or 0)
+        attempted_age = now - (number(cache.get("attemptedAt")) or 0)
+        if 0 <= attempted_age < LIMITS_MIN_FETCH_SECONDS:
+            return cache["limits"] if 0 <= fetched_age < LIMITS_MAX_AGE_SECONDS else []
+    limits = keychain_oauth_limits()
+    if limits:
+        write_limits_cache({"fetchedAt": now, "attemptedAt": now, "limits": limits})
+        return limits
+    if cache is not None and 0 <= now - (number(cache.get("fetchedAt")) or 0) < LIMITS_MAX_AGE_SECONDS:
+        write_limits_cache({**cache, "attemptedAt": now})
+        return cache["limits"]
+    write_limits_cache({"fetchedAt": 0, "attemptedAt": now, "limits": []})
+    return []
 
 
 # --- adapter d: local daily token totals (faithful port of ssh_collector.claude_daily) ---
@@ -314,7 +392,7 @@ def now_iso():
 
 def build_usage_payload():
     logged_in, plan = claude_auth_status()
-    limits = claude_usage_cli_limits() or keychain_oauth_limits()
+    limits = account_limits()
     payload = {"schemaVersion": SCHEMA_VERSION, "provider": PROVIDER, "collectedAt": now_iso()}
     if logged_in is not None:
         payload["loggedIn"] = logged_in

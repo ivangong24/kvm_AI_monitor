@@ -109,6 +109,16 @@ class PushReceiverTests(unittest.TestCase):
         self.assertNotIn("session-abc-123", encoded)
         self.assertIn("Max", encoded)
 
+    def test_limits_retained_when_next_push_lacks_them(self):
+        device = self.store.create("laptop")
+        limits = [{"label": "Weekly limit", "usedPercent": 13, "windowMinutes": 10080}]
+        self.assertTrue(self.receiver.handle_usage(
+            device, {"schemaVersion": 1, "provider": "claude", "loggedIn": True, "limits": limits}))
+        self.assertTrue(self.receiver.handle_usage(
+            device, {"schemaVersion": 1, "provider": "claude", "loggedIn": True}))
+        overlay = self.receiver.usage_overlay()["claude"]
+        self.assertEqual(overlay["limits"][0]["usedPercent"], 13)
+
     def test_daily_date_window_filtering(self):
         device = self.store.create("laptop")
         today = datetime.now().astimezone().date()

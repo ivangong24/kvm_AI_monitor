@@ -302,6 +302,13 @@ class PushReceiver:
                 value = _finite(item.get(key))
                 entry[key] = value if value is not None and value >= 0 else 0
             daily.append(entry)
+        if not limits:
+            # A device whose limits fetch transiently failed still pushes plan/daily data;
+            # keep the last known limits instead of blanking the display's quota bars.
+            with self.lock:
+                previous = self.usage.get((device["id"], provider))
+            if previous and isinstance(previous.get("limits"), list):
+                limits = previous["limits"]
         snapshot = {
             "collectedAt": _valid_iso(body.get("collectedAt")),
             "plan": plan,
