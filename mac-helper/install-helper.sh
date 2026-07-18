@@ -4,36 +4,49 @@ set -euo pipefail
 PROJECT_DIR="${0:A:h:h}"
 KVM_HOST=""
 DEVICE_ID=""
+UPDATE=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --kvm) KVM_HOST="$2"; shift 2 ;;
     --device) DEVICE_ID="$2"; shift 2 ;;
+    --update) UPDATE=1; shift ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
 
+CONFIG_DIR="$HOME/.kvm-ai-monitor"
+if [[ "$UPDATE" -eq 1 && ( -z "$KVM_HOST" || -z "$DEVICE_ID" ) ]]; then
+  if [[ ! -f "$CONFIG_DIR/helper.json" ]]; then
+    echo "--update requires an existing installation ($CONFIG_DIR/helper.json not found)." >&2
+    exit 1
+  fi
+  KVM_HOST=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["kvmHost"])' "$CONFIG_DIR/helper.json")
+  DEVICE_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["deviceId"])' "$CONFIG_DIR/helper.json")
+fi
+
 if [[ -z "$KVM_HOST" || -z "$DEVICE_ID" ]]; then
-  echo "Usage: install-helper.sh --kvm <host-or-ip> --device <device-id>" >&2
+  echo "Usage: install-helper.sh --kvm <host-or-ip> --device <device-id> | --update" >&2
   exit 1
 fi
 
 APP_SUPPORT="$HOME/Library/Application Support/kvm-ai-monitor"
-CONFIG_DIR="$HOME/.kvm-ai-monitor"
 LABEL="com.kvm-ai-monitor.helper"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 
-read -r -s "SECRET?One-time device secret from the KVM AI Usage page: "
-echo
-if [[ -z "$SECRET" ]]; then
-  echo "Secret cannot be empty." >&2
-  exit 1
-fi
+if [[ "$UPDATE" -eq 0 ]]; then
+  read -r -s "SECRET?One-time device secret from the KVM AI Usage page: "
+  echo
+  if [[ -z "$SECRET" ]]; then
+    echo "Secret cannot be empty." >&2
+    exit 1
+  fi
 
-# Item created by the security CLI, so scheduled runs of `security find-generic-password`
-# can read it back without a GUI consent prompt.
-security add-generic-password -a device -s "kvm-ai-monitor-push:$KVM_HOST" -w "$SECRET" -U >/dev/null
-unset SECRET
+  # Item created by the security CLI, so scheduled runs of `security find-generic-password`
+  # can read it back without a GUI consent prompt.
+  security add-generic-password -a device -s "kvm-ai-monitor-push:$KVM_HOST" -w "$SECRET" -U >/dev/null
+  unset SECRET
+fi
 
 mkdir -p "$CONFIG_DIR"
 chmod 700 "$CONFIG_DIR"

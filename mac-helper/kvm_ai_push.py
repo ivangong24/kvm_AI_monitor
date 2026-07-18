@@ -235,9 +235,10 @@ def extract_access_token(data):
 def keychain_oauth_limits():
     token = None
     try:
+        # The first read shows a Keychain consent dialog; give the user time to answer it.
         result = subprocess.run(
             ("/usr/bin/security", "find-generic-password", "-s", "Claude Code-credentials", "-w"),
-            capture_output=True, text=True, timeout=5, check=False,
+            capture_output=True, text=True, timeout=90, check=False,
         )
         if result.returncode != 0 or not result.stdout.strip():
             return []

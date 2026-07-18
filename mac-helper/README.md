@@ -22,6 +22,7 @@ aggregate schema, HMAC-signs it, and pushes it to the KVM. Nothing here opens a 
 
 ```bash
 npm run helper:install -- --kvm <kvm-host-or-ip> --device <device-id>   # enroll + load LaunchAgent
+npm run helper:install -- --update                                     # refresh installed files after git pull (no secret needed)
 npm run helper:hooks                                                   # add Claude Code activity hooks
 npm run helper:status                                                  # audit what is configured/sent
 npm run helper:uninstall                                               # stop + remove installed files
