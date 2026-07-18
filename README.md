@@ -1,6 +1,7 @@
 # KVM AI Monitor
 
-Current unresolved work and the recommended next architecture are recorded in
+The project is feature-complete for its supported providers; the design history and current
+status are recorded in
 [`docs/PROJECT_CHECKPOINT_2026-07-18.md`](docs/PROJECT_CHECKPOINT_2026-07-18.md).
 
 KVM AI Monitor is a GL.iNet Comet Pro extension that discovers an authorized computer, reads AI

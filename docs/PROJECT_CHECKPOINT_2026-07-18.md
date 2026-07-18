@@ -1,8 +1,12 @@
 # Project Checkpoint - 2026-07-18
 
-This document is the durable handoff point for unfinished KVM AI Monitor work. It intentionally
+This document is the chronological design and status record for KVM AI Monitor. It intentionally
 contains no account email, organization ID, password, session token, OAuth token, cookie, private
 key, prompt, response, project name, or local network address.
+
+> **Status:** as of the final update at the end of this document, there is no unresolved work.
+> Earlier sections (including "Unresolved requirements") describe the state at the moment they
+> were written and are kept as history.
 
 ## Current deployed architecture
 
@@ -237,3 +241,32 @@ animation (flash overlay copy mtime frozen while the tmpfs copy updates), `lastE
 event queue draining immediately when working state ends, and clean transition back to the static
 wallpaper. The GUI's `AutoLockTime` is 60 s but `AlwaysOn` is true, so screen-off was ruled out as
 the blackout cause.
+
+---
+
+## Final status - 2026-07-18: no unresolved work
+
+Every issue tracked earlier in this document is resolved and verified on the deployed KVM:
+
+- Claude account usage — plan, current-session, weekly, and model-scoped weekly limits — reaches
+  the KVM through the enrolled-device helper while the OAuth credential never leaves the Mac's
+  Keychain (the original first milestone of the push architecture).
+- The usage-endpoint rate limit, the ignored structured limits array, wallpaper blackouts,
+  animation stalls, and the flash-wear risk are all fixed, deployed, and verified live.
+- Exact per-turn working state arrives from Claude Code hooks on enrolled devices; SSH activity
+  devices cover presence detection for other same-account machines.
+
+What remains is deliberately out of scope rather than unresolved:
+
+- **Provider limitations.** Copilot, Gemini, and Grok expose no supported consumer-subscription
+  quota interface for a third-party appliance, so those providers report installation and
+  authentication detection only. No provider exposes activity from arbitrary un-enrolled devices;
+  cross-device animation therefore covers explicitly enrolled devices only.
+- **Design decisions.** Provider OAuth sign-in on the KVM itself (client registration, callback,
+  token storage on the appliance) is intentionally not implemented; credentials stay on enrolled
+  computers. The helper never refreshes the Claude OAuth token itself — if Claude Code sits
+  unused on the enrolled Mac past token expiry, limit updates pause (the 24 h cache covers normal
+  gaps) until Claude Code next refreshes it.
+
+There is no open bug list and no planned next milestone. Future work, if any, would start with a
+new provider gaining a supported quota interface.
