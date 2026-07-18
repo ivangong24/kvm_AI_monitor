@@ -1,0 +1,1143 @@
+#!/usr/bin/env python3
+"""On-device AI usage wallpaper renderer and local control API."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import threading
+import time
+from datetime import datetime, timezone
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+from PIL import Image, ImageColor, ImageDraw, ImageFont
+from push_receiver import DeviceStore, PushReceiver
+from ssh_collector import SshCollector, build_usage_snapshot
+
+
+ROOT = Path(os.environ.get("KVM_AI_USAGE_ROOT", "/etc/kvmd/user/ai-usage"))
+CONFIG_PATH = Path(os.environ.get("KVM_AI_USAGE_CONFIG", ROOT / "config.json"))
+DEVICES_PATH = Path(os.environ.get("KVM_AI_USAGE_DEVICES", ROOT / "devices.json"))
+PUSH_STATE_PATH = Path(os.environ.get("KVM_AI_USAGE_PUSH_STATE", ROOT / "push-state.json"))
+WALLPAPER_PATH = Path(
+    os.environ.get("KVM_AI_USAGE_WALLPAPER", "/tmp/kvm-ai-usage-wallpaper.png")
+)
+ANIMATION_FRAMES_ROOT = Path(
+    os.environ.get("KVM_AI_USAGE_ANIMATION_FRAMES", "/tmp")
+)
+PROVIDERS_PATH = Path(os.environ.get("KVM_AI_USAGE_PROVIDERS", ROOT / "providers"))
+INDEX_PATH = Path(os.environ.get("KVM_AI_USAGE_INDEX", ROOT / "index.html"))
+ICON_PATH = Path(os.environ.get("KVM_AI_USAGE_ICON", ROOT / "icon.svg"))
+SSH_KEY_PATH = Path(os.environ.get("KVM_AI_USAGE_SSH_KEY", ROOT / "device-key"))
+PORT = int(os.environ.get("KVM_AI_USAGE_PORT", "8199"))
+PUBLISH_ENABLED = os.environ.get("KVM_AI_USAGE_NO_PUBLISH") != "1"
+
+DEFAULT_CONFIG = {
+    "enabled": True,
+    "animateWorking": True,
+    "intervalSeconds": 60,
+    "deviceUser": "",
+    "deviceHost": "auto",
+    "devicePort": 22,
+    "activityHosts": "",
+    "selectedProvider": "claude",
+}
+MIN_INTERVAL = 30
+MAX_INTERVAL = 3600
+ACTIVE_WINDOW_SECONDS = 120
+ANIMATION_FRAME_COUNT = 60
+ANIMATION_ROTATION_SECONDS = 2.0
+ANIMATION_PUBLISH_FPS = 10
+ANIMATION_INTERVAL_SECONDS = 1 / ANIMATION_PUBLISH_FPS
+ANIMATION_RENDER_SCALE = 4
+WORKING_POLL_SECONDS = 5.0
+PUSH_BODY_LIMIT = 64 * 1024
+
+PROVIDERS = {
+    "claude": {
+        "name": "Claude Code", "brand": "CLAUDE", "subbrand": "CODE",
+        "background": "#0d1112", "text": "#f4f5f2", "muted": "#939b98",
+        "line": "#303637", "track": "#293031", "accent": "#d97757",
+        "secondary": "#53d59c", "logo": "claude.png",
+    },
+    "codex": {
+        "name": "Codex", "brand": "CODEX", "subbrand": "OPENAI",
+        "background": "#f5f5f2", "text": "#101312", "muted": "#68716e",
+        "line": "#cbd1ce", "track": "#dfe3e1", "accent": "#101312",
+        "secondary": "#10a37f", "logo": "codex.png",
+    },
+    "copilot": {
+        "name": "GitHub Copilot", "brand": "COPILOT", "subbrand": "GITHUB",
+        "background": "#f6f8fa", "text": "#24292f", "muted": "#68717c",
+        "line": "#d0d7de", "track": "#d8dee4", "accent": "#8534f3",
+        "secondary": "#fe4c25", "logo": "copilot.png", "wideLogo": True,
+    },
+    "gemini": {
+        "name": "Gemini CLI", "brand": "GEMINI", "subbrand": "CLI",
+        "background": "#f7f9fc", "text": "#202124", "muted": "#6c727b",
+        "line": "#d2d8e2", "track": "#e0e5ec", "accent": "#5684d1",
+        "secondary": "#9168c0", "logo": "gemini.png",
+    },
+    "grok": {
+        "name": "Grok Build", "brand": "GROK", "subbrand": "BUILD",
+        "background": "#050505", "text": "#f7f7f7", "muted": "#a0a0a0",
+        "line": "#353535", "track": "#292929", "accent": "#f7f7f7",
+        "secondary": "#8d99a1", "logo": "grok.png",
+    },
+}
+PROVIDER_IDS = frozenset(PROVIDERS)
+
+FONT_REGULAR = (
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/ttf-dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/DejaVuSans.ttf",
+)
+FONT_BOLD = (
+    "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/ttf-dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/DejaVuSans-Bold.ttf",
+)
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def parse_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def load_font(candidates: tuple[str, ...], size: int) -> ImageFont.ImageFont:
+    for candidate in candidates:
+        try:
+            return ImageFont.truetype(candidate, size=size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def compact_number(value: object) -> str:
+    try:
+        number = max(0.0, float(value or 0))
+    except (TypeError, ValueError):
+        number = 0
+    for divisor, suffix in ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K")):
+        if number >= divisor:
+            result = number / divisor
+            return f"{result:.1f}".rstrip("0").rstrip(".") + suffix
+    return str(int(number))
+
+
+def reset_label(value: object, now: datetime | None = None) -> str:
+    reset = parse_timestamp(value)
+    if reset is None:
+        return "WAITING FOR DATA"
+    current = now or datetime.now(timezone.utc)
+    minutes = max(0, round((reset - current).total_seconds() / 60))
+    if minutes >= 2880:
+        return f"RESETS IN {round(minutes / 1440)}D"
+    if minutes >= 120:
+        return f"RESETS IN {round(minutes / 60)}H"
+    return f"RESETS IN {minutes}M"
+
+
+def window_label(limit: dict[str, object] | None, fallback: str) -> str:
+    try:
+        minutes = int(limit.get("windowMinutes")) if limit else 0
+    except (TypeError, ValueError):
+        minutes = 0
+    if minutes and minutes % 10080 == 0:
+        return f"{minutes // 10080 * 7}-DAY WINDOW"
+    if minutes and minutes % 1440 == 0:
+        return f"{minutes // 1440}-DAY WINDOW"
+    if minutes and minutes % 60 == 0:
+        return f"{minutes // 60}-HOUR WINDOW"
+    return fallback
+
+
+def normalize_config(value: object) -> dict[str, object]:
+    raw = value if isinstance(value, dict) else {}
+    enabled = raw.get("enabled", DEFAULT_CONFIG["enabled"])
+    animate_working = raw.get("animateWorking", DEFAULT_CONFIG["animateWorking"])
+    interval = raw.get("intervalSeconds", DEFAULT_CONFIG["intervalSeconds"])
+    device_user = raw.get("deviceUser", DEFAULT_CONFIG["deviceUser"])
+    device_host = raw.get("deviceHost", DEFAULT_CONFIG["deviceHost"])
+    device_port = raw.get("devicePort", DEFAULT_CONFIG["devicePort"])
+    activity_hosts = raw.get("activityHosts", DEFAULT_CONFIG["activityHosts"])
+    selected_provider = raw.get("selectedProvider", DEFAULT_CONFIG["selectedProvider"])
+    try:
+        interval = int(interval)
+    except (TypeError, ValueError):
+        interval = DEFAULT_CONFIG["intervalSeconds"]
+    if not isinstance(enabled, bool):
+        enabled = DEFAULT_CONFIG["enabled"]
+    if not isinstance(animate_working, bool):
+        animate_working = DEFAULT_CONFIG["animateWorking"]
+    try:
+        device_port = int(device_port)
+    except (TypeError, ValueError):
+        device_port = DEFAULT_CONFIG["devicePort"]
+    if not isinstance(device_user, str) or not re.fullmatch(r"[A-Za-z0-9._-]{0,64}", device_user):
+        device_user = DEFAULT_CONFIG["deviceUser"]
+    if not isinstance(device_host, str) or not re.fullmatch(r"(?:auto|[A-Za-z0-9._:-]{1,253})", device_host):
+        device_host = DEFAULT_CONFIG["deviceHost"]
+    if not 1 <= device_port <= 65535:
+        device_port = DEFAULT_CONFIG["devicePort"]
+    if not isinstance(activity_hosts, str):
+        activity_hosts = DEFAULT_CONFIG["activityHosts"]
+    normalized_hosts = []
+    for host in activity_hosts.split(","):
+        host = host.strip()
+        if (host and host != "auto" and len(host) <= 253
+                and re.fullmatch(r"(?:[A-Za-z0-9._-]{1,64}@)?[A-Za-z0-9._:-]{1,253}", host)
+                and host not in normalized_hosts):
+            normalized_hosts.append(host)
+        if len(normalized_hosts) >= 8:
+            break
+    if selected_provider not in PROVIDER_IDS:
+        selected_provider = DEFAULT_CONFIG["selectedProvider"]
+    return {
+        "enabled": enabled,
+        "animateWorking": animate_working,
+        "intervalSeconds": min(MAX_INTERVAL, max(MIN_INTERVAL, interval)),
+        "deviceUser": device_user,
+        "deviceHost": device_host,
+        "devicePort": device_port,
+        "activityHosts": ", ".join(normalized_hosts),
+        "selectedProvider": selected_provider,
+    }
+
+
+def read_config() -> dict[str, object]:
+    try:
+        return normalize_config(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return dict(DEFAULT_CONFIG)
+
+
+def write_config(config: dict[str, object]) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix="config.", suffix=".tmp", dir=CONFIG_PATH.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(normalize_config(config), stream, indent=2)
+            stream.write("\n")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, CONFIG_PATH)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def find_provider(snapshot: dict[str, object], provider_id: str) -> dict[str, object]:
+    providers = snapshot.get("providers", [])
+    for provider in providers if isinstance(providers, list) else []:
+        if isinstance(provider, dict) and provider.get("id") == provider_id:
+            return provider
+    raise RuntimeError(f"usage response has no {PROVIDERS[provider_id]['name']} provider")
+
+
+def draw_text(draw: ImageDraw.ImageDraw, xy: tuple[int, int], text: str, font: ImageFont.ImageFont,
+              fill: str, anchor: str = "la") -> None:
+    draw.text(xy, text, font=font, fill=fill, anchor=anchor, spacing=0)
+
+
+def render_limit(draw: ImageDraw.ImageDraw, limit: dict[str, object] | None, y: int,
+                 title: str, window: str, bar_color: str, theme: dict[str, object]) -> None:
+    label_font = load_font(FONT_BOLD, 12)
+    value_font = load_font(FONT_BOLD, 23)
+    footer_font = load_font(FONT_BOLD, 9)
+    raw_percent = limit.get("usedPercent") if limit else None
+    try:
+        percent = min(100.0, max(0.0, float(raw_percent)))
+        has_percent = True
+    except (TypeError, ValueError):
+        percent = 0
+        has_percent = False
+
+    draw_text(draw, (222, y), title, label_font, str(theme["text"]), "la")
+    draw_text(draw, (465, y - 2), f"{round(percent)}%" if has_percent else "--", value_font,
+              str(theme["text"]), "ra")
+    bar_y = y + 29
+    draw.rectangle((222, bar_y, 465, bar_y + 9), fill=str(theme["track"]))
+    if has_percent and percent > 0:
+        width = max(1, round(243 * percent / 100))
+        draw.rectangle((222, bar_y, 222 + width - 1, bar_y + 9), fill=bar_color)
+    draw_text(draw, (222, y + 46), window, footer_font, str(theme["muted"]), "la")
+    draw_text(draw, (465, y + 46), reset_label(limit.get("resetsAt") if limit else None),
+              footer_font, str(theme["muted"]), "ra")
+
+
+def paste_provider_logo(image: Image.Image, provider_id: str, theme: dict[str, object]) -> None:
+    try:
+        logo = Image.open(PROVIDERS_PATH / str(theme["logo"])).convert("RGBA")
+        if theme.get("wideLogo"):
+            logo.thumbnail((112, 30), Image.Resampling.LANCZOS)
+            position = (15, 12 + (30 - logo.height) // 2)
+        else:
+            logo.thumbnail((27, 27), Image.Resampling.LANCZOS)
+            position = (15 + (27 - logo.width) // 2, 13 + (27 - logo.height) // 2)
+        image.paste(logo, position, logo)
+    except OSError:
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((15, 13, 41, 39), fill=str(theme["accent"]))
+
+
+def blend_color(foreground: str, background: str, strength: float) -> tuple[int, int, int]:
+    front = ImageColor.getrgb(foreground)
+    back = ImageColor.getrgb(background)
+    amount = max(0.0, min(1.0, strength))
+    return tuple(round(back[index] + (front[index] - back[index]) * amount) for index in range(3))
+
+
+def draw_activity_glyph(image: Image.Image, provider_id: str, center: tuple[int, int],
+                        frame: int, color: str, background: str, working: bool) -> None:
+    size = 20
+    scale = ANIMATION_RENDER_SCALE
+    glyph = Image.new("RGB", (size * scale, size * scale), background)
+    draw = ImageDraw.Draw(glyph)
+    x = y = size * scale // 2
+
+    def point(dx: float, dy: float) -> tuple[int, int]:
+        return x + round(dx * scale), y + round(dy * scale)
+
+    def box(left: float, top: float, right: float, bottom: float) -> tuple[int, int, int, int]:
+        return (*point(left, top), *point(right, bottom))
+
+    if not working:
+        draw.ellipse(box(-4, -4, 4, 4),
+                     outline=blend_color(color, background, 0.45), width=1)
+        draw.ellipse(box(-1, -1, 1, 1), fill=color)
+    else:
+        phase = frame % ANIMATION_FRAME_COUNT
+        angle = math.tau * phase / ANIMATION_FRAME_COUNT
+        if provider_id == "claude":
+            for index in range(5):
+                wave = (math.sin(angle - index * 0.8) + 1) / 2
+                height = 3 + wave * 7
+                bar_color = blend_color(color, background, 0.45 + wave * 0.55)
+                left = -6 + index * 3
+                draw.rounded_rectangle(box(left, 5 - height, left + 1.25, 5),
+                                       radius=scale, fill=bar_color)
+        elif provider_id == "codex":
+            for index in range(12):
+                point_angle = angle - index * math.tau / 12 - math.pi / 2
+                strength = max(0.16, 1 - index * 0.075)
+                px = math.cos(point_angle) * 6
+                py = math.sin(point_angle) * 6
+                radius = 1.65 if index < 2 else 0.85
+                draw.ellipse(box(px - radius, py - radius, px + radius, py + radius),
+                             fill=blend_color(color, background, strength))
+        elif provider_id == "copilot":
+            outline = blend_color(color, background, 0.62)
+            draw.rounded_rectangle(box(-7, -4, -1, 3), radius=3 * scale,
+                                   outline=outline, width=scale)
+            draw.rounded_rectangle(box(1, -4, 7, 3), radius=3 * scale,
+                                   outline=outline, width=scale)
+            gaze_x = math.sin(angle) * 2
+            gaze_y = math.sin(angle * 2)
+            draw.ellipse(box(-5 + gaze_x, -1 + gaze_y, -3 + gaze_x, 1 + gaze_y),
+                         fill=color)
+            draw.ellipse(box(3 + gaze_x, -1 + gaze_y, 5 + gaze_x, 1 + gaze_y),
+                         fill=color)
+        elif provider_id == "gemini":
+            pulse = (math.sin(angle) + 1) / 2
+            vertical = 5 + pulse * 2
+            horizontal = 3 + (1 - pulse) * 2
+            draw.polygon((point(0, -vertical), point(1, -1), point(horizontal, 0),
+                          point(1, 1), point(0, vertical), point(-1, 1),
+                          point(-horizontal, 0), point(-1, -1)), fill=color)
+            orbit_x = math.cos(angle) * 7
+            orbit_y = math.sin(angle) * 4
+            draw.ellipse(box(orbit_x - 1, orbit_y - 1, orbit_x + 1, orbit_y + 1),
+                         fill=blend_color(color, background, 0.7))
+        else:
+            draw.line((point(-6, 5), point(6, -5)),
+                      fill=blend_color(color, background, 0.5), width=scale)
+            sweep = (math.sin(angle - math.pi / 2) + 1) / 2
+            px = -6 + sweep * 12
+            py = 5 - sweep * 10
+            draw.ellipse(box(px - 2, py - 2, px + 2, py + 2), fill=color)
+
+    glyph = glyph.resize((size, size), Image.Resampling.LANCZOS)
+    image.paste(glyph, (center[0] - size // 2, center[1] - size // 2))
+
+
+def summarize_provider(provider: dict[str, object]) -> dict[str, object]:
+    installation = provider.get("installation") if isinstance(provider.get("installation"), dict) else {}
+    authentication = provider.get("authentication") if isinstance(provider.get("authentication"), dict) else {}
+    return {
+        "id": provider.get("id"),
+        "name": provider.get("name"),
+        "plan": provider.get("plan"),
+        "connectionState": provider.get("connectionState", "not_installed"),
+        "usageAvailable": bool(provider.get("usageAvailable")),
+        "working": provider.get("working") is True,
+        "workingSource": provider.get("workingSource"),
+        "deviceWorking": provider.get("deviceWorking") is True,
+        "authorizedDeviceWorking": provider.get("authorizedDeviceWorking") is True,
+        "activityState": provider.get("activityState", "standby"),
+        "capabilityNote": provider.get("capabilityNote"),
+        "installation": installation,
+        "authentication": authentication,
+    }
+
+
+def setup_copy(provider: dict[str, object]) -> tuple[str, str, str]:
+    state = str(provider.get("connectionState", "not_installed"))
+    installation = provider.get("installation") if isinstance(provider.get("installation"), dict) else {}
+    authentication = provider.get("authentication") if isinstance(provider.get("authentication"), dict) else {}
+    if state == "not_installed":
+        return "INSTALL REQUIRED", "CONNECTED DEVICE", str(installation.get("installCommand", "Open AI Usage for setup"))
+    if state == "login_required":
+        return "SIGN IN REQUIRED", "RUN ON CONNECTED DEVICE", str(authentication.get("loginCommand", "Open AI Usage for setup"))
+    if state == "verification_required":
+        return "VERIFY SIGN-IN", "CREDENTIALS PROTECTED", "Open Claude Code locally and run /status"
+    if state == "usage_unavailable":
+        return "CONNECTED", "USAGE FEED UNAVAILABLE", "Installation and sign-in detected"
+    return "WAITING FOR USAGE", "CONNECTED DEVICE", "Start a new agent session"
+
+
+def render_setup(draw: ImageDraw.ImageDraw, provider: dict[str, object], theme: dict[str, object]) -> None:
+    headline, label, detail = setup_copy(provider)
+    headline_font = load_font(FONT_BOLD, 23)
+    label_font = load_font(FONT_BOLD, 10)
+    detail_font = load_font(FONT_BOLD, 11)
+    draw_text(draw, (15, 61), headline, headline_font, str(theme["text"]), "la")
+    draw.line((15, 101, 189, 101), fill=str(theme["line"]), width=1)
+    draw_text(draw, (15, 116), str(provider.get("plan") or "NO PLAN DATA").upper(), label_font,
+              str(theme["muted"]), "la")
+    draw_text(draw, (222, 34), label, label_font, str(theme["muted"]), "la")
+    words = detail.split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if len(candidate) > 31 and current:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    for index, line in enumerate(lines[:3]):
+        draw_text(draw, (222, 55 + index * 19), line, detail_font, str(theme["text"]), "la")
+    draw.rectangle((222, 120, 465, 124), fill=str(theme["track"]))
+    draw.rectangle((222, 120, 283, 124), fill=str(theme["accent"]))
+    draw_text(draw, (222, 135), "MANAGE AT /EXTRAS/AI-USAGE/", label_font,
+              str(theme["muted"]), "la")
+
+
+def usage_panel_visible(provider: dict[str, object], limits: list[object]) -> bool:
+    connection_state = provider.get("connectionState")
+    if connection_state == "ready":
+        return True
+    if connection_state is None:
+        activity = provider.get("activity") if isinstance(provider.get("activity"), dict) else {}
+        return bool(provider.get("usageAvailable") or limits or activity.get("lastUsedAt"))
+    if connection_state == "verification_required":
+        return bool(provider.get("trackedTokenTotalsAvailable") or limits)
+    return False
+
+
+def render_wallpaper(snapshot: dict[str, object], provider_id: str = "claude",
+                     output_path: Path = WALLPAPER_PATH, animation_frame: int = 0) -> dict[str, object]:
+    provider = find_provider(snapshot, provider_id)
+    theme = PROVIDERS[provider_id]
+    activity = provider.get("activity") if isinstance(provider.get("activity"), dict) else {}
+    today = activity.get("today") if isinstance(activity.get("today"), dict) else {}
+    limits = provider.get("limits") if isinstance(provider.get("limits"), list) else []
+    by_label = {
+        item.get("label"): item for item in limits if isinstance(item, dict) and item.get("label")
+    }
+
+    image = Image.new("RGB", (480, 160), str(theme["background"]))
+    draw = ImageDraw.Draw(image)
+    brand_font = load_font(FONT_BOLD, 15)
+    code_font = load_font(FONT_BOLD, 9)
+    status_font = load_font(FONT_BOLD, 9)
+    token_label_font = load_font(FONT_BOLD, 10)
+    token_font = load_font(FONT_BOLD, 44)
+    month_font = load_font(FONT_BOLD, 22)
+
+    paste_provider_logo(image, provider_id, theme)
+    if not theme.get("wideLogo"):
+        draw_text(draw, (49, 12), str(theme["brand"]), brand_font, str(theme["text"]), "la")
+        draw_text(draw, (49, 29), str(theme["subbrand"]), code_font, str(theme["muted"]), "la")
+
+    last_used = parse_timestamp(activity.get("lastUsedAt"))
+    is_active = provider.get("working") is True
+    connection_state = str(provider.get("connectionState", ""))
+    if connection_state and connection_state != "ready":
+        status_text = "SETUP" if connection_state == "not_installed" else "CHECK"
+    else:
+        status_text = "WORK" if is_active else "READY"
+    status_color = str(theme["secondary"]) if is_active else str(theme["muted"])
+    draw_activity_glyph(image, provider_id, (145, 27), animation_frame, status_color,
+                        str(theme["background"]), is_active)
+    draw_text(draw, (169, 27), status_text, load_font(FONT_BOLD, 8), status_color, "mm")
+
+    draw.line((205, 11, 205, 149), fill=str(theme["line"]), width=1)
+    if usage_panel_visible(provider, limits):
+        if provider.get("trackedTokenTotalsAvailable") is True:
+            draw_text(draw, (15, 48), "TODAY TOKENS", token_label_font,
+                      str(theme["muted"]), "la")
+            today_tokens = compact_number(today.get("tokens"))
+            draw_text(draw, (15, 60), today_tokens, token_font, str(theme["text"]), "la")
+            draw.line((15, 112, 189, 112), fill=str(theme["line"]), width=1)
+            draw_text(draw, (15, 122), "30D TOKENS / USD EQUIV", token_label_font,
+                      str(theme["muted"]), "la")
+            total_label = compact_number(activity.get("last30DaysTokens"))
+            cost_value = activity.get("last30DaysCostUSD")
+            try:
+                if cost_value is not None:
+                    total_label = f"{total_label} / ${float(cost_value):.0f}"
+            except (TypeError, ValueError):
+                pass
+            draw_text(draw, (189, 143), total_label, load_font(FONT_BOLD, 17),
+                      str(theme["accent"]), "ra")
+        elif provider_id not in ("claude", "codex") and (
+                limits or provider.get("creditsRemaining") is not None
+                or provider.get("providerCostUSD") is not None):
+            draw_text(draw, (15, 48), "SUBSCRIPTION", token_label_font,
+                      str(theme["muted"]), "la")
+            plan_label = str(provider.get("plan") or "CONNECTED").upper()[:18]
+            draw_text(draw, (15, 68), plan_label, load_font(FONT_BOLD, 23),
+                      str(theme["text"]), "la")
+            draw.line((15, 112, 189, 112), fill=str(theme["line"]), width=1)
+            credits = provider.get("creditsRemaining")
+            provider_cost = provider.get("providerCostUSD")
+            if credits is not None:
+                detail_title = "CREDITS REMAINING"
+                detail_value = compact_number(credits)
+            elif provider_cost is not None:
+                detail_title = "PROVIDER COST"
+                detail_value = f"${float(provider_cost):.2f}"
+            else:
+                detail_title = "ACCOUNT LIMITS"
+                detail_value = "CONNECTED"
+            draw_text(draw, (15, 122), detail_title, token_label_font,
+                      str(theme["muted"]), "la")
+            draw_text(draw, (189, 143), detail_value, load_font(FONT_BOLD, 17),
+                      str(theme["accent"]), "ra")
+        elif provider.get("accountTokenTotalsAvailable") is False:
+            draw_text(draw, (15, 48), "NATIVE ACCOUNT", token_label_font,
+                      str(theme["muted"]), "la")
+            plan_label = str(provider.get("plan") or "CONNECTED").upper()[:16]
+            draw_text(draw, (15, 68), plan_label, load_font(FONT_BOLD, 27),
+                      str(theme["text"]), "la")
+            draw.line((15, 120, 189, 120), fill=str(theme["line"]), width=1)
+            draw_text(draw, (15, 132), "TOKEN HISTORY", token_label_font,
+                      str(theme["muted"]), "la")
+            draw_text(draw, (189, 130), "UNAVAILABLE", load_font(FONT_BOLD, 15),
+                      str(theme["accent"]), "ra")
+        else:
+            draw_text(draw, (15, 48), "TODAY TOKENS", token_label_font,
+                      str(theme["muted"]), "la")
+            today_tokens = compact_number(today.get("tokens"))
+            draw_text(draw, (15, 60), today_tokens, token_font, str(theme["text"]), "la")
+            has_cost = activity.get("last30DaysCostUSD") is not None
+            draw.line((15, 112 if has_cost else 120, 189, 112 if has_cost else 120),
+                      fill=str(theme["line"]), width=1)
+            draw_text(draw, (15, 122 if has_cost else 132),
+                      "30D TOKENS / USD EQUIV" if has_cost else "30 DAYS", token_label_font,
+                      str(theme["muted"]), "la")
+            month_value = compact_number(activity.get("last30DaysTokens"))
+            if has_cost:
+                month_value = f"{month_value} / ${float(activity.get('last30DaysCostUSD')):.0f}"
+            draw_text(draw, (189, 143 if has_cost else 130), month_value,
+                      load_font(FONT_BOLD, 17) if has_cost else month_font,
+                      str(theme["accent"]), "ra")
+
+        primary = by_label.get("Current session") or by_label.get("5-hour window")
+        secondary = by_label.get("Weekly limit") or by_label.get("Weekly window")
+        if primary is None and secondary is None:
+            primary = limits[0] if limits else None
+            secondary = limits[1] if len(limits) > 1 else None
+        primary_title = str(primary.get("label") if primary else "CURRENT SESSION").upper()
+        secondary_title = str(secondary.get("label") if secondary else "WEEKLY LIMIT").upper()
+        render_limit(draw, primary, 13, primary_title, window_label(primary, "5-HOUR WINDOW"),
+                     str(theme["accent"]), theme)
+        render_limit(draw, secondary, 87, secondary_title, window_label(secondary, "7-DAY WINDOW"),
+                     str(theme["secondary"]), theme)
+    else:
+        render_setup(draw, provider, theme)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix="wallpaper.", suffix=".png", dir=output_path.parent)
+    os.close(descriptor)
+    try:
+        image.save(temporary, format="PNG", optimize=True)
+        os.replace(temporary, output_path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return {"active": is_active, "generatedAt": snapshot.get("generatedAt"),
+            "provider": summarize_provider(provider)}
+
+
+def render_animation_frames(snapshot: dict[str, object], provider_id: str) -> list[Path]:
+    provider = find_provider(snapshot, provider_id)
+    theme = PROVIDERS[provider_id]
+    working = provider.get("working") is True
+    status_color = str(theme["secondary"]) if working else str(theme["muted"])
+    ANIMATION_FRAMES_ROOT.mkdir(parents=True, exist_ok=True)
+    directory = Path(tempfile.mkdtemp(prefix="kvm-ai-frames.", dir=ANIMATION_FRAMES_ROOT))
+    try:
+        with Image.open(WALLPAPER_PATH) as source:
+            base = source.convert("RGB")
+        paths: list[Path] = []
+        for frame in range(ANIMATION_FRAME_COUNT):
+            frame_image = base.copy()
+            draw_activity_glyph(frame_image, provider_id, (145, 27), frame, status_color,
+                                str(theme["background"]), working)
+            path = directory / f"frame-{frame:02d}.png"
+            frame_image.save(path, format="PNG", compress_level=1)
+            paths.append(path)
+        return paths
+    except Exception:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+
+
+def publish_wallpaper(path: Path = WALLPAPER_PATH) -> None:
+    if not PUBLISH_ENABLED:
+        return
+    event_data = json.dumps({"path": str(path)}, separators=(",", ":"))
+    payload = json.dumps(
+        {
+            "event_module": "custom_screen",
+            "event_type": "update_background",
+            "event_data": event_data,
+        },
+        separators=(",", ":"),
+    )
+    result = subprocess.run(["ubus", "send", "gui", payload], capture_output=True, text=True,
+                            timeout=10, check=False)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        raise RuntimeError(f"wallpaper refresh failed: {detail}")
+
+
+class Agent:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.refresh_lock = threading.Lock()
+        self.wake = threading.Event()
+        self.stop = threading.Event()
+        self.config = read_config()
+        self.collector = SshCollector(SSH_KEY_PATH)
+        self.devices = DeviceStore(DEVICES_PATH)
+        self.push = PushReceiver(self.devices, PUSH_STATE_PATH)
+        self.resolved_device_host: str | None = None
+        self.snapshot: dict[str, object] | None = None
+        self.animation_frames: list[Path] = []
+        self.animation_frame = 0
+        self.animation_started_at = time.monotonic()
+        write_config(self.config)
+        self.state: dict[str, object] = {
+            "running": True,
+            "deviceOnline": False,
+            "lastAttemptAt": None,
+            "lastSuccessAt": None,
+            "snapshotGeneratedAt": None,
+            "selectedProviderActive": False,
+            "activityDeviceCount": 0,
+            "activityDeviceConfiguredCount": 0,
+            "pushDeviceCount": 0,
+            "lastPushAt": None,
+            "providers": [],
+            "lastError": None,
+        }
+
+    def status(self) -> dict[str, object]:
+        with self.lock:
+            return {
+                **self.config,
+                **self.state,
+                "resolvedDeviceHost": self.resolved_device_host,
+                "sshPublicKey": self.collector.public_key(),
+                "collectionMode": "kvm-ssh-pull",
+                "wallpaperReady": WALLPAPER_PATH.is_file(),
+                "pushDevices": self.devices.list(),
+            }
+
+    def update_config(self, changes: dict[str, object]) -> dict[str, object]:
+        allowed = {
+            key: changes[key]
+            for key in (
+                "enabled", "animateWorking", "intervalSeconds", "selectedProvider",
+                "deviceUser", "deviceHost", "devicePort", "activityHosts",
+            )
+            if key in changes
+        }
+        with self.lock:
+            self.config = normalize_config({**self.config, **allowed})
+            if {"deviceUser", "deviceHost", "devicePort"} & allowed.keys():
+                self.resolved_device_host = None
+            write_config(self.config)
+            result = dict(self.config)
+        self.wake.set()
+        return result
+
+    def refresh(self, publish: bool = True) -> dict[str, object]:
+        with self.refresh_lock:
+            with self.lock:
+                device_user = str(self.config["deviceUser"])
+                device_host = str(self.config["deviceHost"])
+                device_port = int(self.config["devicePort"])
+                selected_provider = str(self.config["selectedProvider"])
+                animate_working = bool(self.config.get("animateWorking"))
+                self.state["lastAttemptAt"] = utc_now()
+            collect_error: str | None = None
+            device_online = True
+            resolved_device_host = self.resolved_device_host
+            try:
+                snapshot, resolved_device_host = self.collector.collect(
+                    device_user, device_host, device_port, self.resolved_device_host,
+                )
+            except Exception as error:
+                collect_error = str(error)
+                device_online = False
+                snapshot = build_usage_snapshot({"providers": []})
+                if device_host == "auto":
+                    resolved_device_host = None
+            self.resolved_device_host = resolved_device_host
+            activity_hosts = self.configured_activity_hosts(resolved_device_host)
+            try:
+                activity_results = (
+                    self.collector.probe_activity_hosts(activity_hosts, device_user, device_port)
+                    if activity_hosts else {}
+                )
+            except RuntimeError:
+                activity_results = {}
+            merged_activity = {**activity_results, **self.push.active_map()}
+            self.apply_activity_states(snapshot, merged_activity, resolved_device_host or "")
+            self.apply_usage_overlay(snapshot, self.push.usage_overlay())
+            push_device_count, last_push_at = self.push_health()
+            no_activity_source = not activity_results and not any(
+                not device.get("revoked") for device in self.devices.list()
+            )
+            has_usage = any(
+                isinstance(provider, dict)
+                and (provider.get("usageAvailable") or provider.get("connectionState") == "ready")
+                for provider in snapshot.get("providers", [])
+            )
+            if collect_error and not has_usage:
+                with self.lock:
+                    self.state.update({"deviceOnline": False, "lastError": collect_error})
+                return self.status()
+            try:
+                rendered = render_wallpaper(snapshot, selected_provider)
+                animation_frames = (
+                    render_animation_frames(snapshot, selected_provider)
+                    if animate_working and rendered.get("active") else []
+                )
+                if publish:
+                    publish_wallpaper(animation_frames[0] if animation_frames else WALLPAPER_PATH)
+                with self.lock:
+                    old_animation_frames = self.animation_frames
+                    self.snapshot = snapshot
+                    self.animation_frames = animation_frames
+                    self.animation_frame = 0
+                    self.animation_started_at = time.monotonic()
+                    self.state.update(
+                        {
+                            "deviceOnline": device_online,
+                            "lastSuccessAt": utc_now(),
+                            "snapshotGeneratedAt": rendered.get("generatedAt"),
+                            "selectedProviderActive": rendered.get("active", False),
+                            "activityDeviceCount": len(activity_results),
+                            "activityDeviceConfiguredCount": len(activity_hosts),
+                            "pushDeviceCount": push_device_count,
+                            "lastPushAt": last_push_at,
+                            "providers": [
+                                summarize_provider(provider)
+                                for provider in snapshot.get("providers", [])
+                                if isinstance(provider, dict) and provider.get("id") in PROVIDER_IDS
+                            ],
+                            "lastError": collect_error or (
+                                "no activity device or push device configured" if no_activity_source else None
+                            ),
+                        }
+                    )
+                if old_animation_frames:
+                    shutil.rmtree(old_animation_frames[0].parent, ignore_errors=True)
+            except Exception as error:  # Keep the last successful wallpaper on transient failures.
+                with self.lock:
+                    if str(self.config["deviceHost"]) == "auto":
+                        self.resolved_device_host = None
+                    self.state.update({"deviceOnline": False, "lastError": str(error)})
+        return self.status()
+
+    def configured_activity_hosts(self, primary_host: str | None) -> list[str]:
+        configured = str(self.config.get("activityHosts", ""))
+        extra = [host.strip() for host in configured.split(",") if host.strip()]
+        return list(dict.fromkeys(([primary_host] if primary_host else []) + extra))
+
+    def push_health(self) -> tuple[int, str | None]:
+        devices = self.devices.list()
+        pushed = [device for device in devices if device.get("lastUsageAt") or device.get("lastActivityAt")]
+        last_push_at = max(
+            (device.get("lastUsageAt") or device.get("lastActivityAt") or "" for device in pushed),
+            default="",
+        )
+        return len(pushed), (last_push_at or None)
+
+    @staticmethod
+    def apply_activity_states(snapshot: dict[str, object],
+                              results: dict[str, dict[str, bool]], primary_host: str) -> None:
+        for provider in snapshot.get("providers", []):
+            if not isinstance(provider, dict) or provider.get("id") not in PROVIDER_IDS:
+                continue
+            provider_id = str(provider["id"])
+            device_working = results.get(primary_host, {}).get(provider_id, False)
+            authorized_working = any(
+                host != primary_host and states.get(provider_id, False)
+                for host, states in results.items()
+            )
+            provider["deviceWorking"] = device_working
+            provider["authorizedDeviceWorking"] = authorized_working
+            provider["working"] = device_working or authorized_working
+            provider["workingSource"] = (
+                "connected_device" if device_working
+                else "authorized_device" if authorized_working else None
+            )
+            provider["activityState"] = "working" if provider["working"] else "standby"
+
+    @staticmethod
+    def apply_usage_overlay(snapshot: dict[str, object],
+                            overlay: dict[str, dict[str, object] | None]) -> None:
+        today_key = datetime.now().astimezone().date().isoformat()
+        for provider in snapshot.get("providers", []):
+            if not isinstance(provider, dict) or provider.get("id") not in PROVIDER_IDS:
+                continue
+            pushed = overlay.get(str(provider["id"]))
+            if not pushed:
+                continue
+            if pushed.get("plan"):
+                provider["plan"] = pushed["plan"]
+            if pushed.get("limits"):
+                provider["limits"] = pushed["limits"]
+                provider["exactSubscriptionUsage"] = True
+            daily = pushed.get("daily")
+            if daily:
+                today = next((day for day in daily if day.get("date") == today_key), {
+                    "date": today_key, "totalTokens": 0, "inputTokens": 0, "outputTokens": 0,
+                    "cacheReadTokens": 0, "cacheCreationTokens": 0,
+                })
+                activity = provider.get("activity") if isinstance(provider.get("activity"), dict) else {}
+                activity["today"] = {
+                    "date": today.get("date"),
+                    "tokens": today.get("totalTokens", 0),
+                    "inputTokens": today.get("inputTokens", 0),
+                    "outputTokens": today.get("outputTokens", 0),
+                    "cacheReadTokens": today.get("cacheReadTokens", 0),
+                    "cacheWriteTokens": today.get("cacheCreationTokens", 0),
+                    "costUSD": None,
+                }
+                activity["last7Days"] = daily[-7:]
+                activity["last30Days"] = daily
+                activity["last30DaysTokens"] = sum(day.get("totalTokens", 0) for day in daily)
+                activity["last30DaysCostUSD"] = None
+                provider["activity"] = activity
+                provider["trackedTokenTotalsAvailable"] = True
+                provider["tokenTotalsScope"] = "account"
+                provider["accountTokenTotalsAvailable"] = True
+                provider["usageAvailable"] = True
+            if pushed.get("loggedIn") and (pushed.get("limits") or daily):
+                provider["connectionState"] = "ready"
+                provider["source"] = "Device helper push"
+                provider["usageAvailable"] = True
+
+    def refresh_working_state(self) -> None:
+        with self.refresh_lock:
+            with self.lock:
+                host = self.resolved_device_host
+                snapshot = self.snapshot
+                user = str(self.config["deviceUser"])
+                port = int(self.config["devicePort"])
+                selected_provider = str(self.config["selectedProvider"])
+                animate_working = bool(self.config.get("animateWorking"))
+            if not snapshot:
+                return
+            activity_hosts = self.configured_activity_hosts(host)
+            try:
+                results = (
+                    self.collector.probe_activity_hosts(activity_hosts, user, port)
+                    if activity_hosts else {}
+                )
+            except RuntimeError:
+                results = {}
+            merged = {**results, **self.push.active_map()}
+            previous_states = {
+                str(provider.get("id")): provider.get("working") is True
+                for provider in snapshot.get("providers", []) if isinstance(provider, dict)
+            }
+            self.apply_activity_states(snapshot, merged, host or "")
+            selected_changed = False
+            for provider in snapshot.get("providers", []):
+                if not isinstance(provider, dict) or provider.get("id") not in PROVIDER_IDS:
+                    continue
+                provider_id = str(provider["id"])
+                working = provider.get("working") is True
+                if provider_id == selected_provider and previous_states.get(provider_id) != working:
+                    selected_changed = True
+                provider["status"] = "active" if working else (
+                    "available" if provider.get("usageAvailable") else "unavailable"
+                )
+            if selected_changed:
+                rendered = render_wallpaper(snapshot, selected_provider)
+                animation_frames = (
+                    render_animation_frames(snapshot, selected_provider)
+                    if animate_working and rendered.get("active") else []
+                )
+                publish_wallpaper(animation_frames[0] if animation_frames else WALLPAPER_PATH)
+                with self.lock:
+                    old_animation_frames = self.animation_frames
+                    self.animation_frames = animation_frames
+                    self.animation_frame = 0
+                    self.animation_started_at = time.monotonic()
+                    self.state["selectedProviderActive"] = rendered.get("active", False)
+                if old_animation_frames:
+                    shutil.rmtree(old_animation_frames[0].parent, ignore_errors=True)
+            push_device_count, last_push_at = self.push_health()
+            with self.lock:
+                self.state["providers"] = [
+                    summarize_provider(provider)
+                    for provider in snapshot.get("providers", [])
+                    if isinstance(provider, dict) and provider.get("id") in PROVIDER_IDS
+                ]
+                self.state["lastActivityProbeAt"] = utc_now()
+                self.state["activityDeviceCount"] = len(results)
+                self.state["activityDeviceConfiguredCount"] = len(activity_hosts)
+                self.state["pushDeviceCount"] = push_device_count
+                self.state["lastPushAt"] = last_push_at
+
+    def run(self) -> None:
+        while not self.stop.is_set():
+            with self.lock:
+                enabled = bool(self.config["enabled"])
+                interval = int(self.config["intervalSeconds"])
+            if enabled:
+                self.refresh()
+            deadline = time.monotonic() + (interval if enabled else 3600)
+            next_working_probe = time.monotonic()
+            while not self.stop.is_set() and not self.wake.is_set():
+                with self.lock:
+                    animate = bool(self.config.get("animateWorking"))
+                    active = bool(self.state.get("selectedProviderActive"))
+                    animation_frames = self.animation_frames
+                now = time.monotonic()
+                delay = min(
+                    ANIMATION_INTERVAL_SECONDS if animate and active and animation_frames else 3600,
+                    max(0, next_working_probe - now) if enabled else 3600,
+                    max(0, deadline - now),
+                )
+                if delay <= 0 or self.wake.wait(delay):
+                    if self.wake.is_set():
+                        break
+                if enabled and time.monotonic() >= next_working_probe:
+                    self.refresh_working_state()
+                    next_working_probe = time.monotonic() + WORKING_POLL_SECONDS
+                if animate and active and animation_frames:
+                    try:
+                        with self.refresh_lock:
+                            with self.lock:
+                                animation_frames = self.animation_frames
+                            if not animation_frames:
+                                continue
+                            elapsed = time.monotonic() - self.animation_started_at
+                            next_frame = int(
+                                elapsed % ANIMATION_ROTATION_SECONDS
+                                / ANIMATION_ROTATION_SECONDS
+                                * ANIMATION_FRAME_COUNT
+                            )
+                            if next_frame != self.animation_frame:
+                                self.animation_frame = next_frame
+                                publish_wallpaper(animation_frames[self.animation_frame])
+                    except Exception as error:
+                        with self.lock:
+                            self.state["lastError"] = f"animation: {error}"
+            self.wake.clear()
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "KvmAiUsage/1"
+
+    @property
+    def agent(self) -> Agent:
+        return self.server.agent  # type: ignore[attr-defined]
+
+    def log_message(self, message: str, *args: object) -> None:
+        print(f"{self.address_string()} - {message % args}", flush=True)
+
+    def send_bytes(self, status: int, body: bytes, content_type: str, cache: str = "no-store") -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", cache)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def send_json(self, status: int, value: object) -> None:
+        self.send_bytes(status, json.dumps(value).encode("utf-8"), "application/json; charset=utf-8")
+
+    def serve_file(self, path: Path, content_type: str, cache: str = "no-store") -> None:
+        try:
+            self.send_bytes(HTTPStatus.OK, path.read_bytes(), content_type, cache)
+        except OSError:
+            self.send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+
+    def do_HEAD(self) -> None:
+        self.do_GET()
+
+    def do_GET(self) -> None:
+        path = self.path.split("?", 1)[0]
+        if path in ("/", "/index.html"):
+            self.serve_file(INDEX_PATH, "text/html; charset=utf-8")
+        elif path == "/icon.svg":
+            self.serve_file(ICON_PATH, "image/svg+xml", "public, max-age=3600")
+        elif path.startswith("/providers/") and path.endswith(".png"):
+            name = path.removeprefix("/providers/")
+            if name.removesuffix(".png") in PROVIDER_IDS and "/" not in name:
+                self.serve_file(PROVIDERS_PATH / name, "image/png", "public, max-age=3600")
+            else:
+                self.send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+        elif path == "/wallpaper.png":
+            self.serve_file(WALLPAPER_PATH, "image/png")
+        elif path == "/api/status":
+            self.send_json(HTTPStatus.OK, self.agent.status())
+        elif path == "/api/devices":
+            self.send_json(HTTPStatus.OK, {"devices": self.agent.devices.list()})
+        else:
+            self.send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+
+    def read_json(self) -> dict[str, object]:
+        try:
+            length = min(16_384, int(self.headers.get("Content-Length", "0")))
+            value = json.loads(self.rfile.read(length) or b"{}")
+        except (ValueError, json.JSONDecodeError) as error:
+            raise RuntimeError("Invalid JSON body") from error
+        if not isinstance(value, dict):
+            raise RuntimeError("JSON body must be an object")
+        return value
+
+    def do_POST(self) -> None:
+        path = self.path.split("?", 1)[0]
+        if path in ("/push/v1/usage", "/push/v1/activity"):
+            self.handle_push(path)
+            return
+        try:
+            if path == "/api/config":
+                self.send_json(HTTPStatus.OK, self.agent.update_config(self.read_json()))
+            elif path == "/api/refresh":
+                self.send_json(HTTPStatus.OK, self.agent.refresh())
+            elif path == "/api/devices":
+                self.send_json(HTTPStatus.OK, self.agent.devices.create(self.read_json().get("name")))
+            elif path == "/api/devices/rotate":
+                result = self.agent.devices.rotate(str(self.read_json().get("id", "")))
+                self.send_json(HTTPStatus.OK if result else HTTPStatus.NOT_FOUND,
+                               result or {"error": "Not found"})
+            elif path == "/api/devices/revoke":
+                ok = self.agent.devices.revoke(str(self.read_json().get("id", "")))
+                self.send_json(HTTPStatus.OK if ok else HTTPStatus.NOT_FOUND,
+                               {"ok": True} if ok else {"error": "Not found"})
+            elif path == "/api/devices/delete":
+                ok = self.agent.devices.delete(str(self.read_json().get("id", "")))
+                self.send_json(HTTPStatus.OK if ok else HTTPStatus.NOT_FOUND,
+                               {"ok": True} if ok else {"error": "Not found"})
+            else:
+                self.send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+        except (RuntimeError, ValueError) as error:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+
+    def handle_push(self, path: str) -> None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = -1
+        if length < 0:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid body"})
+            return
+        if length > PUSH_BODY_LIMIT:
+            self.close_connection = True
+            self.send_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "payload too large"})
+            return
+        body = self.rfile.read(length) if length else b""
+        device = self.agent.push.verify(
+            self.headers.get("X-KVM-Device", ""),
+            self.headers.get("X-KVM-Timestamp", ""),
+            self.headers.get("X-KVM-Nonce", ""),
+            self.headers.get("X-KVM-Signature", ""),
+            "POST", path, body,
+        )
+        if device is None:
+            self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+            return
+        if self.agent.push.rate_limited(device["id"]):
+            self.send_json(HTTPStatus.TOO_MANY_REQUESTS, {"error": "rate_limited"})
+            return
+        try:
+            value = json.loads(body or b"{}")
+        except json.JSONDecodeError:
+            value = None
+        if not isinstance(value, dict):
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid body"})
+            return
+        handler = self.agent.push.handle_usage if path.endswith("/usage") else self.agent.push.handle_activity
+        if not handler(device, value):
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid body"})
+            return
+        self.send_json(HTTPStatus.OK, {"ok": True})
+
+
+class ControlServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, address: tuple[str, int], agent: Agent) -> None:
+        self.agent = agent
+        super().__init__(address, Handler)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--render-once", action="store_true", help="fetch and render once")
+    parser.add_argument("--no-publish", action="store_true", help="do not notify the touchscreen GUI")
+    args = parser.parse_args()
+    agent = Agent()
+    if args.render_once:
+        status = agent.refresh(publish=not args.no_publish)
+        print(json.dumps(status, indent=2))
+        raise SystemExit(0 if status["lastError"] is None else 1)
+
+    worker = threading.Thread(target=agent.run, name="wallpaper-worker", daemon=True)
+    worker.start()
+    server = ControlServer(("127.0.0.1", PORT), agent)
+    print(f"KVM AI Usage listening on 127.0.0.1:{PORT}", flush=True)
+    try:
+        server.serve_forever(poll_interval=0.5)
+    finally:
+        agent.stop.set()
+        agent.wake.set()
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()

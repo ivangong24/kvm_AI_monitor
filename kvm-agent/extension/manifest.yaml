@@ -1,0 +1,6 @@
+name: AI Usage
+description: Claude subscription usage on the touchscreen
+icon: extras/ai-usage/icon.svg
+path: extras/ai-usage/
+daemon: kvmd-webterm
+place: 11

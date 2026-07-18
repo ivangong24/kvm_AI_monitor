@@ -1,0 +1,10 @@
+{
+  "enabled": true,
+  "animateWorking": true,
+  "intervalSeconds": 60,
+  "deviceUser": "",
+  "deviceHost": "auto",
+  "devicePort": 22,
+  "activityHosts": "",
+  "selectedProvider": "claude"
+}

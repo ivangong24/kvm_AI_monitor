@@ -1,0 +1,21 @@
+{
+  "name": "kvm-ai-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A KVM-native AI subscription usage wallpaper for GL.iNet Comet Pro",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test",
+    "kvm:configure": "./scripts/configure-kvm.sh",
+    "kvm:agent:install": "./scripts/install-kvm-agent.sh",
+    "kvm:agent:uninstall": "./scripts/uninstall-kvm-agent.sh",
+    "helper:install": "./mac-helper/install-helper.sh",
+    "helper:uninstall": "./mac-helper/uninstall-helper.sh",
+    "helper:status": "./mac-helper/helper-status.sh",
+    "helper:hooks": "./mac-helper/install-claude-hooks.sh",
+    "helper:test": "python3 mac-helper/test_helper.py"
+  }
+}
