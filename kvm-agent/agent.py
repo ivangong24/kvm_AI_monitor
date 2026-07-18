@@ -55,9 +55,16 @@ MAX_INTERVAL = 3600
 ACTIVE_WINDOW_SECONDS = 120
 ANIMATION_FRAME_COUNT = 60
 ANIMATION_ROTATION_SECONDS = 2.0
+# The GUI copies every published background before drawing it. With the tmpfs shield keeping
+# those copies off flash (service.sh), the per-event cost is RAM copies plus a decode, which
+# the event loop sustains at 10 fps without building a queue backlog.
 ANIMATION_PUBLISH_FPS = 10
 ANIMATION_INTERVAL_SECONDS = 1 / ANIMATION_PUBLISH_FPS
 ANIMATION_RENDER_SCALE = 4
+# Frames live at stable paths and are only ever atomically replaced, never deleted: the GUI
+# processes update_background events asynchronously, and a queued event that references a
+# deleted frame file blanks the screen to black.
+ANIMATION_FRAMES_DIR = ANIMATION_FRAMES_ROOT / "kvm-ai-frames"
 WORKING_POLL_SECONDS = 5.0
 PUSH_BODY_LIMIT = 64 * 1024
 
@@ -66,31 +73,31 @@ PROVIDERS = {
         "name": "Claude Code", "brand": "CLAUDE", "subbrand": "CODE",
         "background": "#0d1112", "text": "#f4f5f2", "muted": "#939b98",
         "line": "#303637", "track": "#293031", "accent": "#d97757",
-        "secondary": "#53d59c", "logo": "claude.png",
+        "secondary": "#53d59c", "bar": "#d97757", "logo": "claude.png",
     },
     "codex": {
         "name": "Codex", "brand": "CODEX", "subbrand": "OPENAI",
         "background": "#f5f5f2", "text": "#101312", "muted": "#68716e",
         "line": "#cbd1ce", "track": "#dfe3e1", "accent": "#101312",
-        "secondary": "#10a37f", "logo": "codex.png",
+        "secondary": "#10a37f", "bar": "#10a37f", "logo": "codex.png",
     },
     "copilot": {
         "name": "GitHub Copilot", "brand": "COPILOT", "subbrand": "GITHUB",
         "background": "#f6f8fa", "text": "#24292f", "muted": "#68717c",
         "line": "#d0d7de", "track": "#d8dee4", "accent": "#8534f3",
-        "secondary": "#fe4c25", "logo": "copilot.png", "wideLogo": True,
+        "secondary": "#fe4c25", "bar": "#8534f3", "logo": "copilot.png", "wideLogo": True,
     },
     "gemini": {
         "name": "Gemini CLI", "brand": "GEMINI", "subbrand": "CLI",
         "background": "#f7f9fc", "text": "#202124", "muted": "#6c727b",
         "line": "#d2d8e2", "track": "#e0e5ec", "accent": "#5684d1",
-        "secondary": "#9168c0", "logo": "gemini.png",
+        "secondary": "#9168c0", "bar": "#4285f4", "logo": "gemini.png",
     },
     "grok": {
         "name": "Grok Build", "brand": "GROK", "subbrand": "BUILD",
         "background": "#050505", "text": "#f7f7f7", "muted": "#a0a0a0",
         "line": "#353535", "track": "#292929", "accent": "#f7f7f7",
-        "secondary": "#8d99a1", "logo": "grok.png",
+        "secondary": "#8d99a1", "bar": "#f7f7f7", "logo": "grok.png",
     },
 }
 PROVIDER_IDS = frozenset(PROVIDERS)
@@ -256,7 +263,8 @@ def draw_text(draw: ImageDraw.ImageDraw, xy: tuple[int, int], text: str, font: I
 
 
 def render_limit(draw: ImageDraw.ImageDraw, limit: dict[str, object] | None, y: int,
-                 title: str, window: str, bar_color: str, theme: dict[str, object]) -> None:
+                 title: str, window: str, bar_color: str | tuple[int, int, int],
+                 theme: dict[str, object]) -> None:
     label_font = load_font(FONT_BOLD, 12)
     value_font = load_font(FONT_BOLD, 23)
     footer_font = load_font(FONT_BOLD, 9)
@@ -453,8 +461,23 @@ def usage_panel_visible(provider: dict[str, object], limits: list[object]) -> bo
     return False
 
 
-def render_wallpaper(snapshot: dict[str, object], provider_id: str = "claude",
-                     output_path: Path = WALLPAPER_PATH, animation_frame: int = 0) -> dict[str, object]:
+def save_png_atomic(image: Image.Image, output_path: Path, compress_level: int | None = None) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=".png.", suffix=".png", dir=output_path.parent)
+    os.close(descriptor)
+    try:
+        if compress_level is None:
+            image.save(temporary, format="PNG", optimize=True)
+        else:
+            image.save(temporary, format="PNG", compress_level=compress_level)
+        os.replace(temporary, output_path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def compose_wallpaper(snapshot: dict[str, object], provider_id: str = "claude",
+                      animation_frame: int = 0) -> tuple[Image.Image, dict[str, object]]:
     provider = find_provider(snapshot, provider_id)
     theme = PROVIDERS[provider_id]
     activity = provider.get("activity") if isinstance(provider.get("activity"), dict) else {}
@@ -569,51 +592,57 @@ def render_wallpaper(snapshot: dict[str, object], provider_id: str = "claude",
             secondary = limits[1] if len(limits) > 1 else None
         primary_title = str(primary.get("label") if primary else "CURRENT SESSION").upper()
         secondary_title = str(secondary.get("label") if secondary else "WEEKLY LIMIT").upper()
+        bar_color = str(theme.get("bar", theme["accent"]))
         render_limit(draw, primary, 13, primary_title, window_label(primary, "5-HOUR WINDOW"),
-                     str(theme["accent"]), theme)
+                     bar_color, theme)
         render_limit(draw, secondary, 87, secondary_title, window_label(secondary, "7-DAY WINDOW"),
-                     str(theme["secondary"]), theme)
+                     blend_color(bar_color, str(theme["background"]), 0.62), theme)
     else:
         render_setup(draw, provider, theme)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(prefix="wallpaper.", suffix=".png", dir=output_path.parent)
-    os.close(descriptor)
-    try:
-        image.save(temporary, format="PNG", optimize=True)
-        os.replace(temporary, output_path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
-    return {"active": is_active, "generatedAt": snapshot.get("generatedAt"),
-            "provider": summarize_provider(provider)}
+    return image, {"active": is_active, "generatedAt": snapshot.get("generatedAt"),
+                   "provider": summarize_provider(provider)}
 
 
-def render_animation_frames(snapshot: dict[str, object], provider_id: str) -> list[Path]:
+def render_wallpaper(snapshot: dict[str, object], provider_id: str = "claude",
+                     output_path: Path = WALLPAPER_PATH, animation_frame: int = 0) -> dict[str, object]:
+    image, rendered = compose_wallpaper(snapshot, provider_id, animation_frame)
+    save_png_atomic(image, output_path)
+    return rendered
+
+
+def render_animation_frames(snapshot: dict[str, object], provider_id: str,
+                            base_image: Image.Image | None = None) -> list[Path]:
     provider = find_provider(snapshot, provider_id)
     theme = PROVIDERS[provider_id]
     working = provider.get("working") is True
     status_color = str(theme["secondary"]) if working else str(theme["muted"])
-    ANIMATION_FRAMES_ROOT.mkdir(parents=True, exist_ok=True)
-    directory = Path(tempfile.mkdtemp(prefix="kvm-ai-frames.", dir=ANIMATION_FRAMES_ROOT))
-    try:
+    ANIMATION_FRAMES_DIR.mkdir(parents=True, exist_ok=True)
+    if base_image is None:
         with Image.open(WALLPAPER_PATH) as source:
-            base = source.convert("RGB")
-        paths: list[Path] = []
-        for frame in range(ANIMATION_FRAME_COUNT):
-            frame_image = base.copy()
-            draw_activity_glyph(frame_image, provider_id, (145, 27), frame, status_color,
-                                str(theme["background"]), working)
-            path = directory / f"frame-{frame:02d}.png"
-            frame_image.save(path, format="PNG", compress_level=1)
-            paths.append(path)
-        return paths
-    except Exception:
-        shutil.rmtree(directory, ignore_errors=True)
-        raise
+            base_image = source.convert("RGB")
+    paths: list[Path] = []
+    for frame in range(ANIMATION_FRAME_COUNT):
+        frame_image = base_image.copy()
+        draw_activity_glyph(frame_image, provider_id, (145, 27), frame, status_color,
+                            str(theme["background"]), working)
+        path = ANIMATION_FRAMES_DIR / f"frame-{frame:02d}.png"
+        save_png_atomic(frame_image, path, compress_level=1)
+        paths.append(path)
+    return paths
 
 
-def publish_wallpaper(path: Path = WALLPAPER_PATH) -> None:
+def cleanup_legacy_frame_dirs() -> None:
+    """Old agent versions kept frames in throwaway mkdtemp directories; remove leftovers."""
+    try:
+        for path in ANIMATION_FRAMES_ROOT.glob("kvm-ai-frames.*"):
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+    except OSError:
+        pass
+
+
+def publish_wallpaper(path: Path = WALLPAPER_PATH, timeout: float = 10) -> None:
     if not PUBLISH_ENABLED:
         return
     event_data = json.dumps({"path": str(path)}, separators=(",", ":"))
@@ -626,7 +655,7 @@ def publish_wallpaper(path: Path = WALLPAPER_PATH) -> None:
         separators=(",", ":"),
     )
     result = subprocess.run(["ubus", "send", "gui", payload], capture_output=True, text=True,
-                            timeout=10, check=False)
+                            timeout=timeout, check=False)
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
         raise RuntimeError(f"wallpaper refresh failed: {detail}")
@@ -635,7 +664,11 @@ def publish_wallpaper(path: Path = WALLPAPER_PATH) -> None:
 class Agent:
     def __init__(self) -> None:
         self.lock = threading.Lock()
+        # refresh_lock guards publishing plus the animation frame state; collect_lock
+        # serializes full refresh cycles. Slow network I/O (SSH collect, activity probes)
+        # deliberately runs under neither, so the animation publisher is never starved.
         self.refresh_lock = threading.Lock()
+        self.collect_lock = threading.Lock()
         self.wake = threading.Event()
         self.stop = threading.Event()
         self.config = read_config()
@@ -647,6 +680,7 @@ class Agent:
         self.animation_frames: list[Path] = []
         self.animation_frame = 0
         self.animation_started_at = time.monotonic()
+        cleanup_legacy_frame_dirs()
         write_config(self.config)
         self.state: dict[str, object] = {
             "running": True,
@@ -694,7 +728,7 @@ class Agent:
         return result
 
     def refresh(self, publish: bool = True) -> dict[str, object]:
-        with self.refresh_lock:
+        with self.collect_lock:
             with self.lock:
                 device_user = str(self.config["deviceUser"])
                 device_host = str(self.config["deviceHost"])
@@ -741,41 +775,42 @@ class Agent:
                     self.state.update({"deviceOnline": False, "lastError": collect_error})
                 return self.status()
             try:
-                rendered = render_wallpaper(snapshot, selected_provider)
+                # Compose and pre-render frames outside refresh_lock: the snapshot is still
+                # local to this call, and frame files are replaced atomically in place.
+                image, rendered = compose_wallpaper(snapshot, selected_provider)
                 animation_frames = (
-                    render_animation_frames(snapshot, selected_provider)
+                    render_animation_frames(snapshot, selected_provider, base_image=image)
                     if animate_working and rendered.get("active") else []
                 )
-                if publish:
-                    publish_wallpaper(animation_frames[0] if animation_frames else WALLPAPER_PATH)
-                with self.lock:
-                    old_animation_frames = self.animation_frames
-                    self.snapshot = snapshot
-                    self.animation_frames = animation_frames
-                    self.animation_frame = 0
-                    self.animation_started_at = time.monotonic()
-                    self.state.update(
-                        {
-                            "deviceOnline": device_online,
-                            "lastSuccessAt": utc_now(),
-                            "snapshotGeneratedAt": rendered.get("generatedAt"),
-                            "selectedProviderActive": rendered.get("active", False),
-                            "activityDeviceCount": len(activity_results),
-                            "activityDeviceConfiguredCount": len(activity_hosts),
-                            "pushDeviceCount": push_device_count,
-                            "lastPushAt": last_push_at,
-                            "providers": [
-                                summarize_provider(provider)
-                                for provider in snapshot.get("providers", [])
-                                if isinstance(provider, dict) and provider.get("id") in PROVIDER_IDS
-                            ],
-                            "lastError": collect_error or (
-                                "no activity device or push device configured" if no_activity_source else None
-                            ),
-                        }
-                    )
-                if old_animation_frames:
-                    shutil.rmtree(old_animation_frames[0].parent, ignore_errors=True)
+                with self.refresh_lock:
+                    save_png_atomic(image, WALLPAPER_PATH)
+                    if publish:
+                        publish_wallpaper(animation_frames[0] if animation_frames else WALLPAPER_PATH)
+                    with self.lock:
+                        self.snapshot = snapshot
+                        self.animation_frames = animation_frames
+                        self.animation_frame = 0
+                        self.animation_started_at = time.monotonic()
+                        self.state.update(
+                            {
+                                "deviceOnline": device_online,
+                                "lastSuccessAt": utc_now(),
+                                "snapshotGeneratedAt": rendered.get("generatedAt"),
+                                "selectedProviderActive": rendered.get("active", False),
+                                "activityDeviceCount": len(activity_results),
+                                "activityDeviceConfiguredCount": len(activity_hosts),
+                                "pushDeviceCount": push_device_count,
+                                "lastPushAt": last_push_at,
+                                "providers": [
+                                    summarize_provider(provider)
+                                    for provider in snapshot.get("providers", [])
+                                    if isinstance(provider, dict) and provider.get("id") in PROVIDER_IDS
+                                ],
+                                "lastError": collect_error or (
+                                    "no activity device or push device configured" if no_activity_source else None
+                                ),
+                            }
+                        )
             except Exception as error:  # Keep the last successful wallpaper on transient failures.
                 with self.lock:
                     if str(self.config["deviceHost"]) == "auto":
@@ -864,115 +899,126 @@ class Agent:
                 provider["usageAvailable"] = True
 
     def refresh_working_state(self) -> None:
-        with self.refresh_lock:
-            with self.lock:
-                host = self.resolved_device_host
-                snapshot = self.snapshot
-                user = str(self.config["deviceUser"])
-                port = int(self.config["devicePort"])
-                selected_provider = str(self.config["selectedProvider"])
-                animate_working = bool(self.config.get("animateWorking"))
-            if not snapshot:
-                return
-            activity_hosts = self.configured_activity_hosts(host)
-            try:
-                results = (
-                    self.collector.probe_activity_hosts(activity_hosts, user, port)
-                    if activity_hosts else {}
-                )
-            except RuntimeError:
-                results = {}
-            merged = {**results, **self.push.active_map()}
-            previous_states = {
-                str(provider.get("id")): provider.get("working") is True
-                for provider in snapshot.get("providers", []) if isinstance(provider, dict)
-            }
-            self.apply_activity_states(snapshot, merged, host or "")
-            selected_changed = False
-            for provider in snapshot.get("providers", []):
-                if not isinstance(provider, dict) or provider.get("id") not in PROVIDER_IDS:
-                    continue
-                provider_id = str(provider["id"])
-                working = provider.get("working") is True
-                if provider_id == selected_provider and previous_states.get(provider_id) != working:
-                    selected_changed = True
-                provider["status"] = "active" if working else (
-                    "available" if provider.get("usageAvailable") else "unavailable"
-                )
-            if selected_changed:
-                rendered = render_wallpaper(snapshot, selected_provider)
-                animation_frames = (
-                    render_animation_frames(snapshot, selected_provider)
-                    if animate_working and rendered.get("active") else []
-                )
-                publish_wallpaper(animation_frames[0] if animation_frames else WALLPAPER_PATH)
+        with self.lock:
+            host = self.resolved_device_host
+            snapshot = self.snapshot
+            user = str(self.config["deviceUser"])
+            port = int(self.config["devicePort"])
+            selected_provider = str(self.config["selectedProvider"])
+            animate_working = bool(self.config.get("animateWorking"))
+        if not snapshot:
+            return
+        activity_hosts = self.configured_activity_hosts(host)
+        try:
+            results = (
+                self.collector.probe_activity_hosts(activity_hosts, user, port)
+                if activity_hosts else {}
+            )
+        except RuntimeError:
+            results = {}
+        merged = {**results, **self.push.active_map()}
+        with self.lock:
+            if self.snapshot is not snapshot:
+                return  # A full refresh replaced the snapshot while we probed.
+        previous_states = {
+            str(provider.get("id")): provider.get("working") is True
+            for provider in snapshot.get("providers", []) if isinstance(provider, dict)
+        }
+        self.apply_activity_states(snapshot, merged, host or "")
+        selected_changed = False
+        for provider in snapshot.get("providers", []):
+            if not isinstance(provider, dict) or provider.get("id") not in PROVIDER_IDS:
+                continue
+            provider_id = str(provider["id"])
+            working = provider.get("working") is True
+            if provider_id == selected_provider and previous_states.get(provider_id) != working:
+                selected_changed = True
+            provider["status"] = "active" if working else (
+                "available" if provider.get("usageAvailable") else "unavailable"
+            )
+        if selected_changed:
+            image, rendered = compose_wallpaper(snapshot, selected_provider)
+            animation_frames = (
+                render_animation_frames(snapshot, selected_provider, base_image=image)
+                if animate_working and rendered.get("active") else []
+            )
+            with self.refresh_lock:
                 with self.lock:
-                    old_animation_frames = self.animation_frames
-                    self.animation_frames = animation_frames
-                    self.animation_frame = 0
-                    self.animation_started_at = time.monotonic()
-                    self.state["selectedProviderActive"] = rendered.get("active", False)
-                if old_animation_frames:
-                    shutil.rmtree(old_animation_frames[0].parent, ignore_errors=True)
-            push_device_count, last_push_at = self.push_health()
-            with self.lock:
-                self.state["providers"] = [
-                    summarize_provider(provider)
-                    for provider in snapshot.get("providers", [])
-                    if isinstance(provider, dict) and provider.get("id") in PROVIDER_IDS
-                ]
-                self.state["lastActivityProbeAt"] = utc_now()
-                self.state["activityDeviceCount"] = len(results)
-                self.state["activityDeviceConfiguredCount"] = len(activity_hosts)
-                self.state["pushDeviceCount"] = push_device_count
-                self.state["lastPushAt"] = last_push_at
+                    stale = self.snapshot is not snapshot
+                if not stale:
+                    save_png_atomic(image, WALLPAPER_PATH)
+                    publish_wallpaper(animation_frames[0] if animation_frames else WALLPAPER_PATH)
+                    with self.lock:
+                        self.animation_frames = animation_frames
+                        self.animation_frame = 0
+                        self.animation_started_at = time.monotonic()
+                        self.state["selectedProviderActive"] = rendered.get("active", False)
+        push_device_count, last_push_at = self.push_health()
+        with self.lock:
+            self.state["providers"] = [
+                summarize_provider(provider)
+                for provider in snapshot.get("providers", [])
+                if isinstance(provider, dict) and provider.get("id") in PROVIDER_IDS
+            ]
+            self.state["lastActivityProbeAt"] = utc_now()
+            self.state["activityDeviceCount"] = len(results)
+            self.state["activityDeviceConfiguredCount"] = len(activity_hosts)
+            self.state["pushDeviceCount"] = push_device_count
+            self.state["lastPushAt"] = last_push_at
 
     def run(self) -> None:
+        threading.Thread(target=self.working_probe_loop, name="working-probe", daemon=True).start()
+        threading.Thread(target=self.animation_loop, name="animator", daemon=True).start()
         while not self.stop.is_set():
             with self.lock:
                 enabled = bool(self.config["enabled"])
                 interval = int(self.config["intervalSeconds"])
             if enabled:
                 self.refresh()
-            deadline = time.monotonic() + (interval if enabled else 3600)
-            next_working_probe = time.monotonic()
-            while not self.stop.is_set() and not self.wake.is_set():
-                with self.lock:
-                    animate = bool(self.config.get("animateWorking"))
-                    active = bool(self.state.get("selectedProviderActive"))
-                    animation_frames = self.animation_frames
-                now = time.monotonic()
-                delay = min(
-                    ANIMATION_INTERVAL_SECONDS if animate and active and animation_frames else 3600,
-                    max(0, next_working_probe - now) if enabled else 3600,
-                    max(0, deadline - now),
-                )
-                if delay <= 0 or self.wake.wait(delay):
-                    if self.wake.is_set():
-                        break
-                if enabled and time.monotonic() >= next_working_probe:
-                    self.refresh_working_state()
-                    next_working_probe = time.monotonic() + WORKING_POLL_SECONDS
-                if animate and active and animation_frames:
-                    try:
-                        with self.refresh_lock:
-                            with self.lock:
-                                animation_frames = self.animation_frames
-                            if not animation_frames:
-                                continue
-                            elapsed = time.monotonic() - self.animation_started_at
-                            next_frame = int(
-                                elapsed % ANIMATION_ROTATION_SECONDS
-                                / ANIMATION_ROTATION_SECONDS
-                                * ANIMATION_FRAME_COUNT
-                            )
-                            if next_frame != self.animation_frame:
-                                self.animation_frame = next_frame
-                                publish_wallpaper(animation_frames[self.animation_frame])
-                    except Exception as error:
-                        with self.lock:
-                            self.state["lastError"] = f"animation: {error}"
+            self.wake.wait(interval if enabled else 3600)
             self.wake.clear()
+
+    def working_probe_loop(self) -> None:
+        while not self.stop.is_set():
+            with self.lock:
+                enabled = bool(self.config["enabled"])
+            if enabled:
+                try:
+                    self.refresh_working_state()
+                except Exception as error:
+                    with self.lock:
+                        self.state["lastError"] = f"activity: {error}"
+            self.stop.wait(WORKING_POLL_SECONDS)
+
+    def animation_loop(self) -> None:
+        while not self.stop.is_set():
+            with self.lock:
+                animate = bool(self.config.get("animateWorking"))
+                active = bool(self.state.get("selectedProviderActive"))
+                animation_frames = self.animation_frames
+            if not (animate and active and animation_frames):
+                self.stop.wait(ANIMATION_INTERVAL_SECONDS)
+                continue
+            elapsed = time.monotonic() - self.animation_started_at
+            next_frame = int(
+                elapsed % ANIMATION_ROTATION_SECONDS
+                / ANIMATION_ROTATION_SECONDS
+                * ANIMATION_FRAME_COUNT
+            )
+            if next_frame != self.animation_frame:
+                try:
+                    with self.refresh_lock:
+                        with self.lock:
+                            animation_frames = self.animation_frames
+                        if animation_frames:
+                            self.animation_frame = next_frame % len(animation_frames)
+                            publish_wallpaper(animation_frames[self.animation_frame], timeout=3)
+                except Exception as error:
+                    with self.lock:
+                        self.state["lastError"] = f"animation: {error}"
+            # A full interval between wake-ups caps publishing at ANIMATION_PUBLISH_FPS;
+            # the frame index is derived from elapsed time, so skipped phases stay in step.
+            self.stop.wait(ANIMATION_INTERVAL_SECONDS)
 
 
 class Handler(BaseHTTPRequestHandler):

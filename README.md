@@ -106,7 +106,13 @@ devices send activity events (`start` / `active` / `stop`) that also trigger ani
 push-sourced work is distinct from SSH-sourced work. While
 the selected native agent is working on the primary or an enrolled activity device or any push device,
 the indicator uses 60 cached motion phases with a two-second rotation and publishes at 10 frames per
-second to stay within the display firmware's static-wallpaper update capacity.
+second, which the GUI event loop sustains once its background copies are kept off flash. Animation frames live at
+stable paths under `/tmp/kvm-ai-frames/` and are only ever replaced atomically, never deleted, so a
+queued GUI event can never reference a missing file (which would blank the screen). The Comet GUI
+copies every published background into two directories on its flash-backed overlay; the agent's
+service script mounts a tmpfs over both so animation does not wear the eMMC or slow the GUI event
+loop (the uninstaller unmounts them, restoring stock behavior). Activity probing, usage collection,
+and frame publishing run in separate threads, so a slow SSH probe cannot pause the animation.
 
 Push device usage is retained when the device goes offline; only working state expires. Last successful
 aggregates from the device are preserved in the display until deleted or revoked.

@@ -155,7 +155,7 @@ Also implemented in this phase (`mac-helper/`):
 - **macOS helper**: `kvm_ai_push.py` (stdlib-only sign/collect/push CLI), LaunchAgent
   (`com.kvm-ai-monitor.helper`, 60 s interval in the logged-in GUI session), installer /
   uninstaller / status / secret storage in the login Keychain. Claude usage is collected natively
-  (auth status, optional usage command, Keychain OAuth credential used in memory only, local JSONL
+  (auth status, Keychain OAuth credential used in memory only, local JSONL
   daily totals) and reduced to the whitelisted aggregate schema.
 - **Claude lifecycle hooks**: idempotent installer wiring SessionStart / UserPromptSubmit /
   PostToolUse / Stop / SessionEnd to a background, always-exit-0 hook that pushes signed
@@ -169,3 +169,71 @@ Work remaining:
 - Provider OAuth onboarding and per-provider credential management.
 - Live end-to-end verification on the deployed KVM and enrolled Macs (device enrollment, first
   push, animation from a Mac mini hook event, Mac-asleep retention).
+
+---
+
+## Update - 2026-07-18 (later): Accurate account limits and per-agent bar colors
+
+Verified against the live account: `api.anthropic.com/api/oauth/usage` returns a structured
+`limits` array (`kind`: `session` / `weekly_all` / `weekly_scoped` with `percent`, `resets_at`,
+and a model `scope`) alongside legacy `five_hour` / `seven_day` buckets, and it rate-limits
+aggressive polling with HTTP 429. Changes:
+
+- **Helper** parses the structured `limits` array first (session, weekly all-models, and
+  model-scoped weekly entries such as "Weekly (Fable)"), falling back to the legacy bucket keys.
+  The nonexistent `claude usage --json` adapter was removed.
+- **Helper** now fetches account limits at most once per 4 minutes and caches the last good
+  (already-whitelisted) result in `~/.kvm-ai-monitor/limits-cache.json` for up to 24 h, so the
+  60-second LaunchAgent cadence no longer trips the endpoint's rate limit and a transient 429
+  no longer blanks the pushed limits.
+- **Receiver** retains the previous snapshot's limits when a new usage push arrives without any,
+  matching the "last successful aggregate is preserved" display rule.
+- **Renderer** gives each provider a dedicated `bar` theme color (Claude coral, Codex teal,
+  Copilot purple, Gemini blue, Grok white); the weekly bar is a tint of the same brand color.
+
+These limits are account-wide: one enrolled device with a valid Claude Code OAuth credential
+reports the same session/weekly percentages the account sees everywhere. The helper does not
+refresh the OAuth token itself; if Claude Code is unused on the enrolled Mac long enough for the
+token to expire, limits pause (cache serves up to 24 h) until Claude Code refreshes it.
+
+The KVM-side changes (receiver retention, bar colors) still need deployment via
+`npm run kvm:agent:install`; the saved Comet session token had expired at verification time, so
+`npm run kvm:configure` must be rerun first. The helper-side fix is installed and verified: a
+signed push containing correct session and weekly limits was accepted by the deployed KVM.
+
+---
+
+## Update - 2026-07-18 (later still): Blackout and animation-stall fixes, deployed
+
+Device investigation (gl_kvm_gui logs, binary strings, file mtimes) established:
+
+- Every `update_background` ubus event makes the GUI copy the published PNG into
+  `/etc/glinet/gui/custom/background/` and `/etc/rm10-gui/picture/custom/background/`, both on the
+  flash-backed overlay — at the previous 10 fps this meant ~374 KB/s of eMMC writes while animating
+  and a congested GUI event loop.
+- The agent kept animation frames in throwaway `mkdtemp` directories and deleted the old directory
+  on every refresh/state change; a queued GUI event referencing a deleted frame file loads nothing
+  and blanks the screen to black. This was the frequent working-time blackout.
+- The 5-second SSH working probe and the full 60-frame re-render ran in the same thread/lock as the
+  frame publisher, so slow probes (or each refresh) froze the animation for seconds. This was the
+  stop-and-recover stall.
+
+Fixes (all deployed and verified live on the Comet):
+
+- Animation frames now live at stable paths in `/tmp/kvm-ai-frames/` (60 frames), written with
+  atomic replace and never deleted; legacy mkdtemp directories are cleaned at startup.
+- Publishing runs at 10 fps from a dedicated animator thread; the SSH working probe and the
+  usage-refresh cycle run in their own threads, with network I/O outside the publish lock. The
+  original 60-phase / 10 fps smoothness is retained: with the tmpfs shield the GUI's per-event
+  cost is RAM copies plus a decode, measured at ~5% GUI CPU with no event-queue backlog.
+- Wallpaper composition and frame rendering happen before the publish lock is taken;
+  `render_wallpaper` was split into `compose_wallpaper` + `save_png_atomic`.
+- `service.sh` mounts a tmpfs over both GUI background directories (preserving prior content), so
+  the GUI's per-event copies stay in RAM; `uninstall-on-device.sh` unmounts them. Verified: during
+  animation the tmpfs copy updates while the flash overlay copy's mtime stays frozen.
+
+Verified after deployment: ~10 events/s cadence in gl_kvm_gui logs, zero flash writes during
+animation (flash overlay copy mtime frozen while the tmpfs copy updates), `lastError: null`, the
+event queue draining immediately when working state ends, and clean transition back to the static
+wallpaper. The GUI's `AutoLockTime` is 60 s but `AlwaysOn` is true, so screen-off was ruled out as
+the blackout cause.

@@ -5,6 +5,23 @@ EXTENSION=/usr/share/kvmd/extras/ai-usage
 PID_FILE=/run/kvm-ai-usage.pid
 LOG_FILE=/tmp/kvm-ai-usage.log
 PYTHON=/usr/bin/python3
+GUI_BACKGROUND_DIRS="/etc/glinet/gui/custom/background /etc/rm10-gui/picture/custom/background"
+
+shield_gui_background_writes() {
+    # gl_kvm_gui copies every published wallpaper into these directories, which live on the
+    # flash-backed overlay. Wallpaper animation would rewrite them several times per second,
+    # wearing the eMMC and slowing the GUI event loop, so a tmpfs keeps the copies in RAM.
+    # The agent republishes the wallpaper after boot, and uninstall restores the flash copy.
+    for dir in $GUI_BACKGROUND_DIRS; do
+        [ -d "$dir" ] || continue
+        grep -q " $dir " /proc/mounts && continue
+        cp -a "$dir" "$dir.pre-tmpfs" 2>/dev/null || true
+        if mount -t tmpfs -o size=2m,mode=0755 kvm-ai-usage-bg "$dir" 2>/dev/null; then
+            cp -a "$dir.pre-tmpfs/." "$dir/" 2>/dev/null || true
+        fi
+        rm -rf "$dir.pre-tmpfs"
+    done
+}
 
 sync_extension() {
     mkdir -p "$EXTENSION"
@@ -17,6 +34,7 @@ sync_extension() {
 
 start_agent() {
     sync_extension
+    shield_gui_background_writes
     if [ -s "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
         return 0
     fi
