@@ -107,7 +107,11 @@ devices send activity events (`start` / `active` / `stop`) that also trigger ani
 push-sourced work is distinct from SSH-sourced work. While
 the selected native agent is working on the primary or an enrolled activity device or any push device,
 the indicator uses 60 cached motion phases with a two-second rotation and publishes at 10 frames per
-second, which the GUI event loop sustains once its background copies are kept off flash. Animation frames live at
+second, which the GUI event loop sustains once its background copies are kept off flash. The KVM's
+primary function always wins: the agent runs at nice 15, animation frames are cached and only
+re-rendered when the wallpaper content changes, and while anyone is actively viewing the web
+console's video stream the animation pauses on the static wallpaper (`pauseWhenStreaming`, on by
+default) so remote view and control never compete with wallpaper publishing. Animation frames live at
 stable paths under `/tmp/kvm-ai-frames/` and are only ever replaced atomically, never deleted, so a
 queued GUI event can never reference a missing file (which would blank the screen). The Comet GUI
 copies every published background into two directories on its flash-backed overlay; the agent's

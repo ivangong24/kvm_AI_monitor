@@ -40,7 +40,8 @@ start_agent() {
     fi
     rm -f "$PID_FILE"
     touch "$LOG_FILE"
-    start-stop-daemon -S -b -m -p "$PID_FILE" -x "$PYTHON" -O "$LOG_FILE" -- "$ROOT/agent.py"
+    # Nice 15: the wallpaper must never compete with kvmd video streaming or HID handling.
+    start-stop-daemon -S -b -m -N 15 -p "$PID_FILE" -x "$PYTHON" -O "$LOG_FILE" -- "$ROOT/agent.py"
 }
 
 stop_agent() {

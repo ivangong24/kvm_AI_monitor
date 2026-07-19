@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
@@ -43,6 +45,7 @@ PUBLISH_ENABLED = os.environ.get("KVM_AI_USAGE_NO_PUBLISH") != "1"
 DEFAULT_CONFIG = {
     "enabled": True,
     "animateWorking": True,
+    "pauseWhenStreaming": True,
     "intervalSeconds": 60,
     "deviceUser": "",
     "deviceHost": "auto",
@@ -179,6 +182,7 @@ def normalize_config(value: object) -> dict[str, object]:
     raw = value if isinstance(value, dict) else {}
     enabled = raw.get("enabled", DEFAULT_CONFIG["enabled"])
     animate_working = raw.get("animateWorking", DEFAULT_CONFIG["animateWorking"])
+    pause_when_streaming = raw.get("pauseWhenStreaming", DEFAULT_CONFIG["pauseWhenStreaming"])
     interval = raw.get("intervalSeconds", DEFAULT_CONFIG["intervalSeconds"])
     device_user = raw.get("deviceUser", DEFAULT_CONFIG["deviceUser"])
     device_host = raw.get("deviceHost", DEFAULT_CONFIG["deviceHost"])
@@ -193,6 +197,8 @@ def normalize_config(value: object) -> dict[str, object]:
         enabled = DEFAULT_CONFIG["enabled"]
     if not isinstance(animate_working, bool):
         animate_working = DEFAULT_CONFIG["animateWorking"]
+    if not isinstance(pause_when_streaming, bool):
+        pause_when_streaming = DEFAULT_CONFIG["pauseWhenStreaming"]
     try:
         device_port = int(device_port)
     except (TypeError, ValueError):
@@ -219,6 +225,7 @@ def normalize_config(value: object) -> dict[str, object]:
     return {
         "enabled": enabled,
         "animateWorking": animate_working,
+        "pauseWhenStreaming": pause_when_streaming,
         "intervalSeconds": min(MAX_INTERVAL, max(MIN_INTERVAL, interval)),
         "deviceUser": device_user,
         "deviceHost": device_host,
@@ -611,8 +618,12 @@ def render_wallpaper(snapshot: dict[str, object], provider_id: str = "claude",
     return rendered
 
 
+_last_frames_signature: str | None = None
+
+
 def render_animation_frames(snapshot: dict[str, object], provider_id: str,
                             base_image: Image.Image | None = None) -> list[Path]:
+    global _last_frames_signature
     provider = find_provider(snapshot, provider_id)
     theme = PROVIDERS[provider_id]
     working = provider.get("working") is True
@@ -621,14 +632,18 @@ def render_animation_frames(snapshot: dict[str, object], provider_id: str,
     if base_image is None:
         with Image.open(WALLPAPER_PATH) as source:
             base_image = source.convert("RGB")
-    paths: list[Path] = []
-    for frame in range(ANIMATION_FRAME_COUNT):
+    paths = [ANIMATION_FRAMES_DIR / f"frame-{frame:02d}.png" for frame in range(ANIMATION_FRAME_COUNT)]
+    # Rendering 60 PNGs is the agent's costliest operation and working-state flips can request
+    # it every few seconds; when the base wallpaper is unchanged the existing files are reused.
+    signature = "|".join((provider_id, str(working), hashlib.sha256(base_image.tobytes()).hexdigest()))
+    if signature == _last_frames_signature and all(path.is_file() for path in paths):
+        return paths
+    for frame, path in enumerate(paths):
         frame_image = base_image.copy()
         draw_activity_glyph(frame_image, provider_id, (145, 27), frame, status_color,
                             str(theme["background"]), working)
-        path = ANIMATION_FRAMES_DIR / f"frame-{frame:02d}.png"
         save_png_atomic(frame_image, path, compress_level=1)
-        paths.append(path)
+    _last_frames_signature = signature
     return paths
 
 
@@ -640,6 +655,33 @@ def cleanup_legacy_frame_dirs() -> None:
                 shutil.rmtree(path, ignore_errors=True)
     except OSError:
         pass
+
+
+STREAMER_STATE_SOCKET = os.environ.get("KVM_AI_USAGE_STREAMER_SOCKET", "/run/kvmd/ustreamer.sock")
+STREAM_CHECK_SECONDS = 3.0
+
+
+def stream_clients_active() -> bool:
+    """True while the web console is streaming the captured display to someone. The wallpaper
+    animation yields then: remote view/control must keep the CPU, and concurrent GUI redraws
+    plus capture-encode load is what wedged the vendor video pipeline into D-state once."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.5)
+            sock.connect(STREAMER_STATE_SOCKET)
+            sock.sendall(b"GET /state HTTP/1.0\r\nHost: localhost\r\n\r\n")
+            data = b""
+            while len(data) < 65536:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        body = data.split(b"\r\n\r\n", 1)[1]
+        sinks = json.loads(body).get("result", {}).get("sinks", {})
+        return any(isinstance(sink, dict) and sink.get("has_clients") is True
+                   for sink in sinks.values())
+    except Exception:
+        return False
 
 
 def publish_wallpaper(path: Path = WALLPAPER_PATH, timeout: float = 10) -> None:
@@ -713,8 +755,8 @@ class Agent:
         allowed = {
             key: changes[key]
             for key in (
-                "enabled", "animateWorking", "intervalSeconds", "selectedProvider",
-                "deviceUser", "deviceHost", "devicePort", "activityHosts",
+                "enabled", "animateWorking", "pauseWhenStreaming", "intervalSeconds",
+                "selectedProvider", "deviceUser", "deviceHost", "devicePort", "activityHosts",
             )
             if key in changes
         }
@@ -991,14 +1033,32 @@ class Agent:
             self.stop.wait(WORKING_POLL_SECONDS)
 
     def animation_loop(self) -> None:
+        streaming = False
+        last_stream_check = 0.0
         while not self.stop.is_set():
             with self.lock:
                 animate = bool(self.config.get("animateWorking"))
+                pause_when_streaming = bool(self.config.get("pauseWhenStreaming"))
                 active = bool(self.state.get("selectedProviderActive"))
                 animation_frames = self.animation_frames
             if not (animate and active and animation_frames):
                 self.stop.wait(ANIMATION_INTERVAL_SECONDS)
                 continue
+            if pause_when_streaming:
+                now = time.monotonic()
+                if now - last_stream_check >= STREAM_CHECK_SECONDS:
+                    was_streaming = streaming
+                    streaming = stream_clients_active()
+                    last_stream_check = now
+                    if streaming and not was_streaming:
+                        try:  # Freeze on the static wallpaper while someone is viewing.
+                            with self.refresh_lock:
+                                publish_wallpaper(WALLPAPER_PATH, timeout=3)
+                        except Exception:
+                            pass
+                if streaming:
+                    self.stop.wait(STREAM_CHECK_SECONDS)
+                    continue
             elapsed = time.monotonic() - self.animation_started_at
             next_frame = int(
                 elapsed % ANIMATION_ROTATION_SECONDS

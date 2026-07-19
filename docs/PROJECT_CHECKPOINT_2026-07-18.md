@@ -269,4 +269,27 @@ What remains is deliberately out of scope rather than unresolved:
   gaps) until Claude Code next refreshes it.
 
 There is no open bug list and no planned next milestone. Future work, if any, would start with a
-new provider gaining a supported quota interface.
+new provider gaining a supported quota interface. Longer-term directions (onboarding UX,
+distribution channels, theming, cross-platform helpers) are collected in
+[`ROADMAP.md`](ROADMAP.md).
+
+---
+
+## Update - 2026-07-18 (evening): KVM primary-function protection
+
+Sustained wallpaper animation concurrent with active H.264 web-console streaming wedged the
+device's vendor video pipeline: kernel capture/encode threads stuck in uninterruptible D-state
+(permanent load ~10), compounded by a media-server websocket session pile-up from browser
+retries. A reboot cleared the stuck threads; three safeguards now prevent recurrence:
+
+- **`pauseWhenStreaming`** (new config, default on): the agent polls the streamer's local state
+  socket every 3 s and freezes the animation on the static wallpaper while any web-console video
+  client is connected, so remote view/control never runs concurrently with wallpaper publishing.
+- **Scheduling priority**: the agent starts at nice 15; kvmd video streaming and HID handling
+  always outrank wallpaper work.
+- **Frame-render cache**: the 60 animation frames are re-rendered only when the underlying
+  wallpaper content changes (signature over the composed base image), so working-state flips cost
+  microseconds instead of a full render pass.
+
+A device reboot invalidates the saved Comet web session token; rerun `npm run kvm:configure`
+before the next `npm run kvm:agent:install`.
