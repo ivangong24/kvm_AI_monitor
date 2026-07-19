@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Outbound-only macOS helper. Collects Claude usage/activity locally and pushes signed,
-whitelisted aggregates to the KVM. Provider credentials never leave this process: the push
-secret comes from the login Keychain, the OAuth token (if read) is used in memory only, and
-nothing but the schema fields below is ever sent, printed, or written to disk.
+"""Outbound-only device helper (macOS, Linux, Windows). Collects Claude usage/activity locally
+and pushes signed, whitelisted aggregates to the KVM. Provider credentials never leave this
+process: the push secret comes from the platform vault (macOS Keychain, libsecret, or Windows
+DPAPI, with a 0600-file fallback), the OAuth token (if read) is used in memory only, and nothing
+but the schema fields below is ever sent, printed, or written to disk unencrypted except the
+documented file-backend fallback.
 
-Single stdlib file so it can be copied standalone into Application Support. No inbound socket
-is ever opened."""
+Single stdlib file so it can be copied standalone into the per-user app directory. No inbound
+socket is ever opened."""
 
 from __future__ import annotations
 
@@ -30,7 +32,8 @@ SCHEMA_VERSION = 1
 PROVIDER = "claude"
 ACTIVE_THROTTLE_SECONDS = 20
 
-os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + os.environ.get("PATH", "")
+if sys.platform == "darwin":
+    os.environ["PATH"] = os.pathsep.join(("/opt/homebrew/bin", "/usr/local/bin", os.environ.get("PATH", "")))
 
 
 # --- signing (docs/PUSH_PROTOCOL.md "Request signing") ---------------------------------
@@ -82,14 +85,101 @@ def load_targets():
     return targets
 
 
+# --- push-secret storage: platform vault with a 0600-file fallback ----------------------
+
+def secret_backend():
+    forced = os.environ.get("KVM_AI_SECRET_BACKEND")
+    if forced in ("keychain", "secret-tool", "dpapi", "file"):
+        return forced
+    if sys.platform == "darwin":
+        return "keychain"
+    if sys.platform == "win32":
+        return "dpapi"
+    return "secret-tool" if shutil.which("secret-tool") else "file"
+
+
+def secret_service(kvm_host):
+    return "kvm-ai-monitor-push:" + kvm_host
+
+
+def secret_file(kvm_host):
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", kvm_host)
+    return config_dir() / "secrets" / ("push-" + safe)
+
+
+def _dpapi(data, protect):
+    """Windows DPAPI (user-scoped) via ctypes; real encryption without third-party modules."""
+    import ctypes
+    import ctypes.wintypes as wintypes
+
+    class DataBlob(ctypes.Structure):
+        _fields_ = (("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char)))
+
+    buffer = ctypes.create_string_buffer(data, len(data))
+    incoming = DataBlob(len(data), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_char)))
+    outgoing = DataBlob()
+    call = ctypes.windll.crypt32.CryptProtectData if protect else ctypes.windll.crypt32.CryptUnprotectData
+    if not call(ctypes.byref(incoming), None, None, None, None, 0, ctypes.byref(outgoing)):
+        raise RuntimeError("Windows DPAPI call failed")
+    try:
+        return ctypes.string_at(outgoing.pbData, outgoing.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(outgoing.pbData)
+
+
+def _write_secret_file(path, data):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.write_bytes(data)
+    os.chmod(path, 0o600)
+
+
+def store_secret(kvm_host, secret):
+    backend = secret_backend()
+    if backend == "keychain":
+        subprocess.run(
+            ("/usr/bin/security", "add-generic-password", "-s", secret_service(kvm_host),
+             "-a", "device", "-w", secret, "-U"),
+            capture_output=True, timeout=10, check=True,
+        )
+    elif backend == "secret-tool":
+        subprocess.run(
+            ("secret-tool", "store", "--label", "KVM AI Monitor push secret",
+             "service", secret_service(kvm_host), "account", "device"),
+            input=secret, text=True, capture_output=True, timeout=10, check=True,
+        )
+    elif backend == "dpapi":
+        _write_secret_file(secret_file(kvm_host), _dpapi(secret.encode("utf-8"), protect=True))
+    else:
+        _write_secret_file(secret_file(kvm_host), secret.encode("utf-8"))
+
+
 def load_secret(kvm_host):
-    result = subprocess.run(
-        ("/usr/bin/security", "find-generic-password", "-s", "kvm-ai-monitor-push:" + kvm_host, "-a", "device", "-w"),
-        capture_output=True, text=True, timeout=5, check=False,
-    )
-    secret = result.stdout.strip()
-    if result.returncode != 0 or not secret:
-        raise RuntimeError("push secret not found in Keychain")
+    backend = secret_backend()
+    secret = ""
+    if backend == "keychain":
+        result = subprocess.run(
+            ("/usr/bin/security", "find-generic-password", "-s", secret_service(kvm_host), "-a", "device", "-w"),
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        secret = result.stdout.strip() if result.returncode == 0 else ""
+    elif backend == "secret-tool":
+        result = subprocess.run(
+            ("secret-tool", "lookup", "service", secret_service(kvm_host), "account", "device"),
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        secret = result.stdout.strip() if result.returncode == 0 else ""
+    elif backend == "dpapi":
+        try:
+            secret = _dpapi(secret_file(kvm_host).read_bytes(), protect=False).decode("utf-8").strip()
+        except (OSError, RuntimeError):
+            secret = ""
+    else:
+        try:
+            secret = secret_file(kvm_host).read_text().strip()
+        except OSError:
+            secret = ""
+    if not secret:
+        raise RuntimeError(f"push secret for {kvm_host} not found ({backend} backend)")
     return secret
 
 
@@ -269,17 +359,31 @@ def extract_access_token(data):
     return None
 
 
-def keychain_oauth_limits():
-    token = None
-    try:
+def read_claude_credentials():
+    """Claude Code's credential JSON: the login Keychain on macOS, ~/.claude/.credentials.json
+    on Linux and Windows. The value is used in memory only and never persisted or printed."""
+    if sys.platform == "darwin":
         # The first read shows a Keychain consent dialog; give the user time to answer it.
         result = subprocess.run(
             ("/usr/bin/security", "find-generic-password", "-s", "Claude Code-credentials", "-w"),
             capture_output=True, text=True, timeout=90, check=False,
         )
         if result.returncode != 0 or not result.stdout.strip():
+            return None
+        return result.stdout
+    try:
+        return (pathlib.Path.home() / ".claude" / ".credentials.json").read_text()
+    except OSError:
+        return None
+
+
+def keychain_oauth_limits():
+    token = None
+    try:
+        raw = read_claude_credentials()
+        if not raw:
             return []
-        token = extract_access_token(json.loads(result.stdout))
+        token = extract_access_token(json.loads(raw))
         if not token:
             return []
         request = urllib.request.Request(
@@ -453,6 +557,18 @@ def cmd_print_payload(_args):
     print(json.dumps(build_usage_payload(), indent=2, sort_keys=True))
 
 
+def cmd_store_secret(args):
+    secret = sys.stdin.readline().strip()
+    if not secret:
+        print("kvm-ai-monitor: no secret on stdin", file=sys.stderr)
+        sys.exit(1)
+    try:
+        store_secret(args.kvm, secret)
+    except Exception as error:
+        print(f"kvm-ai-monitor: storing secret failed: {error}", file=sys.stderr)
+        sys.exit(1)
+
+
 def push_to_targets(backend_path, payload, timeout):
     """Push one payload to every configured KVM. Returns (target_count, error_lines);
     error text never contains payload or credential data."""
@@ -515,6 +631,10 @@ def build_parser():
     activity_parser.set_defaults(func=cmd_send_activity)
 
     sub.add_parser("print-payload", help="print the usage payload without sending it").set_defaults(func=cmd_print_payload)
+
+    store_parser = sub.add_parser("store-secret", help="store the device push secret (read from stdin)")
+    store_parser.add_argument("--kvm", required=True)
+    store_parser.set_defaults(func=cmd_store_secret)
     return parser
 
 

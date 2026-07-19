@@ -42,15 +42,19 @@ def save_settings(settings):
         stream.write("\n")
 
 
+# Quoted so a path containing spaces (e.g. "Application Support") stays one argument.
+# Claude Code runs hooks through cmd on Windows, where only double quotes group.
+QUOTE = '"' if sys.platform == "win32" else "'"
+
+
 def command_for(hook_path, event):
-    # Single-quoted so a path containing spaces (e.g. "Application Support") stays one argument.
-    return "'" + hook_path + "' " + EVENT_ARGS[event]
+    return QUOTE + hook_path + QUOTE + " " + EVENT_ARGS[event]
 
 
 def points_to_hook(command, hook_path):
     if not isinstance(command, str):
         return False
-    quoted = "'" + hook_path + "'"
+    quoted = QUOTE + hook_path + QUOTE
     return command == quoted or command.startswith(quoted + " ")
 
 

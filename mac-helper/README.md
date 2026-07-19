@@ -1,8 +1,32 @@
-# macOS device helper
+# Device helper (macOS, Linux, Windows)
 
-Implements the outbound-only side of `docs/PUSH_PROTOCOL.md`: a LaunchAgent that runs in the
-logged-in GUI session (where Keychain consent works), reduces Claude usage to the whitelisted
-aggregate schema, HMAC-signs it, and pushes it to the KVM. Nothing here opens a listening port.
+Implements the outbound-only side of `docs/PUSH_PROTOCOL.md`: a scheduled per-user task that
+reduces Claude usage to the whitelisted aggregate schema, HMAC-signs it, and pushes it to the
+KVM. Nothing here opens a listening port. (The directory name is historical — the same
+stdlib-only helper now runs on all three platforms.)
+
+| | macOS | Linux | Windows |
+|---|---|---|---|
+| Installer | `install-helper.sh` | `install-helper-linux.sh` | `install-helper.ps1` |
+| Scheduler | LaunchAgent (60 s) | systemd user timer (60 s) | Task Scheduler (1 min) |
+| Push secret | login Keychain | libsecret (`secret-tool`), else 0600 file | user-scoped DPAPI file |
+| Claude credentials | Keychain item (consent once) | `~/.claude/.credentials.json` | `~/.claude/.credentials.json` |
+| Claude hook shim | `kvm-ai-claude-hook.sh` | `kvm-ai-claude-hook.sh` | `kvm-ai-claude-hook.cmd` |
+
+Linux/Windows enrollment, with the device ID + one-time secret from the AI Usage page:
+
+```bash
+# Linux (python3 + systemd user session)
+./mac-helper/install-helper-linux.sh --kvm <kvm-ip> --device <device-id>
+
+# Windows (Python 3 on PATH, from PowerShell)
+powershell -ExecutionPolicy Bypass -File mac-helper\install-helper.ps1 -Kvm <kvm-ip> -Device <device-id>
+```
+
+Both print the command that adds Claude Code activity hooks at the end. The
+`KVM_AI_SECRET_BACKEND` environment variable (`keychain` / `secret-tool` / `dpapi` / `file`)
+overrides the automatic secret-storage choice, e.g. for headless Linux boxes without a secret
+service. CI runs the helper test suite on macOS, Ubuntu, and Windows on every push.
 
 ## What runs where
 
@@ -50,11 +74,13 @@ names, session ids, emails, or any credential/token. The OAuth access token read
 (for account limits) and Anthropic's response to `/api/oauth/usage` are held in memory only,
 used to compute `limits`, and discarded — never printed or persisted.
 
-The per-device push secret lives only in the login Keychain (`security add-generic-password`,
-service `kvm-ai-monitor-push:<kvm-host>`, account `device`) and is never written to
-`helper.json` or anywhere else on disk. There is no iCloud sync, no cloud relay, and no
-CodexBar. The Mac never listens on a network port; every push is an outbound HTTPS request the
-helper initiates.
+The per-device push secret lives in the platform vault — login Keychain on macOS (service
+`kvm-ai-monitor-push:<kvm-host>`, account `device`), libsecret on Linux, a user-scoped
+DPAPI-encrypted file on Windows — and is never written to `helper.json`. The only exception is
+the documented Linux fallback for machines without a secret service: a 0600 file under
+`~/.kvm-ai-monitor/secrets/`. There is no iCloud sync, no cloud relay, and no CodexBar. The
+device never listens on a network port; every push is an outbound HTTPS request the helper
+initiates.
 
 ## Keychain consent
 

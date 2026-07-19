@@ -110,6 +110,11 @@ Goal: a user who has never opened a terminal can go from unboxing to a working w
 
 ## 5. Cross-platform support (Linux and Windows)
 
+> **Status (v1.2.0):** helper port shipped — platform secret backends (Keychain / libsecret /
+> DPAPI / file fallback), `~/.claude/.credentials.json` credential source, systemd-timer and
+> Task Scheduler installers, Windows hook shim, and a macOS/Ubuntu/Windows CI matrix.
+> Remaining: cross-platform *setup* tooling (the wizard still assumes a macOS setup machine).
+
 Goal: monitored devices and the setup machine can run Linux or Windows, not just macOS.
 
 - **Helper port (highest value, lowest effort).** The push helper is a single stdlib Python file;

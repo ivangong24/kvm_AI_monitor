@@ -48,12 +48,13 @@ def fixture_event(date, message_id, input_tokens, output_tokens, cache_read=0, c
 
 
 class HomeIsolatedTestCase(unittest.TestCase):
-    """Points $HOME at a scratch directory so tests never touch the real machine's files."""
+    """Points the home directory at a scratch directory so tests never touch real files.
+    Sets both HOME (POSIX) and USERPROFILE (Windows) so Path.home() is isolated everywhere."""
 
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tempdir.cleanup)
-        patcher = mock.patch.dict(os.environ, {"HOME": self.tempdir.name})
+        patcher = mock.patch.dict(os.environ, {"HOME": self.tempdir.name, "USERPROFILE": self.tempdir.name})
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -346,6 +347,59 @@ class MultiTargetTests(HomeIsolatedTestCase):
         self._write_config({"targets": [{"kvmHost": "kvm-a", "deviceId": "d-1"}]})
         with self.assertRaises(SystemExit):
             helper.cmd_send_usage(mock.Mock())
+
+
+class SecretBackendTests(HomeIsolatedTestCase):
+    def test_forced_backend_env_wins(self):
+        with mock.patch.dict(os.environ, {"KVM_AI_SECRET_BACKEND": "file"}):
+            self.assertEqual(helper.secret_backend(), "file")
+
+    def test_platform_defaults(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("KVM_AI_SECRET_BACKEND", None)
+            with mock.patch.object(helper.sys, "platform", "darwin"):
+                self.assertEqual(helper.secret_backend(), "keychain")
+            with mock.patch.object(helper.sys, "platform", "win32"):
+                self.assertEqual(helper.secret_backend(), "dpapi")
+            with mock.patch.object(helper.sys, "platform", "linux"):
+                with mock.patch.object(helper.shutil, "which", return_value="/usr/bin/secret-tool"):
+                    self.assertEqual(helper.secret_backend(), "secret-tool")
+                with mock.patch.object(helper.shutil, "which", return_value=None):
+                    self.assertEqual(helper.secret_backend(), "file")
+
+    def test_file_backend_round_trip_and_permissions(self):
+        with mock.patch.dict(os.environ, {"KVM_AI_SECRET_BACKEND": "file"}):
+            helper.store_secret("kvm-a", "0123456789abcdef")
+            self.assertEqual(helper.load_secret("kvm-a"), "0123456789abcdef")
+            if os.name == "posix":
+                mode = helper.secret_file("kvm-a").stat().st_mode & 0o777
+                self.assertEqual(mode, 0o600)
+
+    def test_missing_secret_raises_with_backend_name(self):
+        with mock.patch.dict(os.environ, {"KVM_AI_SECRET_BACKEND": "file"}):
+            with self.assertRaisesRegex(RuntimeError, "file backend"):
+                helper.load_secret("kvm-unknown")
+
+    @unittest.skipUnless(sys.platform == "win32", "DPAPI exists only on Windows")
+    def test_dpapi_backend_round_trip(self):
+        with mock.patch.dict(os.environ, {"KVM_AI_SECRET_BACKEND": "dpapi"}):
+            helper.store_secret("kvm-w", "fedcba9876543210")
+            self.assertEqual(helper.load_secret("kvm-w"), "fedcba9876543210")
+
+
+class CredentialSourceTests(HomeIsolatedTestCase):
+    def test_non_macos_reads_claude_credentials_file(self):
+        claude_dir = pathlib.Path(self.tempdir.name) / ".claude"
+        claude_dir.mkdir()
+        (claude_dir / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "tok-file"}}))
+        with mock.patch.object(helper.sys, "platform", "linux"):
+            raw = helper.read_claude_credentials()
+        self.assertEqual(helper.extract_access_token(json.loads(raw)), "tok-file")
+
+    def test_non_macos_missing_credentials_returns_none(self):
+        with mock.patch.object(helper.sys, "platform", "linux"):
+            self.assertIsNone(helper.read_claude_credentials())
 
 
 class AccountLimitsCacheTests(HomeIsolatedTestCase):

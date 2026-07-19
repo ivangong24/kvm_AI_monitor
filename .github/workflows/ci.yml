@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Helper unit tests (all platforms)
+        run: python mac-helper/test_helper.py
+      - name: KVM agent tests (the agent only ever runs on Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          python kvm-agent/test_push_receiver.py
+          python kvm-agent/test_ssh_collector.py
+      - name: Node tests (Comet client, CLI, cross-language HMAC vector)
+        run: npm test
+      - name: Shell syntax checks
+        if: runner.os != 'Windows'
+        run: |
+          sh -n kvm-agent/service.sh
+          sh -n kvm-agent/install-on-device.sh
+          sh -n kvm-agent/uninstall-on-device.sh
+          sh -n mac-helper/install-helper-linux.sh
+      - name: PowerShell installer parse check
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $tokens = $null; $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("mac-helper/install-helper.ps1", [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Error $_.Message } }
+      - name: Linux end-to-end helper simulation
+        if: runner.os == 'Linux'
+        env:
+          KVM_AI_SECRET_BACKEND: file
+        run: |
+          # Store a secret, seed a fresh limits cache (so no network fetch is attempted),
+          # write a fake Claude credentials file, and confirm the payload builder produces
+          # the whitelisted schema on Linux with the file-based sources.
+          mkdir -p ~/.claude
+          echo '{"claudeAiOauth": {"accessToken": "tok-ci-fake"}}' > ~/.claude/.credentials.json
+          printf '0123456789abcdef0123456789abcdef0123456789abcdef\n' | \
+            python mac-helper/kvm_ai_push.py store-secret --kvm 192.0.2.1
+          python - <<'PY'
+          import json, pathlib, subprocess, sys, time
+          cache_dir = pathlib.Path.home() / ".kvm-ai-monitor"
+          cache_dir.mkdir(mode=0o700, exist_ok=True)
+          (cache_dir / "limits-cache.json").write_text(json.dumps({
+              "fetchedAt": time.time(), "attemptedAt": time.time(),
+              "limits": [{"label": "Weekly limit", "usedPercent": 12, "windowMinutes": 10080}],
+          }))
+          payload = json.loads(subprocess.run(
+              [sys.executable, "mac-helper/kvm_ai_push.py", "print-payload"],
+              capture_output=True, text=True, check=True).stdout)
+          allowed = {"schemaVersion", "provider", "collectedAt", "plan", "loggedIn", "limits", "daily"}
+          assert set(payload) <= allowed, payload.keys()
+          assert payload["provider"] == "claude"
+          assert payload["limits"][0]["label"] == "Weekly limit"
+          assert "tok-ci-fake" not in json.dumps(payload)
+          print("linux payload simulation OK")
+          PY

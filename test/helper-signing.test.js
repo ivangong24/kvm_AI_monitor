@@ -6,11 +6,12 @@ import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const helperPath = path.join(here, "..", "mac-helper", "kvm_ai_push.py");
+const python = process.platform === "win32" ? "python" : "python3";
 
-test("mac helper reproduces the push protocol HMAC test vector", () => {
+test("device helper reproduces the push protocol HMAC test vector", () => {
   const body = '{"event":"active","provider":"claude","schemaVersion":1}';
   const result = spawnSync(
-    "python3",
+    python,
     [
       helperPath,
       "sign",
