@@ -1,177 +1,113 @@
 # KVM AI Monitor
 
-The project is feature-complete for its supported providers; the design history and current
-status are recorded in
-[`docs/PROJECT_CHECKPOINT_2026-07-18.md`](docs/PROJECT_CHECKPOINT_2026-07-18.md).
+Turn a GL.iNet Comet Pro KVM's touchscreen into a live AI-usage dashboard. The KVM renders a
+480×160 wallpaper showing your AI subscription usage — Claude Code's account-accurate current
+session, weekly, and model-scoped limits, Codex plan windows and daily tokens — plus an
+animated working indicator whenever an agent is actively processing on any enrolled device.
 
-KVM AI Monitor is a GL.iNet Comet Pro extension that discovers an authorized computer, reads AI
-subscription usage over SSH, and renders a 480x160 wallpaper entirely on the KVM. No computer runs a
-dashboard, telemetry server, scheduled exporter, or wallpaper renderer, and the display continues to
-operate without an HDMI source.
+- Everything renders on the KVM itself; your computers never run a dashboard, server, or open
+  port. Enrolled devices push signed, whitelisted usage aggregates outbound; credentials never
+  leave the device they live on.
+- Works across devices and accounts: enroll any number of macOS, Linux, or Windows machines,
+  and one machine can push to several KVMs.
+- The KVM's primary job always wins: the animation pauses automatically while anyone is
+  remote-viewing, and the agent runs at low priority.
+- Copilot, Gemini CLI, and Grok get installation/sign-in detection; their vendors expose no
+  supported consumer quota API yet.
 
-## Architecture
+![Wallpaper rendered on the KVM touchscreen (sample data)](docs/images/wallpaper-claude.png)
 
-The persistent agent at `/etc/kvmd/user/ai-usage` owns the complete display pipeline. Usage is collected via two channels:
+## Prerequisites
 
-1. **SSH collector** (primary): The KVM generates a dedicated Ed25519 key and scans its local subnet for a device that accepts it. The KVM opens a short, noninteractive SSH session and runs a read-only in-memory collector. The collector detects Claude Code, Codex, GitHub Copilot, Gemini CLI, and Grok installations and invokes supported read-only interfaces in the installed provider CLI or desktop bundle.
-
-2. **Push devices** (outbound-only): Enrolled Macs run a local helper in the GUI session that reads Claude usage natively via Keychain consent, signs the aggregate schema with a per-device secret, and POSTs it over HTTPS to an unauthenticated-but-signed KVM endpoint. Push devices do not require Remote Login or a network-facing listener.
-
-The KVM accepts only whitelisted aggregate fields, renders the selected provider wallpaper, and publishes it through the Comet GUI. The connected computer's Remote Login remains the only inbound server; there is no KVM AI Monitor process running on that computer. Automatic discovery selects only a host that accepts the KVM's dedicated key, so an address change does not require reconfiguration.
-
-## Privacy
-
-- The KVM key is generated and stored only on the KVM with mode `0600`.
-- Each push device gets a revocable per-device secret (48 hex chars) stored on the KVM and in the device's Keychain.
-- Push requests are signed with HMAC-SHA256; the signature includes the request path, method, timestamp, and body hash.
-- Passwords, tokens, provider credentials, prompts, responses, source code, session records, project
-  names, filesystem paths, account emails, and raw provider output are not returned or persisted.
-- Push payloads contain only: plan label, quota percentages, reset times, daily token categories by date, and timestamps. Session IDs, transcript paths, working directories, and prompts are discarded at ingest.
-- Authentication files are checked only for existence; their contents are never opened.
-- Only quota percentages, reset times, daily token categories, equivalent cost totals, installation
-  booleans, and aggregate working booleans enter the display snapshot.
-- There is no iCloud sync and no cross-device usage exporter. Additional activity devices are polled
-  directly by the KVM and return no account identity, prompt, response, project, or path data.
-
-Codex's native app-server supplies account-wide quota windows and daily token buckets. Claude Code's
-native logs supply connected-device token totals; Anthropic does not expose a documented equivalent
-account-wide token-history command. Push device usage is collected natively on the Mac via Keychain
-without SSH. API-equivalent cost is not estimated.
+- A GL.iNet Comet Pro with its admin password (2FA supported), reachable on your LAN.
+- A macOS machine with Node.js 22+ to run the setup wizard (Linux/Windows *monitored* devices
+  are supported; the setup machine itself is macOS-only for now).
+- On each monitored device: Python 3 and Claude Code signed in (`claude` CLI) for Claude data.
 
 ## Install
 
-The fastest path — one command on any Mac (Node.js 22+) on the same network as the Comet:
+One command on a Mac on the same network:
 
 ```bash
-npx github:ivangong24/kvm_AI_monitor
+npx github:ivangong24/kvm_AI_monitor        # or: brew install ivangong24/kvm-ai-monitor/kvm-ai-monitor && kvm-ai-monitor
 ```
 
-The guided wizard discovers the Comet on your network, signs in with the admin password
-(saving only a revocable session token in your Keychain), installs the on-device agent,
-switches the touchscreen to Wallpaper Only, enrolls the Mac it runs on as a push device, and
-finishes with a health check. No other terminal commands are needed.
+The wizard discovers the Comet, signs in (only a revocable session token is kept, in your
+Keychain), installs the on-device agent, switches the touchscreen to Wallpaper Only, enrolls
+the Mac it runs on as a push device (with optional Claude Code hooks for exact working-state
+animation), and finishes with a health check. From a clone: `npm run setup`.
 
-Via Homebrew:
+### Enrolling more devices
+
+On the AI Usage page (`https://<comet-ip>/extras/ai-usage/`), use **Enroll a device** to get a
+device ID and one-time secret, then on that device run:
 
 ```bash
-brew install ivangong24/kvm-ai-monitor/kvm-ai-monitor
-kvm-ai-monitor
+# macOS
+./mac-helper/install-helper.sh --kvm <comet-ip> --device <device-id>
+
+# Linux (systemd user session)
+./mac-helper/install-helper-linux.sh --kvm <comet-ip> --device <device-id>
+
+# Windows (PowerShell, Python 3 on PATH)
+powershell -ExecutionPolicy Bypass -File mac-helper\install-helper.ps1 -Kvm <comet-ip> -Device <device-id>
 ```
 
-There is also a menu bar companion app showing enrollment/push health with one-click actions —
-build it with `./desktop/build.sh` (see [`desktop/README.md`](desktop/README.md)).
-
-From a clone, the same wizard runs with:
-
-```bash
-git clone git@github.com:ivangong24/kvm_AI_monitor.git
-cd kvm_AI_monitor
-npm run setup
-```
-
-The classic step-by-step scripts still work and are what the wizard drives internally:
-
-```bash
-npm run kvm:configure
-npm run kvm:agent:install
-```
-
-`kvm:configure` asks for the Comet admin password and current 2FA code. It saves the resulting
-revocable Comet session token in macOS Keychain and immediately deletes the admin password. The
-Comet agent itself uses the firmware's Python, Dropbear SSH client, Pillow, nginx extension
-support, and persistent user scripts. One Mac can be enrolled against several KVMs; the helper
-pushes to every configured target.
-
-### Primary device with SSH
-
-1. On the computer to monitor, enable **System Settings > General > Sharing > Remote Login**.
-2. Open `https://<comet-address>/extras/ai-usage/` after signing in to the Comet.
-3. Copy the displayed KVM public key into `~/.ssh/authorized_keys` for that macOS user. Restrict it to
-   the KVM address and disable forwarding and PTY allocation where practical.
-4. Enter the macOS username, leave the device address as `auto`, and select **Save**.
-5. Under the Comet's **Settings > System > Screen Display**, choose **Wallpaper Only** and apply it.
-
-### Alternate: push device without Remote Login
-
-Instead of or in addition to SSH, enroll a push device on the AI Usage page:
-
-1. Enter a device name (e.g., "Mac mini") and select **Add device**.
-2. Copy the install command and device secret.
-3. On the enrolled Mac, run: `./mac-helper/install-helper.sh --kvm <comet-address> --device <id>` (paste the secret when prompted).
-4. Optionally, for exact working-state animation without Remote Login, also run: `./mac-helper/install-claude-hooks.sh`.
-
-Push devices do not require Remote Login and run only in the logged-in GUI session. You can revoke,
-rotate the secret, or delete a device at any time from the AI Usage page.
-
-### Additional activity devices
-
-To include live activity from another device using the same subscription, enable Remote Login there,
-authorize the same restricted KVM key, and add its address under **Additional activity devices** (format: `[user@]host[:port]`, e.g., `anna@192.168.0.25` or `mini.local:2222`). The primary connected device remains the only source for installation, authentication, and usage totals.
-
-The AI Usage page provides provider selection, connected-device diagnostics, refresh controls, status,
-and a wallpaper preview. The wallpaper is retained if the device is temporarily offline.
-
-CodexBar is not read or invoked. Codex uses the installed CLI or the helper embedded in Codex.app.
-Claude requires Claude Code CLI authentication (`claude auth login`) for native account state; the
-consumer Claude desktop app does not expose the same read-only usage interface. When a push device is
-enrolled and pushing usage, Claude's plan, limits, and daily token totals come from the device helper
-without requiring the SSH probe to read the Keychain. Account quota limits therefore arrive via the
-device helper running in the GUI session. Other providers are reported as installed and authenticated
-only when their native artifacts support that detection. When Claude reports `verification_required`
-over SSH, the display still renders any locally collected token totals instead of the setup screen.
-The agent checks the protected `Claude Code-credentials` Keychain item only for existence and never
-reads or copies its protected value. The complete push protocol — enrollment, HMAC signing, replay
-protection, payload whitelist, and merge rules — is specified in
-[`docs/PUSH_PROTOCOL.md`](docs/PUSH_PROTOCOL.md); the helper's commands are documented in
+Each installer schedules a per-minute usage push (LaunchAgent / systemd timer / Task
+Scheduler), stores the secret in the platform vault (Keychain / libsecret / Windows DPAPI),
+and prints the command that adds Claude Code activity hooks. Details:
 [`mac-helper/README.md`](mac-helper/README.md).
 
-## Runtime
+Optionally, a device can instead be read over SSH ("Connected device" on the page): enable
+Remote Login, authorize the KVM's public key, and enter the username. SSH devices provide
+install/auth detection and working-state presence; push devices provide full usage and are the
+recommended path.
 
-The agent refreshes once per minute by default. Its configuration is stored on the KVM at
-`/etc/kvmd/user/ai-usage/config.json`; its private key is
-`/etc/kvmd/user/ai-usage/device-key`. The KVM performs a lightweight activity probe over SSH every
-five seconds, independently of the slower account refresh. The probe combines agent process state
-with Codex rollout and Claude transcript modification times using a 120-second active window. Push
-devices send activity events (`start` / `active` / `stop`) that also trigger animation with a 120-second expiry;
-push-sourced work is distinct from SSH-sourced work. While
-the selected native agent is working on the primary or an enrolled activity device or any push device,
-the indicator uses 60 cached motion phases with a two-second rotation and publishes at 10 frames per
-second, which the GUI event loop sustains once its background copies are kept off flash. The KVM's
-primary function always wins: the agent runs at nice 15, animation frames are cached and only
-re-rendered when the wallpaper content changes, and while anyone is actively viewing the web
-console's video stream the animation pauses on the static wallpaper (`pauseWhenStreaming`, on by
-default) so remote view and control never compete with wallpaper publishing. Animation frames live at
-stable paths under `/tmp/kvm-ai-frames/` and are only ever replaced atomically, never deleted, so a
-queued GUI event can never reference a missing file (which would blank the screen). The Comet GUI
-copies every published background into two directories on its flash-backed overlay; the agent's
-service script mounts a tmpfs over both so animation does not wear the eMMC or slow the GUI event
-loop (the uninstaller unmounts them, restoring stock behavior). Activity probing, usage collection,
-and frame publishing run in separate threads, so a slow SSH probe cannot pause the animation.
+## Usage
 
-Push device usage is retained when the device goes offline; only working state expires. Last successful
-aggregates from the device are preserved in the display until deleted or revoked.
+Manage everything at `https://<comet-ip>/extras/ai-usage/`:
 
-No provider currently exposes a supported subscription API for real-time work occurring on arbitrary
-devices. Cross-device animation therefore covers only explicitly enrolled, online SSH devices and push
-devices with active working events. The remote SSH command is ephemeral and read-only; CodexBar, a daemon, exporter, renderer, and scheduler are
-not installed or invoked on those devices.
+- **Display provider** — choose which subscription the touchscreen shows (Claude, Codex, …),
+  each with its own brand colors and working-glyph animation.
+- **Push devices** — enroll, rotate secrets, revoke, or delete devices; last-seen times shown.
+- **Display settings** — enable/disable the wallpaper, working animation, and refresh interval.
+  A live wallpaper preview and health status are on the same page.
+- **Updates** — the page shows the agent version and checks GitHub releases on demand; update
+  with `npx github:ivangong24/kvm_AI_monitor install-agent` (or `brew upgrade` + the same).
 
-Remove the KVM extension while preserving its configuration with:
+The wallpaper shows current-session and weekly limit bars with reset times, today's and
+30-day token totals, and animates while the selected agent is working on any enrolled device
+(120-second activity window; exact per-turn state when Claude hooks are installed). Usage data
+is retained while a device is offline; the animation pauses during active remote viewing
+(`pauseWhenStreaming`).
+
+A menu bar companion app for macOS (enrollment health, one-click actions) can be built with
+`./desktop/build.sh` — see [`desktop/README.md`](desktop/README.md).
+
+## Privacy
+
+Push payloads contain only plan label, quota percentages, reset times, and daily token
+counts — never prompts, responses, paths, project names, emails, or credentials. Every push is
+HMAC-signed with a revocable per-device secret; the OAuth token used to read Claude's account
+limits stays in memory on the device that owns it. Inspect exactly what would be sent with
+`npm run helper:status`. Full protocol: [`docs/PUSH_PROTOCOL.md`](docs/PUSH_PROTOCOL.md).
+
+## Uninstall
 
 ```bash
-npm run kvm:agent:uninstall
+npm run kvm:agent:uninstall    # remove the KVM extension (config preserved on the KVM)
+npm run helper:uninstall       # remove this Mac's helper (--purge also removes secrets)
 ```
 
 ## Development
 
 ```bash
-python3 kvm-agent/test_ssh_collector.py
+npm test                          # Node: Comet client, CLI, cross-language HMAC vector
+python3 mac-helper/test_helper.py # helper unit tests (also run on Linux/Windows in CI)
 python3 kvm-agent/test_push_receiver.py
-python3 mac-helper/test_helper.py
-npm test
+python3 kvm-agent/test_ssh_collector.py
 ```
 
-`npm test` covers Comet authentication payload handling. The Python tests verify aggregate conversion,
-HMAC signature verification, replay protection, stale activity expiry, and ensure sensitive or
-content-bearing fields are dropped at the push receiver. The mac-helper tests verify the native
-Claude usage parsing and schema compliance.
+CI runs the suite on macOS, Ubuntu, and Windows. Design history and device internals are in
+[`docs/PROJECT_CHECKPOINT_2026-07-18.md`](docs/PROJECT_CHECKPOINT_2026-07-18.md); future
+directions in [`docs/ROADMAP.md`](docs/ROADMAP.md).
