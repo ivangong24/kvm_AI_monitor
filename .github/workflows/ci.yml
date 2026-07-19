@@ -25,6 +25,7 @@ jobs:
       - name: KVM agent tests (the agent only ever runs on Linux/macOS)
         if: runner.os != 'Windows'
         run: |
+          python -m pip install --quiet pillow  # the Comet firmware ships Pillow for the renderer
           python kvm-agent/test_push_receiver.py
           python kvm-agent/test_ssh_collector.py
       - name: Node tests (Comet client, CLI, cross-language HMAC vector)
