@@ -69,6 +69,9 @@ Manage everything at `https://<comet-ip>/extras/ai-usage/`:
 
 - **Display provider** — choose which subscription the touchscreen shows (Claude, Codex, …),
   each with its own brand colors and working-glyph animation.
+- **Appearance** — customize the selected provider's wallpaper colors, working-glyph style, and
+  whether limit rows lead with percent used or time to reset, with an instant live preview;
+  themes are validated JSON stored on the KVM (export/import supported, one-click reset).
 - **Push devices** — enroll, rotate secrets, revoke, or delete devices; last-seen times shown.
 - **Display settings** — enable/disable the wallpaper, working animation, and refresh interval.
   A live wallpaper preview and health status are on the same page.

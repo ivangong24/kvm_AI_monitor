@@ -92,6 +92,11 @@ Goal: a user who has never opened a terminal can go from unboxing to a working w
 
 ## 4. Themes, widgets, and user customization
 
+> **Status (v1.4.0):** theme system and editor shipped — per-provider color editing with a live
+> rendered preview (`POST /api/theme/preview`), glyph-style selection, percent vs. time-to-reset
+> emphasis, JSON import/export, strict server-side validation with built-in fallback, and
+> instant republish on save. Remaining: the widget/layout system and additional display options.
+
 - **Theme system**: extract the hardcoded `PROVIDERS` styling into versioned JSON theme files on
   the KVM (colors, bar colors, fonts, background treatment per provider). Ship the current look
   as the default theme set. The AI Usage page gets a theme editor with live rendered preview

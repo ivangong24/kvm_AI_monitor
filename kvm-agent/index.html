@@ -100,6 +100,12 @@
       .preview { width: 100%; aspect-ratio: 3 / 1; display: block; object-fit: contain; object-position: left top; background: #0d1112; border: 1px solid #303637; border-radius: 12px; }
       #error { min-height: 18px; margin: 12px 0 0; color: var(--bad); font-size: 13px; }
       .linklike { border: none; background: none; padding: 0; color: var(--muted); font-size: inherit; text-decoration: underline; cursor: pointer; }
+      .theme-colors { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 6px; }
+      .theme-colors label { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 13px; color: var(--muted); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+      .theme-colors input[type="color"] { width: 34px; height: 26px; padding: 0; border: 1px solid var(--line); border-radius: 6px; background: none; cursor: pointer; }
+      .theme-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+      #theme-preview { margin-top: 14px; }
+      @media (max-width: 720px) { .theme-colors { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
       #wizard .row code { align-self: center; }
       #wizard .section-heading h2::before { content: "★ "; color: var(--selected); }
       @media (max-width: 720px) {
@@ -194,6 +200,33 @@
         <div class="provider-options" id="provider-options" role="radiogroup" aria-label="AI provider"></div>
       </section>
 
+      <section class="band" aria-labelledby="appearance-heading">
+        <div class="section-heading"><h2 id="appearance-heading">Appearance</h2><p>Customize the selected provider's wallpaper. Changes preview instantly and apply to the touchscreen when saved.</p></div>
+        <div class="theme-colors" id="theme-colors"></div>
+        <div class="row">
+          <div class="label"><strong>Working glyph</strong><span>Animation drawn while the agent is processing</span></div>
+          <select id="glyphStyle" aria-label="Working glyph style">
+            <option value="claude">Wave (Claude)</option><option value="codex">Ring (Codex)</option>
+            <option value="copilot">Eyes (Copilot)</option><option value="gemini">Star (Gemini)</option>
+            <option value="grok">Comet (Grok)</option>
+          </select>
+        </div>
+        <div class="row">
+          <div class="label"><strong>Limit emphasis</strong><span>Lead the limit rows with percent used or time to reset (applies to all providers)</span></div>
+          <select id="limitEmphasis" aria-label="Limit emphasis">
+            <option value="percent">Percent used</option><option value="time">Time to reset</option>
+          </select>
+        </div>
+        <img id="theme-preview" class="preview" alt="Theme preview" hidden />
+        <div class="theme-actions">
+          <button class="command" id="themeSave" type="button">Save &amp; apply</button>
+          <button class="command" id="themeReset" type="button">Reset provider</button>
+          <button class="command" id="themeExport" type="button">Export JSON</button>
+          <button class="command" id="themeImportBtn" type="button">Import JSON</button>
+          <input type="file" id="themeImport" accept="application/json,.json" hidden />
+        </div>
+      </section>
+
       <section class="diagnostic" aria-live="polite">
         <div class="diagnostic-brand" id="diagnostic-brand"><img id="provider-logo" alt="" /><span class="provider-state"><i class="dot" id="provider-dot"></i><span id="provider-state">Checking device</span></span></div>
         <div class="diagnostic-body">
@@ -245,7 +278,7 @@
         { id: "grok", name: "Grok Build" },
       ];
       const stateLabels = { ready: "Usage ready", not_installed: "Install required", login_required: "Sign in required", verification_required: "Verify sign-in on device", usage_unavailable: "Usage unavailable" };
-      const elements = Object.fromEntries(["deviceUser", "deviceHost", "activityHosts", "deviceKey", "saveDevice", "enabled", "animateWorking", "interval", "refresh", "agent", "source", "activityDevices", "updated", "preview", "error", "host", "provider-options", "diagnostic-brand", "provider-logo", "provider-dot", "provider-state", "provider-title", "provider-note", "next-action", "provider-command", "provider-guide", "provider-paths", "deviceName", "addDevice", "secret-panel", "secret-device-id", "secret-value", "install-command", "devices-list", "dismiss-secret", "wizard", "version", "checkUpdate", "update-panel", "update-command"].map(id => [id, document.getElementById(id)]));
+      const elements = Object.fromEntries(["deviceUser", "deviceHost", "activityHosts", "deviceKey", "saveDevice", "enabled", "animateWorking", "interval", "refresh", "agent", "source", "activityDevices", "updated", "preview", "error", "host", "provider-options", "diagnostic-brand", "provider-logo", "provider-dot", "provider-state", "provider-title", "provider-note", "next-action", "provider-command", "provider-guide", "provider-paths", "deviceName", "addDevice", "secret-panel", "secret-device-id", "secret-value", "install-command", "devices-list", "dismiss-secret", "wizard", "version", "checkUpdate", "update-panel", "update-command", "theme-colors", "glyphStyle", "limitEmphasis", "theme-preview", "themeSave", "themeReset", "themeExport", "themeImportBtn", "themeImport"].map(id => [id, document.getElementById(id)]));
       let current = null;
       let saving = false;
       let devices = [];
@@ -384,6 +417,7 @@
         try {
           await api("api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ selectedProvider: id }) });
           show(await api("api/refresh", { method: "POST" }));
+          renderThemeEditor();
         } catch (error) { elements.error.textContent = error.message; }
         finally { saving = false; }
       }
@@ -513,6 +547,111 @@
       elements.enabled.addEventListener("change", saveConfig);
       elements.animateWorking.addEventListener("change", saveConfig);
       elements.interval.addEventListener("change", saveConfig);
+      // --- theme editor -------------------------------------------------------------
+      const THEME_FIELDS = [
+        ["background", "Background"], ["text", "Text"], ["muted", "Muted text"], ["line", "Lines"],
+        ["track", "Bar track"], ["bar", "Bar color"], ["accent", "Accent"], ["secondary", "Working color"],
+      ];
+      let themeDoc = { schemaVersion: 1, providers: {} };
+      let themeBuiltin = {};
+      let previewTimer = null;
+      let previewUrl = null;
+
+      function themeFor(id) {
+        return { ...(themeBuiltin[id] || {}), ...((themeDoc.providers || {})[id] || {}) };
+      }
+      function setOverride(id, key, value) {
+        themeDoc.providers = themeDoc.providers || {};
+        themeDoc.providers[id] = themeDoc.providers[id] || {};
+        themeDoc.providers[id][key] = value;
+      }
+      function renderThemeEditor() {
+        const id = current?.selectedProvider || "claude";
+        const merged = themeFor(id);
+        elements["theme-colors"].replaceChildren(...THEME_FIELDS.map(([key, label]) => {
+          const wrap = document.createElement("label");
+          const input = document.createElement("input");
+          input.type = "color";
+          input.value = merged[key] || "#000000";
+          input.addEventListener("input", () => { setOverride(id, key, input.value); schedulePreview(); });
+          wrap.append(label, input);
+          return wrap;
+        }));
+        elements.glyphStyle.value = merged.glyph || id;
+        elements.limitEmphasis.value = themeDoc.display?.limitEmphasis || "percent";
+        schedulePreview();
+      }
+      function schedulePreview() {
+        clearTimeout(previewTimer);
+        previewTimer = setTimeout(async () => {
+          const id = current?.selectedProvider || "claude";
+          try {
+            const response = await fetch("api/theme/preview", {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ provider: id, theme: themeDoc }),
+            });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const blob = await response.blob();
+            if (previewUrl) URL.revokeObjectURL(previewUrl);
+            previewUrl = URL.createObjectURL(blob);
+            elements["theme-preview"].src = previewUrl;
+            elements["theme-preview"].hidden = false;
+          } catch (error) { elements.error.textContent = `Preview failed: ${error.message}`; }
+        }, 250);
+      }
+      async function loadTheme() {
+        try {
+          const data = await api("api/theme");
+          themeDoc = data.theme || { schemaVersion: 1, providers: {} };
+          themeBuiltin = data.builtin || {};
+          renderThemeEditor();
+        } catch { /* agent predating themes; leave the editor at defaults */ }
+      }
+      elements.glyphStyle.addEventListener("change", () => {
+        setOverride(current?.selectedProvider || "claude", "glyph", elements.glyphStyle.value);
+        schedulePreview();
+      });
+      elements.limitEmphasis.addEventListener("change", () => {
+        themeDoc.display = { limitEmphasis: elements.limitEmphasis.value };
+        schedulePreview();
+      });
+      elements.themeSave.addEventListener("click", async () => {
+        try {
+          const result = await api("api/theme", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ theme: themeDoc }),
+          });
+          themeDoc = result.theme;
+          elements.error.textContent = "";
+          setTimeout(() => { elements.preview.src = `wallpaper.png?t=${Date.now()}`; }, 800);
+        } catch (error) { elements.error.textContent = `Theme save failed: ${error.message}`; }
+      });
+      elements.themeReset.addEventListener("click", () => {
+        const id = current?.selectedProvider || "claude";
+        if (themeDoc.providers) delete themeDoc.providers[id];
+        renderThemeEditor();
+      });
+      elements.themeExport.addEventListener("click", () => {
+        const blob = new Blob([JSON.stringify(themeDoc, null, 2)], { type: "application/json" });
+        const link = document.createElement("a");
+        link.href = URL.createObjectURL(blob);
+        link.download = "kvm-ai-monitor-theme.json";
+        link.click();
+        URL.revokeObjectURL(link.href);
+      });
+      elements.themeImportBtn.addEventListener("click", () => elements.themeImport.click());
+      elements.themeImport.addEventListener("change", async () => {
+        const file = elements.themeImport.files?.[0];
+        if (!file) return;
+        try {
+          const parsed = JSON.parse(await file.text());
+          if (parsed?.schemaVersion !== 1) throw new Error("not a theme document");
+          themeDoc = parsed;
+          renderThemeEditor();
+        } catch (error) { elements.error.textContent = `Import failed: ${error.message}`; }
+        elements.themeImport.value = "";
+      });
+
       elements.saveDevice.addEventListener("click", saveDevice);
       elements.addDevice.addEventListener("click", addDevice);
       elements.checkUpdate.addEventListener("click", checkForUpdates);
@@ -526,7 +665,7 @@
         catch (error) { elements.error.textContent = error.message; }
         finally { elements.refresh.disabled = false; }
       });
-      load();
+      load().then(loadTheme);
       setInterval(load, 15000);
     </script>
   </body>

@@ -193,34 +193,59 @@ class ThemeLoaderTests(unittest.TestCase):
             os.unlink(path)
 
     def test_valid_override_is_applied(self):
-        themes = self._load_with(json.dumps({
+        themes, display = self._load_with(json.dumps({
             "schemaVersion": 1,
-            "providers": {"claude": {"bar": "#123456"}},
+            "providers": {"claude": {"bar": "#123456", "glyph": "gemini"}},
+            "display": {"limitEmphasis": "time"},
         }))
         self.assertEqual(themes["claude"]["bar"], "#123456")
+        self.assertEqual(themes["claude"]["glyph"], "gemini")
         self.assertEqual(themes["codex"]["bar"], "#10a37f")  # untouched provider keeps builtin
+        self.assertEqual(display["limitEmphasis"], "time")
 
     def test_invalid_colors_unknown_keys_and_providers_are_ignored(self):
-        themes = self._load_with(json.dumps({
+        themes, display = self._load_with(json.dumps({
             "schemaVersion": 1,
             "providers": {
-                "claude": {"bar": "red", "accent": "#12345", "logo": "evil.png", "name": "X"},
+                "claude": {"bar": "red", "accent": "#12345", "logo": "evil.png", "name": "X",
+                           "glyph": "nonsense"},
                 "notaprovider": {"bar": "#123456"},
             },
+            "display": {"limitEmphasis": "bogus"},
         }))
         self.assertEqual(themes["claude"]["bar"], "#d97757")
         self.assertEqual(themes["claude"]["accent"], "#d97757")
         self.assertEqual(themes["claude"]["logo"], "claude.png")
         self.assertEqual(themes["claude"]["name"], "Claude Code")
+        self.assertNotIn("glyph", themes["claude"])
         self.assertNotIn("notaprovider", themes)
+        self.assertEqual(display["limitEmphasis"], "percent")
 
     def test_bad_json_and_wrong_schema_fall_back_to_builtin(self):
         import agent as agent_module
-        self.assertEqual(self._load_with("{nope"), {
+        themes, display = self._load_with("{nope")
+        self.assertEqual(themes, {
             provider_id: dict(theme) for provider_id, theme in agent_module.BUILTIN_PROVIDERS.items()
         })
-        themes = self._load_with(json.dumps({"schemaVersion": 2, "providers": {"claude": {"bar": "#123456"}}}))
+        self.assertEqual(display, dict(agent_module.DEFAULT_DISPLAY))
+        themes, _ = self._load_with(json.dumps({"schemaVersion": 2, "providers": {"claude": {"bar": "#123456"}}}))
         self.assertEqual(themes["claude"]["bar"], "#d97757")
+
+    def test_sanitize_theme_rejects_non_documents(self):
+        import agent as agent_module
+        self.assertIsNone(agent_module.sanitize_theme(None))
+        self.assertIsNone(agent_module.sanitize_theme("text"))
+        self.assertIsNone(agent_module.sanitize_theme({"schemaVersion": 3}))
+        clean = agent_module.sanitize_theme({
+            "schemaVersion": 1,
+            "providers": {"grok": {"bar": "#abcdef", "glyph": "claude"}},
+            "display": {"limitEmphasis": "time"},
+        })
+        self.assertEqual(clean, {
+            "schemaVersion": 1,
+            "providers": {"grok": {"bar": "#abcdef", "glyph": "claude"}},
+            "display": {"limitEmphasis": "time"},
+        })
 
 
 if __name__ == "__main__":

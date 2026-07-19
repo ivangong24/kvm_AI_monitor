@@ -15,7 +15,8 @@ import subprocess
 import tempfile
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -25,7 +26,7 @@ from push_receiver import DeviceStore, PushReceiver
 from ssh_collector import SshCollector, build_usage_snapshot
 
 
-AGENT_VERSION = "1.3.0"  # Keep in step with package.json; surfaced on /api/status for updates.
+AGENT_VERSION = "1.4.0"  # Keep in step with package.json; surfaced on /api/status for updates.
 
 ROOT = Path(os.environ.get("KVM_AI_USAGE_ROOT", "/etc/kvmd/user/ai-usage"))
 CONFIG_PATH = Path(os.environ.get("KVM_AI_USAGE_CONFIG", ROOT / "config.json"))
@@ -114,31 +115,72 @@ THEME_COLOR_KEYS = (
     "accent", "secondary", "bar",
 )
 THEME_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+GLYPH_STYLES = frozenset(BUILTIN_PROVIDERS)
+DEFAULT_DISPLAY = {"limitEmphasis": "percent"}
 
 
-def load_providers() -> dict[str, dict[str, object]]:
-    """Built-in themes overlaid with validated color overrides from the theme JSON file.
-    Themes are data, never code: only known color keys with strict hex values are accepted,
-    and any parse or schema problem silently keeps the built-in look."""
-    themes = {provider_id: dict(theme) for provider_id, theme in BUILTIN_PROVIDERS.items()}
+def sanitize_theme(raw: object) -> dict[str, object] | None:
+    """Reduce arbitrary input to a safe theme document, or None if it isn't one at all.
+    Themes are data, never code: only known providers, known color keys with strict hex
+    values, a known glyph style, and known display options survive."""
+    if not isinstance(raw, dict) or raw.get("schemaVersion") != 1:
+        return None
+    clean: dict[str, object] = {"schemaVersion": 1, "providers": {}}
+    providers = raw.get("providers")
+    for provider_id, overrides in (providers.items() if isinstance(providers, dict) else ()):
+        if provider_id not in BUILTIN_PROVIDERS or not isinstance(overrides, dict):
+            continue
+        entry: dict[str, object] = {}
+        for key, value in overrides.items():
+            if key in THEME_COLOR_KEYS and isinstance(value, str) and THEME_COLOR_RE.match(value):
+                entry[key] = value
+            elif key == "glyph" and value in GLYPH_STYLES:
+                entry[key] = value
+        if entry:
+            clean["providers"][provider_id] = entry
+    display = raw.get("display")
+    if isinstance(display, dict) and display.get("limitEmphasis") in ("percent", "time"):
+        clean["display"] = {"limitEmphasis": display["limitEmphasis"]}
+    return clean
+
+
+def read_theme_file() -> dict[str, object] | None:
     try:
         raw = json.loads(THEME_PATH.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return themes
-    if not isinstance(raw, dict) or raw.get("schemaVersion") != 1:
-        return themes
-    providers = raw.get("providers")
-    for provider_id, overrides in (providers.items() if isinstance(providers, dict) else ()):
-        if provider_id not in themes or not isinstance(overrides, dict):
-            continue
-        for key, value in overrides.items():
-            if key in THEME_COLOR_KEYS and isinstance(value, str) and THEME_COLOR_RE.match(value):
-                themes[provider_id][key] = value
-    return themes
+        return None
+    return sanitize_theme(raw)
 
 
-PROVIDERS = load_providers()
-PROVIDER_IDS = frozenset(PROVIDERS)
+def load_providers(theme: dict[str, object] | None = None) -> tuple[dict[str, dict[str, object]], dict[str, object]]:
+    """(provider themes, display options): built-ins overlaid with a sanitized theme document
+    (the saved file when none is given). Any problem keeps the built-in look."""
+    themes = {provider_id: dict(entry) for provider_id, entry in BUILTIN_PROVIDERS.items()}
+    display = dict(DEFAULT_DISPLAY)
+    clean = theme if theme is not None else read_theme_file()
+    if not clean:
+        return themes, display
+    for provider_id, overrides in clean.get("providers", {}).items():
+        themes[provider_id].update(overrides)
+    display.update(clean.get("display", {}))
+    return themes, display
+
+
+PROVIDERS: dict[str, dict[str, object]] = {}
+DISPLAY: dict[str, object] = {}
+
+
+def apply_theme(theme: dict[str, object] | None = None) -> None:
+    """Swap the active theme in place so every reference (renderer, frames) sees it."""
+    providers, display = load_providers(theme)
+    PROVIDERS.clear()
+    PROVIDERS.update(providers)
+    DISPLAY.clear()
+    DISPLAY.update(display)
+
+
+apply_theme()
+PROVIDER_IDS = frozenset(BUILTIN_PROVIDERS)
 
 FONT_REGULAR = (
     "/usr/share/fonts/dejavu/DejaVuSans.ttf",
@@ -345,9 +387,14 @@ def fit_text(draw: ImageDraw.ImageDraw, text: str, candidates: tuple[str, ...],
     return load_font(candidates, min_size)
 
 
+def short_reset(value: object) -> str:
+    label = reset_label(value)
+    return label.removeprefix("RESETS IN ") if label.startswith("RESETS IN ") else "--"
+
+
 def render_limit_row(draw: ImageDraw.ImageDraw, limit: dict[str, object] | None, y: int,
                      title: str, window: str, bar_color: object,
-                     theme: dict[str, object], s: int) -> None:
+                     theme: dict[str, object], s: int, emphasis: str = "percent") -> None:
     label_font = load_font(FONT_UI_SEMIBOLD, 11 * s)
     value_font = load_font(FONT_UI_DISPLAY, 27 * s)
     footer_font = load_font(FONT_UI_MEDIUM, 9 * s)
@@ -359,10 +406,17 @@ def render_limit_row(draw: ImageDraw.ImageDraw, limit: dict[str, object] | None,
         percent = 0
         has_percent = False
 
+    resets_at = limit.get("resetsAt") if limit else None
+    if emphasis == "time":
+        hero_value = short_reset(resets_at)
+        footer_right = f"{round(percent)}% USED" if has_percent else "WAITING FOR DATA"
+    else:
+        hero_value = f"{round(percent)}%" if has_percent else "--"
+        footer_right = reset_label(resets_at)
+
     x0, x1 = 218 * s, 464 * s
     draw_text(draw, (x0, y * s), title, label_font, str(theme["text"]), "la")
-    draw_text(draw, (x1, (y - 5) * s), f"{round(percent)}%" if has_percent else "--", value_font,
-              str(theme["text"]), "ra")
+    draw_text(draw, (x1, (y - 5) * s), hero_value, value_font, str(theme["text"]), "ra")
     bar_y = (y + 27) * s
     bar_height = 12 * s
     radius = bar_height // 2
@@ -373,8 +427,7 @@ def render_limit_row(draw: ImageDraw.ImageDraw, limit: dict[str, object] | None,
         draw.rounded_rectangle((x0, bar_y, x0 + width, bar_y + bar_height), radius=radius,
                                fill=bar_color)
     draw_text(draw, (x0, (y + 45) * s), window, footer_font, str(theme["muted"]), "la")
-    draw_text(draw, (x1, (y + 45) * s), reset_label(limit.get("resetsAt") if limit else None),
-              footer_font, str(theme["muted"]), "ra")
+    draw_text(draw, (x1, (y + 45) * s), footer_right, footer_font, str(theme["muted"]), "ra")
 
 
 def paste_provider_logo(image: Image.Image, provider_id: str, theme: dict[str, object],
@@ -564,9 +617,12 @@ def save_png_atomic(image: Image.Image, output_path: Path, compress_level: int |
 
 
 def compose_wallpaper(snapshot: dict[str, object], provider_id: str = "claude",
-                      animation_frame: int = 0) -> tuple[Image.Image, dict[str, object]]:
+                      animation_frame: int = 0, theme_override: dict[str, object] | None = None,
+                      display_override: dict[str, object] | None = None,
+                      ) -> tuple[Image.Image, dict[str, object]]:
     provider = find_provider(snapshot, provider_id)
-    theme = PROVIDERS[provider_id]
+    theme = theme_override or PROVIDERS[provider_id]
+    emphasis = str((display_override or DISPLAY).get("limitEmphasis", "percent"))
     activity = provider.get("activity") if isinstance(provider.get("activity"), dict) else {}
     today = activity.get("today") if isinstance(activity.get("today"), dict) else {}
     limits = provider.get("limits") if isinstance(provider.get("limits"), list) else []
@@ -659,10 +715,10 @@ def compose_wallpaper(snapshot: dict[str, object], provider_id: str = "claude",
         secondary_title = str(secondary.get("label") if secondary else "WEEKLY LIMIT").upper()
         bar_color = str(theme.get("bar", theme["accent"]))
         render_limit_row(draw, primary, 16, primary_title,
-                         window_label(primary, "5-HOUR WINDOW"), bar_color, theme, s)
+                         window_label(primary, "5-HOUR WINDOW"), bar_color, theme, s, emphasis)
         render_limit_row(draw, secondary, 90, secondary_title,
                          window_label(secondary, "7-DAY WINDOW"),
-                         blend_color(bar_color, top_color, 0.62), theme, s)
+                         blend_color(bar_color, top_color, 0.62), theme, s, emphasis)
     else:
         render_setup(draw, provider, theme, s)
 
@@ -670,7 +726,8 @@ def compose_wallpaper(snapshot: dict[str, object], provider_id: str = "claude",
     # The glyph is drawn on the final 1x image so animation frames can redraw exactly the
     # same box; its tile background is sampled beside the box to blend with the gradient.
     glyph_background = image.getpixel((GLYPH_CENTER[0] - 14, GLYPH_CENTER[1]))
-    draw_activity_glyph(image, provider_id, GLYPH_CENTER, animation_frame, status_color,
+    glyph_style = str(theme.get("glyph", provider_id))
+    draw_activity_glyph(image, glyph_style, GLYPH_CENTER, animation_frame, status_color,
                         glyph_background, is_active)
 
     return image, {"active": is_active, "generatedAt": snapshot.get("generatedAt"),
@@ -706,13 +763,45 @@ def render_animation_frames(snapshot: dict[str, object], provider_id: str,
         return paths
     # Sampled beside the glyph box so the redrawn tile blends with the gradient background.
     glyph_background = base_image.getpixel((GLYPH_CENTER[0] - 14, GLYPH_CENTER[1]))
+    glyph_style = str(theme.get("glyph", provider_id))
     for frame, path in enumerate(paths):
         frame_image = base_image.copy()
-        draw_activity_glyph(frame_image, provider_id, GLYPH_CENTER, frame, status_color,
+        draw_activity_glyph(frame_image, glyph_style, GLYPH_CENTER, frame, status_color,
                             glyph_background, working)
         save_png_atomic(frame_image, path, compress_level=1)
     _last_frames_signature = signature
     return paths
+
+
+def build_preview_snapshot(provider_id: str) -> dict[str, object]:
+    """Representative sample data for theme previews when no live snapshot exists yet."""
+    now = datetime.now(timezone.utc)
+    return {"generatedAt": utc_now(), "providers": [{
+        "id": provider_id, "name": provider_id, "plan": "Pro", "connectionState": "ready",
+        "usageAvailable": True, "working": True, "trackedTokenTotalsAvailable": True,
+        "limits": [
+            {"label": "Current session", "usedPercent": 42, "windowMinutes": 300,
+             "resetsAt": (now + timedelta(hours=2, minutes=40)).isoformat()},
+            {"label": "Weekly limit", "usedPercent": 63, "windowMinutes": 10080,
+             "resetsAt": (now + timedelta(days=2, hours=15)).isoformat()},
+        ],
+        "activity": {"today": {"tokens": 5_400_000}, "last30DaysTokens": 128_000_000,
+                     "lastUsedAt": utc_now()},
+    }]}
+
+
+def write_theme_file(theme: dict[str, object]) -> None:
+    THEME_PATH.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=".theme.", suffix=".json", dir=THEME_PATH.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(theme, stream, indent=2)
+            stream.write("\n")
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, THEME_PATH)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def cleanup_legacy_frame_dirs() -> None:
@@ -1009,6 +1098,28 @@ class Agent:
                 provider["source"] = "Device helper push"
                 provider["usageAvailable"] = True
 
+    def republish(self) -> None:
+        """Re-render and publish the wallpaper with the currently applied theme."""
+        with self.lock:
+            snapshot = self.snapshot
+            selected_provider = str(self.config["selectedProvider"])
+            animate_working = bool(self.config.get("animateWorking"))
+        if not snapshot:
+            self.wake.set()
+            return
+        image, rendered = compose_wallpaper(snapshot, selected_provider)
+        animation_frames = (
+            render_animation_frames(snapshot, selected_provider, base_image=image)
+            if animate_working and rendered.get("active") else []
+        )
+        with self.refresh_lock:
+            save_png_atomic(image, WALLPAPER_PATH)
+            publish_wallpaper(animation_frames[0] if animation_frames else WALLPAPER_PATH)
+            with self.lock:
+                self.animation_frames = animation_frames
+                self.animation_frame = 0
+                self.animation_started_at = time.monotonic()
+
     def refresh_working_state(self) -> None:
         with self.lock:
             host = self.resolved_device_host
@@ -1200,6 +1311,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(HTTPStatus.OK, self.agent.status())
         elif path == "/api/devices":
             self.send_json(HTTPStatus.OK, {"devices": self.agent.devices.list()})
+        elif path == "/api/theme":
+            builtin = {
+                provider_id: {key: theme[key] for key in THEME_COLOR_KEYS if key in theme}
+                for provider_id, theme in BUILTIN_PROVIDERS.items()
+            }
+            self.send_json(HTTPStatus.OK, {
+                "theme": read_theme_file() or {"schemaVersion": 1, "providers": {}},
+                "builtin": builtin,
+                "glyphStyles": sorted(GLYPH_STYLES),
+            })
         else:
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
 
@@ -1223,6 +1344,38 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(HTTPStatus.OK, self.agent.update_config(self.read_json()))
             elif path == "/api/refresh":
                 self.send_json(HTTPStatus.OK, self.agent.refresh())
+            elif path == "/api/theme":
+                clean = sanitize_theme(self.read_json().get("theme"))
+                if clean is None:
+                    self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid theme document"})
+                    return
+                write_theme_file(clean)
+                apply_theme(clean)
+                self.agent.republish()
+                self.send_json(HTTPStatus.OK, {"ok": True, "theme": clean})
+            elif path == "/api/theme/preview":
+                body = self.read_json()
+                provider_id = body.get("provider")
+                if provider_id not in PROVIDER_IDS:
+                    self.send_json(HTTPStatus.BAD_REQUEST, {"error": "unknown provider"})
+                    return
+                clean = sanitize_theme(body.get("theme"))
+                providers, display = load_providers(clean)
+                with self.agent.lock:
+                    snapshot = self.agent.snapshot
+                try:
+                    if snapshot:
+                        find_provider(snapshot, provider_id)
+                except RuntimeError:
+                    snapshot = None
+                image, _ = compose_wallpaper(
+                    snapshot or build_preview_snapshot(provider_id), provider_id,
+                    animation_frame=18, theme_override=providers[provider_id],
+                    display_override=display,
+                )
+                buffer = BytesIO()
+                image.save(buffer, format="PNG")
+                self.send_bytes(HTTPStatus.OK, buffer.getvalue(), "image/png")
             elif path == "/api/devices":
                 self.send_json(HTTPStatus.OK, self.agent.devices.create(self.read_json().get("name")))
             elif path == "/api/devices/rotate":
