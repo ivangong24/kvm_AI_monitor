@@ -6,26 +6,25 @@ KVM_HOST=""
 DEVICE_ID=""
 UPDATE=0
 
+SECRET_STDIN=0
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --kvm) KVM_HOST="$2"; shift 2 ;;
     --device) DEVICE_ID="$2"; shift 2 ;;
+    --secret-stdin) SECRET_STDIN=1; shift ;;
     --update) UPDATE=1; shift ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
 
 CONFIG_DIR="$HOME/.kvm-ai-monitor"
-if [[ "$UPDATE" -eq 1 && ( -z "$KVM_HOST" || -z "$DEVICE_ID" ) ]]; then
+if [[ "$UPDATE" -eq 1 ]]; then
   if [[ ! -f "$CONFIG_DIR/helper.json" ]]; then
     echo "--update requires an existing installation ($CONFIG_DIR/helper.json not found)." >&2
     exit 1
   fi
-  KVM_HOST=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["kvmHost"])' "$CONFIG_DIR/helper.json")
-  DEVICE_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["deviceId"])' "$CONFIG_DIR/helper.json")
-fi
-
-if [[ -z "$KVM_HOST" || -z "$DEVICE_ID" ]]; then
+elif [[ -z "$KVM_HOST" || -z "$DEVICE_ID" ]]; then
   echo "Usage: install-helper.sh --kvm <host-or-ip> --device <device-id> | --update" >&2
   exit 1
 fi
@@ -35,8 +34,12 @@ LABEL="com.kvm-ai-monitor.helper"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 
 if [[ "$UPDATE" -eq 0 ]]; then
-  read -r -s "SECRET?One-time device secret from the KVM AI Usage page: "
-  echo
+  if [[ "$SECRET_STDIN" -eq 1 ]]; then
+    IFS= read -r SECRET  # piped by the setup wizard; never echoed or logged
+  else
+    read -r -s "SECRET?One-time device secret from the KVM AI Usage page: "
+    echo
+  fi
   if [[ -z "$SECRET" ]]; then
     echo "Secret cannot be empty." >&2
     exit 1
@@ -50,8 +53,28 @@ fi
 
 mkdir -p "$CONFIG_DIR"
 chmod 700 "$CONFIG_DIR"
-printf '{"kvmHost": "%s", "deviceId": "%s"}\n' "$KVM_HOST" "$DEVICE_ID" > "$CONFIG_DIR/helper.json"
-chmod 600 "$CONFIG_DIR/helper.json"
+if [[ "$UPDATE" -eq 0 ]]; then
+  # Merge this KVM into the target list so one Mac can push to several KVMs.
+  python3 - "$CONFIG_DIR/helper.json" "$KVM_HOST" "$DEVICE_ID" <<'PY'
+import json, os, pathlib, sys
+path, host, device = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+config = {}
+if path.is_file():
+    try:
+        config = json.load(path.open())
+    except ValueError:
+        config = {}
+targets = config.get("targets")
+if not isinstance(targets, list):
+    targets = []
+    if config.get("kvmHost") and config.get("deviceId"):
+        targets.append({"kvmHost": config["kvmHost"], "deviceId": config["deviceId"]})
+targets = [t for t in targets if isinstance(t, dict) and t.get("kvmHost") != host]
+targets.append({"kvmHost": host, "deviceId": device})
+path.write_text(json.dumps({"targets": targets}, indent=2) + "\n")
+os.chmod(path, 0o600)
+PY
+fi
 
 mkdir -p "$APP_SUPPORT"
 chmod 755 "$APP_SUPPORT"

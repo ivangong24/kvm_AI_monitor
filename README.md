@@ -40,8 +40,28 @@ without SSH. API-equivalent cost is not estimated.
 
 ## Install
 
-Requirements for deployment are Node.js 22 or newer on the setup Mac. The Comet agent itself uses the
-firmware's Python, Dropbear SSH client, Pillow, nginx extension support, and persistent user scripts.
+The fastest path — one command on any Mac (Node.js 22+) on the same network as the Comet:
+
+```bash
+npx github:ivangong24/kvm_AI_monitor
+```
+
+The guided wizard discovers the Comet on your network, signs in with the admin password
+(saving only a revocable session token in your Keychain), installs the on-device agent,
+switches the touchscreen to Wallpaper Only, enrolls the Mac it runs on as a push device, and
+finishes with a health check. No other terminal commands are needed.
+
+Via Homebrew:
+
+```bash
+brew install ivangong24/kvm-ai-monitor/kvm-ai-monitor
+kvm-ai-monitor
+```
+
+There is also a menu bar companion app showing enrollment/push health with one-click actions —
+build it with `./desktop/build.sh` (see [`desktop/README.md`](desktop/README.md)).
+
+The classic scripted path from a clone still works and is what the wizard drives internally:
 
 ```bash
 git clone git@github.com:ivangong24/kvm_AI_monitor.git
@@ -51,7 +71,10 @@ npm run kvm:agent:install
 ```
 
 `kvm:configure` asks for the Comet admin password and current 2FA code. It saves the resulting
-revocable Comet session token in macOS Keychain and immediately deletes the admin password.
+revocable Comet session token in macOS Keychain and immediately deletes the admin password. The
+Comet agent itself uses the firmware's Python, Dropbear SSH client, Pillow, nginx extension
+support, and persistent user scripts. One Mac can be enrolled against several KVMs; the helper
+pushes to every configured target.
 
 ### Primary device with SSH
 

@@ -1,13 +1,17 @@
 {
   "name": "kvm-ai-monitor",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "A KVM-native AI subscription usage wallpaper for GL.iNet Comet Pro",
   "type": "module",
+  "bin": {
+    "kvm-ai-monitor": "bin/kvm-ai-monitor.mjs"
+  },
   "engines": {
     "node": ">=22"
   },
   "scripts": {
+    "setup": "node bin/kvm-ai-monitor.mjs setup",
     "test": "node --test",
     "kvm:configure": "./scripts/configure-kvm.sh",
     "kvm:agent:install": "./scripts/install-kvm-agent.sh",

@@ -101,12 +101,12 @@ class ThrottleTests(HomeIsolatedTestCase):
         content = helper.activity_marker_path().read_text().strip()
         self.assertRegex(content, r"^\d+$")
 
-    @mock.patch("kvm_ai_push.load_config", side_effect=RuntimeError("no config"))
-    def test_send_activity_active_skips_silently_when_throttled(self, mock_config):
+    @mock.patch("kvm_ai_push.load_targets", side_effect=RuntimeError("no config"))
+    def test_send_activity_active_skips_silently_when_throttled(self, mock_targets):
         helper.mark_activity_sent()
         args = mock.Mock(event="active")
-        helper.cmd_send_activity(args)  # must return without raising or calling load_config
-        mock_config.assert_not_called()
+        helper.cmd_send_activity(args)  # must return without raising or reading config
+        mock_targets.assert_not_called()
 
 
 class ClaudeDailyTests(HomeIsolatedTestCase):
@@ -284,6 +284,68 @@ class OAuthUsageMappingTests(unittest.TestCase):
         self.assertEqual(helper.extract_access_token({"claudeAiOauth": {"accessToken": "tok-b"}}), "tok-b")
         self.assertIsNone(helper.extract_access_token({"nothing": "here"}))
         self.assertIsNone(helper.extract_access_token("not-a-dict"))
+
+
+class MultiTargetTests(HomeIsolatedTestCase):
+    def _write_config(self, payload):
+        helper.config_dir().mkdir(mode=0o700, parents=True, exist_ok=True)
+        helper.config_path().write_text(json.dumps(payload))
+
+    def test_legacy_single_target_config_still_loads(self):
+        self._write_config({"kvmHost": "kvm-a", "deviceId": "d-1"})
+        self.assertEqual(helper.load_targets(), [{"kvmHost": "kvm-a", "deviceId": "d-1"}])
+
+    def test_targets_list_loads_and_skips_malformed_entries(self):
+        self._write_config({"targets": [
+            {"kvmHost": "kvm-a", "deviceId": "d-1"},
+            {"kvmHost": "", "deviceId": "d-x"},
+            "junk",
+            {"kvmHost": "kvm-b", "deviceId": "d-2"},
+        ]})
+        self.assertEqual(helper.load_targets(), [
+            {"kvmHost": "kvm-a", "deviceId": "d-1"},
+            {"kvmHost": "kvm-b", "deviceId": "d-2"},
+        ])
+
+    def test_empty_targets_raise(self):
+        self._write_config({"targets": []})
+        with self.assertRaises(RuntimeError):
+            helper.load_targets()
+
+    @mock.patch("kvm_ai_push.post")
+    @mock.patch("kvm_ai_push.load_secret", side_effect=lambda host: "secret-" + host)
+    def test_pushes_to_every_target(self, _secret, post):
+        self._write_config({"targets": [
+            {"kvmHost": "kvm-a", "deviceId": "d-1"},
+            {"kvmHost": "kvm-b", "deviceId": "d-2"},
+        ]})
+        total, errors = helper.push_to_targets("/push/v1/usage", {"x": 1}, timeout=5)
+        self.assertEqual((total, errors), (2, []))
+        called_hosts = [call.args[0] for call in post.call_args_list]
+        self.assertEqual(called_hosts, ["kvm-a", "kvm-b"])
+        self.assertEqual(post.call_args_list[0].args[4], "d-1")
+        self.assertEqual(post.call_args_list[1].args[4], "d-2")
+
+    @mock.patch("kvm_ai_push.post")
+    @mock.patch("kvm_ai_push.load_secret", side_effect=lambda host: "secret-" + host)
+    def test_partial_failure_reports_but_does_not_exit(self, _secret, post):
+        post.side_effect = [RuntimeError("down"), None]
+        self._write_config({"targets": [
+            {"kvmHost": "kvm-a", "deviceId": "d-1"},
+            {"kvmHost": "kvm-b", "deviceId": "d-2"},
+        ]})
+        total, errors = helper.push_to_targets("/push/v1/usage", {"x": 1}, timeout=5)
+        self.assertEqual(total, 2)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("kvm-a", errors[0])
+
+    @mock.patch("kvm_ai_push.build_usage_payload", return_value={"schemaVersion": 1})
+    @mock.patch("kvm_ai_push.post", side_effect=RuntimeError("down"))
+    @mock.patch("kvm_ai_push.load_secret", return_value="s")
+    def test_send_usage_exits_only_when_all_targets_fail(self, _secret, _post, _payload):
+        self._write_config({"targets": [{"kvmHost": "kvm-a", "deviceId": "d-1"}]})
+        with self.assertRaises(SystemExit):
+            helper.cmd_send_usage(mock.Mock())
 
 
 class AccountLimitsCacheTests(HomeIsolatedTestCase):

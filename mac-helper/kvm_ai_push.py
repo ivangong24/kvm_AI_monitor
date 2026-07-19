@@ -64,12 +64,22 @@ def activity_marker_path():
     return config_dir() / "last-activity"
 
 
-def load_config():
+def load_targets():
+    """KVM push targets. Modern helper.json holds {"targets": [{kvmHost, deviceId}, ...]};
+    the legacy single kvmHost/deviceId layout is still accepted."""
     with config_path().open() as stream:
         config = json.load(stream)
-    if not config.get("kvmHost") or not config.get("deviceId"):
-        raise RuntimeError("helper.json missing kvmHost/deviceId")
-    return config
+    raw = config.get("targets")
+    if not isinstance(raw, list):
+        raw = [{"kvmHost": config.get("kvmHost"), "deviceId": config.get("deviceId")}]
+    targets = [
+        {"kvmHost": target["kvmHost"], "deviceId": target["deviceId"]}
+        for target in raw
+        if isinstance(target, dict) and target.get("kvmHost") and target.get("deviceId")
+    ]
+    if not targets:
+        raise RuntimeError("helper.json has no usable KVM targets")
+    return targets
 
 
 def load_secret(kvm_host):
@@ -443,30 +453,46 @@ def cmd_print_payload(_args):
     print(json.dumps(build_usage_payload(), indent=2, sort_keys=True))
 
 
+def push_to_targets(backend_path, payload, timeout):
+    """Push one payload to every configured KVM. Returns (target_count, error_lines);
+    error text never contains payload or credential data."""
+    targets = load_targets()
+    errors = []
+    for target in targets:
+        try:
+            secret = load_secret(target["kvmHost"])
+            post(target["kvmHost"], backend_path, payload, secret, target["deviceId"], timeout=timeout)
+        except Exception as error:
+            errors.append(f"{target['kvmHost']}: {error}")
+    return len(targets), errors
+
+
 def cmd_send_usage(_args):
     try:
-        config = load_config()
-        secret = load_secret(config["kvmHost"])
-        post(config["kvmHost"], "/push/v1/usage", build_usage_payload(), secret, config["deviceId"], timeout=10)
+        total, errors = push_to_targets("/push/v1/usage", build_usage_payload(), timeout=10)
     except Exception as error:
-        # Exceptions reaching here are config/Keychain-lookup/transport errors whose text never
-        # contains payload or credential data.
         print(f"kvm-ai-monitor: usage push failed: {error}", file=sys.stderr)
+        sys.exit(1)
+    for line in errors:
+        print(f"kvm-ai-monitor: usage push failed: {line}", file=sys.stderr)
+    if errors and len(errors) == total:
         sys.exit(1)
 
 
 def cmd_send_activity(args):
     if args.event == "active" and throttled():
         return
+    payload = {"schemaVersion": SCHEMA_VERSION, "provider": PROVIDER, "event": args.event}
     try:
-        config = load_config()
-        secret = load_secret(config["kvmHost"])
-        payload = {"schemaVersion": SCHEMA_VERSION, "provider": PROVIDER, "event": args.event}
-        post(config["kvmHost"], "/push/v1/activity", payload, secret, config["deviceId"], timeout=3)
-        if args.event == "active":
-            mark_activity_sent()
+        total, errors = push_to_targets("/push/v1/activity", payload, timeout=3)
     except Exception as error:
         print(f"kvm-ai-monitor: activity push failed: {error}", file=sys.stderr)
+        sys.exit(1)
+    if args.event == "active" and len(errors) < total:
+        mark_activity_sent()
+    for line in errors:
+        print(f"kvm-ai-monitor: activity push failed: {line}", file=sys.stderr)
+    if errors and len(errors) == total:
         sys.exit(1)
 
 

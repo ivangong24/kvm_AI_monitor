@@ -99,6 +99,9 @@
       .offline { color: var(--bad); }
       .preview { width: 100%; aspect-ratio: 3 / 1; display: block; object-fit: contain; object-position: left top; background: #0d1112; border: 1px solid #303637; }
       #error { min-height: 18px; margin: 12px 0 0; color: var(--bad); font-size: 13px; }
+      .linklike { border: none; background: none; padding: 0; color: var(--muted); font-size: inherit; text-decoration: underline; cursor: pointer; }
+      #wizard .row code { align-self: center; }
+      #wizard .section-heading h2::before { content: "★ "; color: var(--selected); }
       @media (max-width: 720px) {
         .provider-options { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         .provider-option:last-child { grid-column: span 2; }
@@ -134,6 +137,20 @@
         <div class="identity"><img src="icon.svg" alt="" /><h1>AI Usage</h1></div>
         <p class="host" id="host">KVM-owned collector</p>
       </header>
+
+      <section class="band wizard" id="wizard" aria-labelledby="wizard-heading" hidden>
+        <div class="section-heading"><h2 id="wizard-heading">Get started</h2><p>Nothing is enrolled yet. The fastest path takes one command on your Mac.</p></div>
+        <div class="row">
+          <div class="label"><strong>1. Easiest: run the setup wizard</strong><span>On any Mac on this network — it enrolls that Mac and finishes this page's setup for you</span></div>
+          <code>npx github:ivangong24/kvm_AI_monitor</code>
+        </div>
+        <div class="row">
+          <div class="label"><strong>2. Or enroll a device manually</strong><span>Use “Enroll a device” below, then run the shown install command on that Mac</span></div>
+        </div>
+        <div class="row">
+          <div class="label"><strong>3. Optional: SSH-connected device</strong><span>For install/auth detection over SSH, fill in “Connected device” below (needs Remote Login)</span></div>
+        </div>
+      </section>
 
       <section class="band" aria-labelledby="device-heading">
         <div class="section-heading"><h2 id="device-heading">Connected device</h2><p>The KVM discovers the authorized device, reads aggregate AI usage over SSH, and renders the touchscreen locally.</p></div>
@@ -213,7 +230,11 @@
         <div><span>Connected device</span><strong id="source">Checking</strong></div>
         <div><span>Activity devices</span><strong id="activityDevices">Checking</strong></div>
         <div><span>Last update</span><strong id="updated">Never</strong></div>
+        <div><span>Agent version <button class="linklike" id="checkUpdate" type="button">check for updates</button></span><strong id="version">—</strong></div>
       </section>
+      <div id="update-panel" class="secret-panel" hidden>
+        <div class="field"><span>Update available — run on your Mac</span><code id="update-command"></code></div>
+      </div>
       <img id="preview" class="preview" src="wallpaper.png" alt="Current AI usage wallpaper" />
       <p id="error" role="status"></p>
     </main>
@@ -224,7 +245,7 @@
         { id: "grok", name: "Grok Build" },
       ];
       const stateLabels = { ready: "Usage ready", not_installed: "Install required", login_required: "Sign in required", verification_required: "Verify sign-in on device", usage_unavailable: "Usage unavailable" };
-      const elements = Object.fromEntries(["deviceUser", "deviceHost", "activityHosts", "deviceKey", "saveDevice", "enabled", "animateWorking", "interval", "refresh", "agent", "source", "activityDevices", "updated", "preview", "error", "host", "provider-options", "diagnostic-brand", "provider-logo", "provider-dot", "provider-state", "provider-title", "provider-note", "next-action", "provider-command", "provider-guide", "provider-paths", "deviceName", "addDevice", "secret-panel", "secret-device-id", "secret-value", "install-command", "devices-list", "dismiss-secret"].map(id => [id, document.getElementById(id)]));
+      const elements = Object.fromEntries(["deviceUser", "deviceHost", "activityHosts", "deviceKey", "saveDevice", "enabled", "animateWorking", "interval", "refresh", "agent", "source", "activityDevices", "updated", "preview", "error", "host", "provider-options", "diagnostic-brand", "provider-logo", "provider-dot", "provider-state", "provider-title", "provider-note", "next-action", "provider-command", "provider-guide", "provider-paths", "deviceName", "addDevice", "secret-panel", "secret-device-id", "secret-value", "install-command", "devices-list", "dismiss-secret", "wizard", "version", "checkUpdate", "update-panel", "update-command"].map(id => [id, document.getElementById(id)]));
       let current = null;
       let saving = false;
       let devices = [];
@@ -319,9 +340,36 @@
         elements.updated.textContent = state.lastSuccessAt ? new Date(state.lastSuccessAt).toLocaleString() : "Never";
         elements.host.textContent = "KVM-owned SSH collector";
         elements.error.textContent = state.lastError || "";
+        if (state.agentVersion && !elements.version.dataset.checked) elements.version.textContent = `v${state.agentVersion}`;
+        const enrolled = (state.pushDevices || []).some(device => !device.revoked);
+        elements.wizard.hidden = Boolean(state.deviceUser) || enrolled;
         renderOptions(state);
         renderDiagnostic(state);
         if (state.wallpaperReady) elements.preview.src = `wallpaper.png?t=${Date.now()}`;
+      }
+
+      async function checkForUpdates() {
+        const currentVersion = current?.agentVersion || "";
+        elements.version.textContent = "Checking…";
+        elements.version.dataset.checked = "1";
+        try {
+          const response = await fetch("https://api.github.com/repos/ivangong24/kvm_AI_monitor/releases/latest", { headers: { Accept: "application/vnd.github+json" } });
+          if (!response.ok) throw new Error(`GitHub HTTP ${response.status}`);
+          const release = await response.json();
+          const latest = String(release.tag_name || "").replace(/^v/, "");
+          if (!latest) throw new Error("No releases published");
+          if (latest === currentVersion) {
+            elements.version.textContent = `v${currentVersion} (latest)`;
+            elements["update-panel"].hidden = true;
+          } else {
+            elements.version.textContent = `v${currentVersion} → v${latest} available`;
+            elements["update-command"].textContent = "npx github:ivangong24/kvm_AI_monitor install-agent";
+            elements["update-panel"].hidden = false;
+          }
+        } catch (error) {
+          elements.version.textContent = currentVersion ? `v${currentVersion}` : "—";
+          elements.error.textContent = `Update check failed: ${error.message}`;
+        }
       }
 
       async function load() {
@@ -467,6 +515,7 @@
       elements.interval.addEventListener("change", saveConfig);
       elements.saveDevice.addEventListener("click", saveDevice);
       elements.addDevice.addEventListener("click", addDevice);
+      elements.checkUpdate.addEventListener("click", checkForUpdates);
       elements["dismiss-secret"].addEventListener("click", () => {
         elements["secret-value"].textContent = "";
         elements["secret-panel"].hidden = true;

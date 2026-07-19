@@ -11,4 +11,5 @@
 .kvm-ai-monitor/
 __pycache__/
 coverage/
+desktop/dist/
 node_modules/

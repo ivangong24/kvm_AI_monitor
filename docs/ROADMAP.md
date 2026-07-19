@@ -27,6 +27,12 @@ after firmware updates.
 
 ## 1. Zero-terminal onboarding (highest impact)
 
+> **Status (v1.1.0):** largely shipped — `kvm-ai-monitor` guided CLI (discovery, authorize,
+> agent install, automatic Wallpaper Only, one-step enrollment), first-run wizard on the AI
+> Usage page, browser-side update check against GitHub releases, multi-KVM registry and
+> multi-target helper, and a menu bar companion app. Remaining: on-KVM one-click self-update
+> download, native-dialog setup app replacing the Terminal step.
+
 Goal: a user who has never opened a terminal can go from unboxing to a working wallpaper.
 
 - **Native setup app (macOS menu bar app).** One "Set up my KVM" flow that:
@@ -51,6 +57,11 @@ Goal: a user who has never opened a terminal can go from unboxing to a working w
   config with a list of enrolled KVMs; the helper signs and pushes to each.
 
 ## 2. Distribution and installation options
+
+> **Status (v1.1.0):** shipped — `npx github:ivangong24/kvm_AI_monitor` one-shot, Homebrew tap
+> (`brew install ivangong24/kvm-ai-monitor/kvm-ai-monitor`), and a buildable menu bar app
+> (`desktop/build.sh`, ad-hoc signed). Remaining: Developer ID signing + notarization for a
+> downloadable .dmg / Homebrew cask, and any GL.iNet marketplace channel.
 
 - **Homebrew**: `brew install --cask kvm-ai-monitor` delivering the menu bar app; a `--formula`
   CLI-only variant for headless/scripted setups. Requires codesigning + notarization.
