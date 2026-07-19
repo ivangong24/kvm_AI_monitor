@@ -177,5 +177,51 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(parse_activity_entry("fe80::1", "alice", 22), ("fe80::1", "alice", 22))
 
 
+class ThemeLoaderTests(unittest.TestCase):
+    def _load_with(self, content):
+        import tempfile
+        from unittest import mock
+        import agent as agent_module
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as stream:
+            stream.write(content)
+            path = stream.name
+        try:
+            with mock.patch.object(agent_module, "THEME_PATH", type(agent_module.THEME_PATH)(path)):
+                return agent_module.load_providers()
+        finally:
+            import os
+            os.unlink(path)
+
+    def test_valid_override_is_applied(self):
+        themes = self._load_with(json.dumps({
+            "schemaVersion": 1,
+            "providers": {"claude": {"bar": "#123456"}},
+        }))
+        self.assertEqual(themes["claude"]["bar"], "#123456")
+        self.assertEqual(themes["codex"]["bar"], "#10a37f")  # untouched provider keeps builtin
+
+    def test_invalid_colors_unknown_keys_and_providers_are_ignored(self):
+        themes = self._load_with(json.dumps({
+            "schemaVersion": 1,
+            "providers": {
+                "claude": {"bar": "red", "accent": "#12345", "logo": "evil.png", "name": "X"},
+                "notaprovider": {"bar": "#123456"},
+            },
+        }))
+        self.assertEqual(themes["claude"]["bar"], "#d97757")
+        self.assertEqual(themes["claude"]["accent"], "#d97757")
+        self.assertEqual(themes["claude"]["logo"], "claude.png")
+        self.assertEqual(themes["claude"]["name"], "Claude Code")
+        self.assertNotIn("notaprovider", themes)
+
+    def test_bad_json_and_wrong_schema_fall_back_to_builtin(self):
+        import agent as agent_module
+        self.assertEqual(self._load_with("{nope"), {
+            provider_id: dict(theme) for provider_id, theme in agent_module.BUILTIN_PROVIDERS.items()
+        })
+        themes = self._load_with(json.dumps({"schemaVersion": 2, "providers": {"claude": {"bar": "#123456"}}}))
+        self.assertEqual(themes["claude"]["bar"], "#d97757")
+
+
 if __name__ == "__main__":
     unittest.main()

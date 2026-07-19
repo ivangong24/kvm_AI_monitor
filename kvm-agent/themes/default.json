@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "name": "default",
+  "providers": {
+    "claude": {
+      "background": "#0d1112", "text": "#f4f5f2", "muted": "#939b98",
+      "line": "#303637", "track": "#293031", "accent": "#d97757",
+      "secondary": "#53d59c", "bar": "#d97757"
+    },
+    "codex": {
+      "background": "#f5f5f2", "text": "#101312", "muted": "#68716e",
+      "line": "#cbd1ce", "track": "#dfe3e1", "accent": "#101312",
+      "secondary": "#10a37f", "bar": "#10a37f"
+    },
+    "copilot": {
+      "background": "#f6f8fa", "text": "#24292f", "muted": "#68717c",
+      "line": "#d0d7de", "track": "#d8dee4", "accent": "#8534f3",
+      "secondary": "#fe4c25", "bar": "#8534f3"
+    },
+    "gemini": {
+      "background": "#f7f9fc", "text": "#202124", "muted": "#6c727b",
+      "line": "#d2d8e2", "track": "#e0e5ec", "accent": "#5684d1",
+      "secondary": "#9168c0", "bar": "#4285f4"
+    },
+    "grok": {
+      "background": "#050505", "text": "#f7f7f7", "muted": "#a0a0a0",
+      "line": "#353535", "track": "#292929", "accent": "#f7f7f7",
+      "secondary": "#8d99a1", "bar": "#f7f7f7"
+    }
+  }
+}

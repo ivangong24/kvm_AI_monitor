@@ -32,7 +32,7 @@
       h1 { font-size: 24px; letter-spacing: 0; }
       h2 { font-size: 17px; letter-spacing: 0; }
       .host { color: var(--muted); font-size: 13px; text-align: right; }
-      .band { border-top: 1px solid var(--line); padding: 20px 0; }
+      .band { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; margin-bottom: 16px; }
       .section-heading { margin-bottom: 14px; }
       .section-heading p, .label span, .meta { margin-top: 4px; color: var(--muted); font-size: 13px; }
       .provider-options { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; }
@@ -51,7 +51,7 @@
       .dot.ready { background: var(--good); }
       .dot.login_required, .dot.usage_unavailable { background: var(--warn); }
       .dot.not_installed { background: var(--bad); }
-      .diagnostic { display: grid; grid-template-columns: 220px minmax(0, 1fr); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+      .diagnostic { display: grid; grid-template-columns: 220px minmax(0, 1fr); background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 0 20px; margin-bottom: 16px; }
       .diagnostic-brand { padding: 22px 20px 22px 0; display: flex; flex-direction: column; justify-content: space-between; gap: 20px; }
       .diagnostic-brand img { width: 62px; height: 48px; object-fit: contain; object-position: left center; }
       .diagnostic-brand.copilot img { width: 160px; }
@@ -90,14 +90,14 @@
       button.command { padding: 0 14px; cursor: pointer; font-weight: 650; }
       button.command:hover { border-color: #69736f; }
       button:disabled { cursor: wait; opacity: .55; }
-      .status { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; padding: 18px 0; }
+      .status { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; margin-bottom: 16px; }
       .status div { min-width: 0; }
       .status span, .status strong { display: block; }
       .status span { color: var(--muted); font-size: 12px; text-transform: uppercase; }
       .status strong { margin-top: 5px; font-size: 14px; overflow-wrap: anywhere; }
       .online { color: var(--good); }
       .offline { color: var(--bad); }
-      .preview { width: 100%; aspect-ratio: 3 / 1; display: block; object-fit: contain; object-position: left top; background: #0d1112; border: 1px solid #303637; }
+      .preview { width: 100%; aspect-ratio: 3 / 1; display: block; object-fit: contain; object-position: left top; background: #0d1112; border: 1px solid #303637; border-radius: 12px; }
       #error { min-height: 18px; margin: 12px 0 0; color: var(--bad); font-size: 13px; }
       .linklike { border: none; background: none; padding: 0; color: var(--muted); font-size: inherit; text-decoration: underline; cursor: pointer; }
       #wizard .row code { align-self: center; }

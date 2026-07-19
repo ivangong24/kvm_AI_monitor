@@ -25,7 +25,7 @@ from push_receiver import DeviceStore, PushReceiver
 from ssh_collector import SshCollector, build_usage_snapshot
 
 
-AGENT_VERSION = "1.2.0"  # Keep in step with package.json; surfaced on /api/status for updates.
+AGENT_VERSION = "1.3.0"  # Keep in step with package.json; surfaced on /api/status for updates.
 
 ROOT = Path(os.environ.get("KVM_AI_USAGE_ROOT", "/etc/kvmd/user/ai-usage"))
 CONFIG_PATH = Path(os.environ.get("KVM_AI_USAGE_CONFIG", ROOT / "config.json"))
@@ -38,6 +38,8 @@ ANIMATION_FRAMES_ROOT = Path(
     os.environ.get("KVM_AI_USAGE_ANIMATION_FRAMES", "/tmp")
 )
 PROVIDERS_PATH = Path(os.environ.get("KVM_AI_USAGE_PROVIDERS", ROOT / "providers"))
+FONTS_PATH = Path(os.environ.get("KVM_AI_USAGE_FONTS", ROOT / "fonts"))
+THEME_PATH = Path(os.environ.get("KVM_AI_USAGE_THEME", ROOT / "themes" / "default.json"))
 INDEX_PATH = Path(os.environ.get("KVM_AI_USAGE_INDEX", ROOT / "index.html"))
 ICON_PATH = Path(os.environ.get("KVM_AI_USAGE_ICON", ROOT / "icon.svg"))
 SSH_KEY_PATH = Path(os.environ.get("KVM_AI_USAGE_SSH_KEY", ROOT / "device-key"))
@@ -73,7 +75,9 @@ ANIMATION_FRAMES_DIR = ANIMATION_FRAMES_ROOT / "kvm-ai-frames"
 WORKING_POLL_SECONDS = 5.0
 PUSH_BODY_LIMIT = 64 * 1024
 
-PROVIDERS = {
+# Built-in provider themes; kvm-agent/themes/default.json ships the same values as editable
+# data and load_providers() validates and overlays it, falling back here on any problem.
+BUILTIN_PROVIDERS = {
     "claude": {
         "name": "Claude Code", "brand": "CLAUDE", "subbrand": "CODE",
         "background": "#0d1112", "text": "#f4f5f2", "muted": "#939b98",
@@ -105,6 +109,35 @@ PROVIDERS = {
         "secondary": "#8d99a1", "bar": "#f7f7f7", "logo": "grok.png",
     },
 }
+THEME_COLOR_KEYS = (
+    "background", "backgroundBottom", "text", "muted", "line", "track",
+    "accent", "secondary", "bar",
+)
+THEME_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def load_providers() -> dict[str, dict[str, object]]:
+    """Built-in themes overlaid with validated color overrides from the theme JSON file.
+    Themes are data, never code: only known color keys with strict hex values are accepted,
+    and any parse or schema problem silently keeps the built-in look."""
+    themes = {provider_id: dict(theme) for provider_id, theme in BUILTIN_PROVIDERS.items()}
+    try:
+        raw = json.loads(THEME_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return themes
+    if not isinstance(raw, dict) or raw.get("schemaVersion") != 1:
+        return themes
+    providers = raw.get("providers")
+    for provider_id, overrides in (providers.items() if isinstance(providers, dict) else ()):
+        if provider_id not in themes or not isinstance(overrides, dict):
+            continue
+        for key, value in overrides.items():
+            if key in THEME_COLOR_KEYS and isinstance(value, str) and THEME_COLOR_RE.match(value):
+                themes[provider_id][key] = value
+    return themes
+
+
+PROVIDERS = load_providers()
 PROVIDER_IDS = frozenset(PROVIDERS)
 
 FONT_REGULAR = (
@@ -117,6 +150,11 @@ FONT_BOLD = (
     "/usr/share/fonts/ttf-dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/DejaVuSans-Bold.ttf",
 )
+# Bundled Inter (OFL) with firmware DejaVu as fallback.
+FONT_UI_BOLD = (str(FONTS_PATH / "Inter-Bold.ttf"),) + FONT_BOLD
+FONT_UI_SEMIBOLD = (str(FONTS_PATH / "Inter-SemiBold.ttf"), str(FONTS_PATH / "Inter-Bold.ttf")) + FONT_BOLD
+FONT_UI_MEDIUM = (str(FONTS_PATH / "Inter-Medium.ttf"),) + FONT_REGULAR
+FONT_UI_DISPLAY = (str(FONTS_PATH / "InterDisplay-Bold.ttf"), str(FONTS_PATH / "Inter-Bold.ttf")) + FONT_BOLD
 
 
 def utc_now() -> str:
@@ -266,17 +304,53 @@ def find_provider(snapshot: dict[str, object], provider_id: str) -> dict[str, ob
     raise RuntimeError(f"usage response has no {PROVIDERS[provider_id]['name']} provider")
 
 
+Color = "str | tuple[int, int, int]"
+SS = 2  # The base wallpaper is composed at 2x and downsampled once for crisp text and curves.
+GLYPH_CENTER = (146, 26)
+
+
 def draw_text(draw: ImageDraw.ImageDraw, xy: tuple[int, int], text: str, font: ImageFont.ImageFont,
-              fill: str, anchor: str = "la") -> None:
+              fill: object, anchor: str = "la") -> None:
     draw.text(xy, text, font=font, fill=fill, anchor=anchor, spacing=0)
 
 
-def render_limit(draw: ImageDraw.ImageDraw, limit: dict[str, object] | None, y: int,
-                 title: str, window: str, bar_color: str | tuple[int, int, int],
-                 theme: dict[str, object]) -> None:
-    label_font = load_font(FONT_BOLD, 12)
-    value_font = load_font(FONT_BOLD, 23)
-    footer_font = load_font(FONT_BOLD, 9)
+def _rgb(color: object) -> tuple[int, int, int]:
+    return ImageColor.getrgb(color) if isinstance(color, str) else tuple(color)
+
+
+def blend_color(foreground: object, background: object, strength: float) -> tuple[int, int, int]:
+    front = _rgb(foreground)
+    back = _rgb(background)
+    amount = max(0.0, min(1.0, strength))
+    return tuple(round(back[index] + (front[index] - back[index]) * amount) for index in range(3))
+
+
+def vertical_gradient(size: tuple[int, int], top: object, bottom: object) -> Image.Image:
+    image = Image.new("RGB", size, _rgb(top))
+    draw = ImageDraw.Draw(image)
+    top_rgb, bottom_rgb = _rgb(top), _rgb(bottom)
+    for y in range(size[1]):
+        amount = y / max(1, size[1] - 1)
+        color = tuple(round(top_rgb[i] + (bottom_rgb[i] - top_rgb[i]) * amount) for i in range(3))
+        draw.line((0, y, size[0], y), fill=color)
+    return image
+
+
+def fit_text(draw: ImageDraw.ImageDraw, text: str, candidates: tuple[str, ...],
+             max_size: int, min_size: int, max_width: int) -> ImageFont.ImageFont:
+    for size in range(max_size, min_size - 1, -2):
+        font = load_font(candidates, size)
+        if draw.textlength(text, font=font) <= max_width:
+            return font
+    return load_font(candidates, min_size)
+
+
+def render_limit_row(draw: ImageDraw.ImageDraw, limit: dict[str, object] | None, y: int,
+                     title: str, window: str, bar_color: object,
+                     theme: dict[str, object], s: int) -> None:
+    label_font = load_font(FONT_UI_SEMIBOLD, 11 * s)
+    value_font = load_font(FONT_UI_DISPLAY, 27 * s)
+    footer_font = load_font(FONT_UI_MEDIUM, 9 * s)
     raw_percent = limit.get("usedPercent") if limit else None
     try:
         percent = min(100.0, max(0.0, float(raw_percent)))
@@ -285,43 +359,43 @@ def render_limit(draw: ImageDraw.ImageDraw, limit: dict[str, object] | None, y: 
         percent = 0
         has_percent = False
 
-    draw_text(draw, (222, y), title, label_font, str(theme["text"]), "la")
-    draw_text(draw, (465, y - 2), f"{round(percent)}%" if has_percent else "--", value_font,
+    x0, x1 = 218 * s, 464 * s
+    draw_text(draw, (x0, y * s), title, label_font, str(theme["text"]), "la")
+    draw_text(draw, (x1, (y - 5) * s), f"{round(percent)}%" if has_percent else "--", value_font,
               str(theme["text"]), "ra")
-    bar_y = y + 29
-    draw.rectangle((222, bar_y, 465, bar_y + 9), fill=str(theme["track"]))
+    bar_y = (y + 27) * s
+    bar_height = 12 * s
+    radius = bar_height // 2
+    draw.rounded_rectangle((x0, bar_y, x1, bar_y + bar_height), radius=radius,
+                           fill=str(theme["track"]))
     if has_percent and percent > 0:
-        width = max(1, round(243 * percent / 100))
-        draw.rectangle((222, bar_y, 222 + width - 1, bar_y + 9), fill=bar_color)
-    draw_text(draw, (222, y + 46), window, footer_font, str(theme["muted"]), "la")
-    draw_text(draw, (465, y + 46), reset_label(limit.get("resetsAt") if limit else None),
+        width = max(bar_height, round((x1 - x0) * percent / 100))
+        draw.rounded_rectangle((x0, bar_y, x0 + width, bar_y + bar_height), radius=radius,
+                               fill=bar_color)
+    draw_text(draw, (x0, (y + 45) * s), window, footer_font, str(theme["muted"]), "la")
+    draw_text(draw, (x1, (y + 45) * s), reset_label(limit.get("resetsAt") if limit else None),
               footer_font, str(theme["muted"]), "ra")
 
 
-def paste_provider_logo(image: Image.Image, provider_id: str, theme: dict[str, object]) -> None:
+def paste_provider_logo(image: Image.Image, provider_id: str, theme: dict[str, object],
+                        s: int = 1) -> None:
     try:
         logo = Image.open(PROVIDERS_PATH / str(theme["logo"])).convert("RGBA")
         if theme.get("wideLogo"):
-            logo.thumbnail((112, 30), Image.Resampling.LANCZOS)
-            position = (15, 12 + (30 - logo.height) // 2)
+            logo.thumbnail((112 * s, 30 * s), Image.Resampling.LANCZOS)
+            position = (15 * s, 12 * s + (30 * s - logo.height) // 2)
         else:
-            logo.thumbnail((27, 27), Image.Resampling.LANCZOS)
-            position = (15 + (27 - logo.width) // 2, 13 + (27 - logo.height) // 2)
+            logo.thumbnail((26 * s, 26 * s), Image.Resampling.LANCZOS)
+            position = (16 * s + (26 * s - logo.width) // 2, 13 * s + (26 * s - logo.height) // 2)
         image.paste(logo, position, logo)
     except OSError:
         draw = ImageDraw.Draw(image)
-        draw.rectangle((15, 13, 41, 39), fill=str(theme["accent"]))
-
-
-def blend_color(foreground: str, background: str, strength: float) -> tuple[int, int, int]:
-    front = ImageColor.getrgb(foreground)
-    back = ImageColor.getrgb(background)
-    amount = max(0.0, min(1.0, strength))
-    return tuple(round(back[index] + (front[index] - back[index]) * amount) for index in range(3))
+        draw.rounded_rectangle((16 * s, 13 * s, 42 * s, 39 * s), radius=6 * s,
+                               fill=str(theme["accent"]))
 
 
 def draw_activity_glyph(image: Image.Image, provider_id: str, center: tuple[int, int],
-                        frame: int, color: str, background: str, working: bool) -> None:
+                        frame: int, color: str, background: object, working: bool) -> None:
     size = 20
     scale = ANIMATION_RENDER_SCALE
     glyph = Image.new("RGB", (size * scale, size * scale), background)
@@ -428,16 +502,17 @@ def setup_copy(provider: dict[str, object]) -> tuple[str, str, str]:
     return "WAITING FOR USAGE", "CONNECTED DEVICE", "Start a new agent session"
 
 
-def render_setup(draw: ImageDraw.ImageDraw, provider: dict[str, object], theme: dict[str, object]) -> None:
+def render_setup(draw: ImageDraw.ImageDraw, provider: dict[str, object], theme: dict[str, object],
+                 s: int) -> None:
     headline, label, detail = setup_copy(provider)
-    headline_font = load_font(FONT_BOLD, 23)
-    label_font = load_font(FONT_BOLD, 10)
-    detail_font = load_font(FONT_BOLD, 11)
-    draw_text(draw, (15, 61), headline, headline_font, str(theme["text"]), "la")
-    draw.line((15, 101, 189, 101), fill=str(theme["line"]), width=1)
-    draw_text(draw, (15, 116), str(provider.get("plan") or "NO PLAN DATA").upper(), label_font,
-              str(theme["muted"]), "la")
-    draw_text(draw, (222, 34), label, label_font, str(theme["muted"]), "la")
+    headline_font = load_font(FONT_UI_DISPLAY, 23 * s)
+    label_font = load_font(FONT_UI_SEMIBOLD, 10 * s)
+    detail_font = load_font(FONT_UI_MEDIUM, 11 * s)
+    draw_text(draw, (16 * s, 60 * s), headline, headline_font, str(theme["text"]), "la")
+    draw.line((16 * s, 101 * s, 188 * s, 101 * s), fill=str(theme["line"]), width=s)
+    draw_text(draw, (16 * s, 114 * s), str(provider.get("plan") or "NO PLAN DATA").upper(),
+              label_font, str(theme["muted"]), "la")
+    draw_text(draw, (218 * s, 32 * s), label, label_font, str(theme["muted"]), "la")
     words = detail.split()
     lines: list[str] = []
     current = ""
@@ -451,10 +526,13 @@ def render_setup(draw: ImageDraw.ImageDraw, provider: dict[str, object], theme: 
     if current:
         lines.append(current)
     for index, line in enumerate(lines[:3]):
-        draw_text(draw, (222, 55 + index * 19), line, detail_font, str(theme["text"]), "la")
-    draw.rectangle((222, 120, 465, 124), fill=str(theme["track"]))
-    draw.rectangle((222, 120, 283, 124), fill=str(theme["accent"]))
-    draw_text(draw, (222, 135), "MANAGE AT /EXTRAS/AI-USAGE/", label_font,
+        draw_text(draw, (218 * s, (53 + index * 19) * s), line, detail_font, str(theme["text"]), "la")
+    bar_y = 120 * s
+    draw.rounded_rectangle((218 * s, bar_y, 464 * s, bar_y + 6 * s), radius=3 * s,
+                           fill=str(theme["track"]))
+    draw.rounded_rectangle((218 * s, bar_y, 280 * s, bar_y + 6 * s), radius=3 * s,
+                           fill=str(theme.get("bar", theme["accent"])))
+    draw_text(draw, (218 * s, 136 * s), "MANAGE AT /EXTRAS/AI-USAGE/", label_font,
               str(theme["muted"]), "la")
 
 
@@ -496,21 +574,20 @@ def compose_wallpaper(snapshot: dict[str, object], provider_id: str = "claude",
         item.get("label"): item for item in limits if isinstance(item, dict) and item.get("label")
     }
 
-    image = Image.new("RGB", (480, 160), str(theme["background"]))
+    s = SS
+    top_color = str(theme["background"])
+    bottom_color = theme.get("backgroundBottom") or blend_color(
+        str(theme.get("bar", theme["accent"])), top_color, 0.08)
+    image = vertical_gradient((480 * s, 160 * s), top_color, bottom_color)
     draw = ImageDraw.Draw(image)
-    brand_font = load_font(FONT_BOLD, 15)
-    code_font = load_font(FONT_BOLD, 9)
-    status_font = load_font(FONT_BOLD, 9)
-    token_label_font = load_font(FONT_BOLD, 10)
-    token_font = load_font(FONT_BOLD, 44)
-    month_font = load_font(FONT_BOLD, 22)
 
-    paste_provider_logo(image, provider_id, theme)
+    paste_provider_logo(image, provider_id, theme, s)
     if not theme.get("wideLogo"):
-        draw_text(draw, (49, 12), str(theme["brand"]), brand_font, str(theme["text"]), "la")
-        draw_text(draw, (49, 29), str(theme["subbrand"]), code_font, str(theme["muted"]), "la")
+        draw_text(draw, (48 * s, 11 * s), str(theme["brand"]),
+                  load_font(FONT_UI_BOLD, 16 * s), str(theme["text"]), "la")
+        draw_text(draw, (48 * s, 31 * s), str(theme["subbrand"]),
+                  load_font(FONT_UI_SEMIBOLD, 9 * s), str(theme["muted"]), "la")
 
-    last_used = parse_timestamp(activity.get("lastUsedAt"))
     is_active = provider.get("working") is True
     connection_state = str(provider.get("connectionState", ""))
     if connection_state and connection_state != "ready":
@@ -518,81 +595,60 @@ def compose_wallpaper(snapshot: dict[str, object], provider_id: str = "claude",
     else:
         status_text = "WORK" if is_active else "READY"
     status_color = str(theme["secondary"]) if is_active else str(theme["muted"])
-    draw_activity_glyph(image, provider_id, (145, 27), animation_frame, status_color,
-                        str(theme["background"]), is_active)
-    draw_text(draw, (169, 27), status_text, load_font(FONT_BOLD, 8), status_color, "mm")
+    draw_text(draw, ((GLYPH_CENTER[0] + 15) * s, GLYPH_CENTER[1] * s), status_text,
+              load_font(FONT_UI_SEMIBOLD, 8 * s), status_color, "lm")
 
-    draw.line((205, 11, 205, 149), fill=str(theme["line"]), width=1)
+    draw.line((204 * s, 14 * s, 204 * s, 146 * s), fill=str(theme["line"]), width=s)
     if usage_panel_visible(provider, limits):
+        # Left panel: one consistent hierarchy — small label, hero value, bottom detail row.
         if provider.get("trackedTokenTotalsAvailable") is True:
-            draw_text(draw, (15, 48), "TODAY TOKENS", token_label_font,
-                      str(theme["muted"]), "la")
-            today_tokens = compact_number(today.get("tokens"))
-            draw_text(draw, (15, 60), today_tokens, token_font, str(theme["text"]), "la")
-            draw.line((15, 112, 189, 112), fill=str(theme["line"]), width=1)
-            draw_text(draw, (15, 122), "30D TOKENS / USD EQUIV", token_label_font,
-                      str(theme["muted"]), "la")
-            total_label = compact_number(activity.get("last30DaysTokens"))
+            top_label, hero = "TODAY TOKENS", compact_number(today.get("tokens"))
+            bottom_label = "LAST 30 DAYS"
+            bottom_value = compact_number(activity.get("last30DaysTokens"))
             cost_value = activity.get("last30DaysCostUSD")
             try:
                 if cost_value is not None:
-                    total_label = f"{total_label} / ${float(cost_value):.0f}"
+                    bottom_value = f"{bottom_value} · ${float(cost_value):.0f}"
             except (TypeError, ValueError):
                 pass
-            draw_text(draw, (189, 143), total_label, load_font(FONT_BOLD, 17),
-                      str(theme["accent"]), "ra")
         elif provider_id not in ("claude", "codex") and (
                 limits or provider.get("creditsRemaining") is not None
                 or provider.get("providerCostUSD") is not None):
-            draw_text(draw, (15, 48), "SUBSCRIPTION", token_label_font,
-                      str(theme["muted"]), "la")
-            plan_label = str(provider.get("plan") or "CONNECTED").upper()[:18]
-            draw_text(draw, (15, 68), plan_label, load_font(FONT_BOLD, 23),
-                      str(theme["text"]), "la")
-            draw.line((15, 112, 189, 112), fill=str(theme["line"]), width=1)
+            top_label = "SUBSCRIPTION"
+            hero = str(provider.get("plan") or "CONNECTED").upper()[:18]
             credits = provider.get("creditsRemaining")
             provider_cost = provider.get("providerCostUSD")
             if credits is not None:
-                detail_title = "CREDITS REMAINING"
-                detail_value = compact_number(credits)
+                bottom_label, bottom_value = "CREDITS LEFT", compact_number(credits)
             elif provider_cost is not None:
-                detail_title = "PROVIDER COST"
-                detail_value = f"${float(provider_cost):.2f}"
+                bottom_label, bottom_value = "PROVIDER COST", f"${float(provider_cost):.2f}"
             else:
-                detail_title = "ACCOUNT LIMITS"
-                detail_value = "CONNECTED"
-            draw_text(draw, (15, 122), detail_title, token_label_font,
-                      str(theme["muted"]), "la")
-            draw_text(draw, (189, 143), detail_value, load_font(FONT_BOLD, 17),
-                      str(theme["accent"]), "ra")
+                bottom_label, bottom_value = "ACCOUNT LIMITS", "CONNECTED"
         elif provider.get("accountTokenTotalsAvailable") is False:
-            draw_text(draw, (15, 48), "NATIVE ACCOUNT", token_label_font,
-                      str(theme["muted"]), "la")
-            plan_label = str(provider.get("plan") or "CONNECTED").upper()[:16]
-            draw_text(draw, (15, 68), plan_label, load_font(FONT_BOLD, 27),
-                      str(theme["text"]), "la")
-            draw.line((15, 120, 189, 120), fill=str(theme["line"]), width=1)
-            draw_text(draw, (15, 132), "TOKEN HISTORY", token_label_font,
-                      str(theme["muted"]), "la")
-            draw_text(draw, (189, 130), "UNAVAILABLE", load_font(FONT_BOLD, 15),
-                      str(theme["accent"]), "ra")
+            top_label = "NATIVE ACCOUNT"
+            hero = str(provider.get("plan") or "CONNECTED").upper()[:16]
+            bottom_label, bottom_value = "TOKEN HISTORY", "UNAVAILABLE"
         else:
-            draw_text(draw, (15, 48), "TODAY TOKENS", token_label_font,
-                      str(theme["muted"]), "la")
-            today_tokens = compact_number(today.get("tokens"))
-            draw_text(draw, (15, 60), today_tokens, token_font, str(theme["text"]), "la")
-            has_cost = activity.get("last30DaysCostUSD") is not None
-            draw.line((15, 112 if has_cost else 120, 189, 112 if has_cost else 120),
-                      fill=str(theme["line"]), width=1)
-            draw_text(draw, (15, 122 if has_cost else 132),
-                      "30D TOKENS / USD EQUIV" if has_cost else "30 DAYS", token_label_font,
-                      str(theme["muted"]), "la")
-            month_value = compact_number(activity.get("last30DaysTokens"))
-            if has_cost:
-                month_value = f"{month_value} / ${float(activity.get('last30DaysCostUSD')):.0f}"
-            draw_text(draw, (189, 143 if has_cost else 130), month_value,
-                      load_font(FONT_BOLD, 17) if has_cost else month_font,
-                      str(theme["accent"]), "ra")
+            top_label, hero = "TODAY TOKENS", compact_number(today.get("tokens"))
+            cost_value = activity.get("last30DaysCostUSD")
+            bottom_label = "LAST 30 DAYS"
+            bottom_value = compact_number(activity.get("last30DaysTokens"))
+            try:
+                if cost_value is not None:
+                    bottom_value = f"{bottom_value} · ${float(cost_value):.0f}"
+            except (TypeError, ValueError):
+                pass
+
+        draw_text(draw, (16 * s, 56 * s), top_label,
+                  load_font(FONT_UI_SEMIBOLD, 10 * s), str(theme["muted"]), "la")
+        hero_font = fit_text(draw, hero, FONT_UI_DISPLAY, 42 * s, 20 * s, 176 * s)
+        draw_text(draw, (15 * s, 70 * s), hero, hero_font, str(theme["text"]), "la")
+        draw.line((16 * s, 124 * s, 188 * s, 124 * s), fill=str(theme["line"]), width=s)
+        draw_text(draw, (16 * s, 134 * s), bottom_label,
+                  load_font(FONT_UI_SEMIBOLD, 9 * s), str(theme["muted"]), "la")
+        bottom_font = fit_text(draw, bottom_value, FONT_UI_BOLD, 15 * s, 10 * s, 108 * s)
+        draw_text(draw, (188 * s, 140 * s), bottom_value, bottom_font,
+                  str(theme.get("bar", theme["accent"])), "rm")
 
         primary = by_label.get("Current session") or by_label.get("5-hour window")
         secondary = by_label.get("Weekly limit") or by_label.get("Weekly window")
@@ -602,12 +658,20 @@ def compose_wallpaper(snapshot: dict[str, object], provider_id: str = "claude",
         primary_title = str(primary.get("label") if primary else "CURRENT SESSION").upper()
         secondary_title = str(secondary.get("label") if secondary else "WEEKLY LIMIT").upper()
         bar_color = str(theme.get("bar", theme["accent"]))
-        render_limit(draw, primary, 13, primary_title, window_label(primary, "5-HOUR WINDOW"),
-                     bar_color, theme)
-        render_limit(draw, secondary, 87, secondary_title, window_label(secondary, "7-DAY WINDOW"),
-                     blend_color(bar_color, str(theme["background"]), 0.62), theme)
+        render_limit_row(draw, primary, 16, primary_title,
+                         window_label(primary, "5-HOUR WINDOW"), bar_color, theme, s)
+        render_limit_row(draw, secondary, 90, secondary_title,
+                         window_label(secondary, "7-DAY WINDOW"),
+                         blend_color(bar_color, top_color, 0.62), theme, s)
     else:
-        render_setup(draw, provider, theme)
+        render_setup(draw, provider, theme, s)
+
+    image = image.resize((480, 160), Image.Resampling.LANCZOS)
+    # The glyph is drawn on the final 1x image so animation frames can redraw exactly the
+    # same box; its tile background is sampled beside the box to blend with the gradient.
+    glyph_background = image.getpixel((GLYPH_CENTER[0] - 14, GLYPH_CENTER[1]))
+    draw_activity_glyph(image, provider_id, GLYPH_CENTER, animation_frame, status_color,
+                        glyph_background, is_active)
 
     return image, {"active": is_active, "generatedAt": snapshot.get("generatedAt"),
                    "provider": summarize_provider(provider)}
@@ -640,10 +704,12 @@ def render_animation_frames(snapshot: dict[str, object], provider_id: str,
     signature = "|".join((provider_id, str(working), hashlib.sha256(base_image.tobytes()).hexdigest()))
     if signature == _last_frames_signature and all(path.is_file() for path in paths):
         return paths
+    # Sampled beside the glyph box so the redrawn tile blends with the gradient background.
+    glyph_background = base_image.getpixel((GLYPH_CENTER[0] - 14, GLYPH_CENTER[1]))
     for frame, path in enumerate(paths):
         frame_image = base_image.copy()
-        draw_activity_glyph(frame_image, provider_id, (145, 27), frame, status_color,
-                            str(theme["background"]), working)
+        draw_activity_glyph(frame_image, provider_id, GLYPH_CENTER, frame, status_color,
+                            glyph_background, working)
         save_png_atomic(frame_image, path, compress_level=1)
     _last_frames_signature = signature
     return paths

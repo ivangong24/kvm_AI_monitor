@@ -17,13 +17,17 @@ if [ -e "$ROOT" ] || [ -e "$STARTUP" ] || [ -e "$EXTENSION" ]; then
     echo "Previous non-secret configuration backed up to $BACKUP"
 fi
 
-mkdir -p "$ROOT/extension" "$ROOT/providers" "$(dirname "$STARTUP")"
+mkdir -p "$ROOT/extension" "$ROOT/providers" "$ROOT/fonts" "$ROOT/themes" "$(dirname "$STARTUP")"
 rm -f "$ROOT/claude-logo.png"
 cp "$SOURCE_DIR/agent.py" "$ROOT/agent.py"
 cp "$SOURCE_DIR/ssh_collector.py" "$ROOT/ssh_collector.py"
 cp "$SOURCE_DIR/push_receiver.py" "$ROOT/push_receiver.py"
 cp "$SOURCE_DIR/index.html" "$ROOT/index.html"
 cp "$SOURCE_DIR/providers/"*.png "$ROOT/providers/"
+cp "$SOURCE_DIR/fonts/"* "$ROOT/fonts/"
+if [ ! -e "$ROOT/themes/default.json" ]; then
+    cp "$SOURCE_DIR/themes/default.json" "$ROOT/themes/default.json"
+fi
 cp "$SOURCE_DIR/icon.svg" "$ROOT/icon.svg"
 cp "$SOURCE_DIR/extension/manifest.yaml" "$ROOT/extension/manifest.yaml"
 cp "$SOURCE_DIR/extension/nginx.ctx-http.conf" "$ROOT/extension/nginx.ctx-http.conf"
@@ -38,7 +42,7 @@ fi
 chmod 755 "$ROOT/agent.py" "$ROOT/uninstall-on-device.sh" "$STARTUP"
 chmod 600 "$ROOT/config.json"
 chmod 644 "$ROOT/index.html" "$ROOT/icon.svg" "$ROOT/ssh_collector.py" "$ROOT/push_receiver.py" "$ROOT/extension/"*
-chmod 644 "$ROOT/providers/"*.png
+chmod 644 "$ROOT/providers/"*.png "$ROOT/fonts/"* "$ROOT/themes/"*.json
 
 "$STARTUP" restart
 nohup sh -c 'sleep 2; /etc/init.d/S99kvmd-nginx restart' >/tmp/kvm-ai-usage-nginx.log 2>&1 &
