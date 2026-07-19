@@ -92,10 +92,13 @@ Goal: a user who has never opened a terminal can go from unboxing to a working w
 
 ## 4. Themes, widgets, and user customization
 
-> **Status (v1.4.0):** theme system and editor shipped — per-provider color editing with a live
-> rendered preview (`POST /api/theme/preview`), glyph-style selection, percent vs. time-to-reset
-> emphasis, JSON import/export, strict server-side validation with built-in fallback, and
-> instant republish on save. Remaining: the widget/layout system and additional display options.
+> **Status (v1.5.0): complete.** Theme system and editor (v1.4.0): per-provider color editing
+> with live rendered preview, glyph-style selection, percent vs. time-to-reset emphasis, JSON
+> import/export, strict validation with built-in fallback, instant republish. Widget/layout
+> system (v1.5.0): seven widgets (limit bars, token totals, 7-day sparkline, reset countdown,
+> clock, all-provider grid, plan) rendered from data-driven placements; four presets (Classic,
+> Detailed, Compact, Multi-agent) plus custom slot-based arrangements from the page, all through
+> the same sanitizer, with the brand/status header fixed so the animation pipeline is untouched.
 
 - **Theme system**: extract the hardcoded `PROVIDERS` styling into versioned JSON theme files on
   the KVM (colors, bar colors, fonts, background treatment per provider). Ship the current look

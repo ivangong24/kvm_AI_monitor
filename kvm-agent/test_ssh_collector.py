@@ -193,19 +193,22 @@ class ThemeLoaderTests(unittest.TestCase):
             os.unlink(path)
 
     def test_valid_override_is_applied(self):
-        themes, display = self._load_with(json.dumps({
+        themes, display, layout = self._load_with(json.dumps({
             "schemaVersion": 1,
             "providers": {"claude": {"bar": "#123456", "glyph": "gemini"}},
             "display": {"limitEmphasis": "time"},
+            "layout": {"preset": "detailed"},
         }))
         self.assertEqual(themes["claude"]["bar"], "#123456")
         self.assertEqual(themes["claude"]["glyph"], "gemini")
         self.assertEqual(themes["codex"]["bar"], "#10a37f")  # untouched provider keeps builtin
         self.assertEqual(display["limitEmphasis"], "time")
+        self.assertEqual(layout, {"preset": "detailed"})
 
     def test_invalid_colors_unknown_keys_and_providers_are_ignored(self):
-        themes, display = self._load_with(json.dumps({
+        themes, display, layout = self._load_with(json.dumps({
             "schemaVersion": 1,
+            "layout": {"preset": "nonsense"},
             "providers": {
                 "claude": {"bar": "red", "accent": "#12345", "logo": "evil.png", "name": "X",
                            "glyph": "nonsense"},
@@ -220,15 +223,16 @@ class ThemeLoaderTests(unittest.TestCase):
         self.assertNotIn("glyph", themes["claude"])
         self.assertNotIn("notaprovider", themes)
         self.assertEqual(display["limitEmphasis"], "percent")
+        self.assertEqual(layout, {"preset": "classic"})
 
     def test_bad_json_and_wrong_schema_fall_back_to_builtin(self):
         import agent as agent_module
-        themes, display = self._load_with("{nope")
+        themes, display, layout = self._load_with("{nope")
         self.assertEqual(themes, {
             provider_id: dict(theme) for provider_id, theme in agent_module.BUILTIN_PROVIDERS.items()
         })
         self.assertEqual(display, dict(agent_module.DEFAULT_DISPLAY))
-        themes, _ = self._load_with(json.dumps({"schemaVersion": 2, "providers": {"claude": {"bar": "#123456"}}}))
+        themes, _, _ = self._load_with(json.dumps({"schemaVersion": 2, "providers": {"claude": {"bar": "#123456"}}}))
         self.assertEqual(themes["claude"]["bar"], "#d97757")
 
     def test_sanitize_theme_rejects_non_documents(self):
@@ -246,6 +250,38 @@ class ThemeLoaderTests(unittest.TestCase):
             "providers": {"grok": {"bar": "#abcdef", "glyph": "claude"}},
             "display": {"limitEmphasis": "time"},
         })
+
+
+class LayoutTests(unittest.TestCase):
+    def test_presets_resolve(self):
+        import agent as agent_module
+        for name in agent_module.LAYOUT_PRESETS:
+            layout = agent_module.resolve_layout({"preset": name})
+            self.assertTrue(layout["widgets"])
+            for widget in layout["widgets"]:
+                self.assertIn(widget["widget"], agent_module.WIDGET_TYPES)
+
+    def test_custom_layout_sanitized(self):
+        import agent as agent_module
+        clean = agent_module._sanitize_layout({"widgets": [
+            {"widget": "clock", "x": 218, "y": 100, "w": 246, "h": 40},
+            {"widget": "evil", "x": 0, "y": 0, "w": 100, "h": 100},
+            {"widget": "limitBar", "x": 400, "y": 0, "w": 400, "h": 60},
+            "junk",
+        ], "divider": False})
+        self.assertEqual(clean, {"widgets": [
+            {"widget": "clock", "x": 218, "y": 100, "w": 246, "h": 40},
+        ], "divider": False})
+        self.assertIsNone(agent_module._sanitize_layout({"widgets": []}))
+        self.assertIsNone(agent_module._sanitize_layout({"preset": "bogus"}))
+
+    def test_all_presets_render(self):
+        import agent as agent_module
+        snap = agent_module.build_preview_snapshot("claude")
+        for name in agent_module.LAYOUT_PRESETS:
+            image, meta = agent_module.compose_wallpaper(
+                snap, "claude", layout_override={"preset": name})
+            self.assertEqual(image.size, (480, 160), name)
 
 
 if __name__ == "__main__":

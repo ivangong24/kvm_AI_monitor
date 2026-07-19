@@ -26,7 +26,7 @@ from push_receiver import DeviceStore, PushReceiver
 from ssh_collector import SshCollector, build_usage_snapshot
 
 
-AGENT_VERSION = "1.4.0"  # Keep in step with package.json; surfaced on /api/status for updates.
+AGENT_VERSION = "1.5.0"  # Keep in step with package.json; surfaced on /api/status for updates.
 
 ROOT = Path(os.environ.get("KVM_AI_USAGE_ROOT", "/etc/kvmd/user/ai-usage"))
 CONFIG_PATH = Path(os.environ.get("KVM_AI_USAGE_CONFIG", ROOT / "config.json"))
@@ -118,6 +118,82 @@ THEME_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 GLYPH_STYLES = frozenset(BUILTIN_PROVIDERS)
 DEFAULT_DISPLAY = {"limitEmphasis": "percent"}
 
+# --- widget layouts: everything below the fixed brand/status header is composed from widget
+# --- placements (rects in 1x canvas units). Presets ship the arrangements; custom layouts
+# --- come from the theme document and pass the same validation.
+WIDGET_TYPES = frozenset((
+    "tokensToday", "limitBar", "sparkline", "resetCountdown", "clock", "providerGrid", "plan",
+))
+LAYOUT_PRESETS: dict[str, dict[str, object]] = {
+    "classic": {"divider": True, "widgets": [
+        {"widget": "tokensToday", "x": 0, "y": 44, "w": 196, "h": 116},
+        {"widget": "limitBar", "x": 218, "y": 10, "w": 246, "h": 66, "limit": "primary"},
+        {"widget": "limitBar", "x": 218, "y": 84, "w": 246, "h": 66, "limit": "secondary"},
+    ]},
+    "detailed": {"divider": True, "widgets": [
+        {"widget": "tokensToday", "x": 0, "y": 44, "w": 196, "h": 116},
+        {"widget": "limitBar", "x": 218, "y": 10, "w": 246, "h": 66, "limit": "primary"},
+        {"widget": "sparkline", "x": 218, "y": 84, "w": 118, "h": 66},
+        {"widget": "resetCountdown", "x": 346, "y": 84, "w": 118, "h": 66, "limit": "secondary"},
+    ]},
+    "compact": {"divider": True, "widgets": [
+        {"widget": "tokensToday", "x": 0, "y": 44, "w": 196, "h": 116},
+        {"widget": "limitBar", "x": 218, "y": 40, "w": 246, "h": 66, "limit": "secondary"},
+        {"widget": "clock", "x": 218, "y": 114, "w": 246, "h": 40},
+    ]},
+    "multiAgent": {"divider": False, "widgets": [
+        {"widget": "tokensToday", "x": 0, "y": 44, "w": 196, "h": 116},
+        {"widget": "providerGrid", "x": 212, "y": 6, "w": 262, "h": 148},
+    ]},
+}
+DEFAULT_LAYOUT: dict[str, object] = {"preset": "classic"}
+
+
+def _sanitize_layout(raw: object) -> dict[str, object] | None:
+    if not isinstance(raw, dict):
+        return None
+    preset = raw.get("preset")
+    if isinstance(preset, str) and preset in LAYOUT_PRESETS and "widgets" not in raw:
+        return {"preset": preset}
+    widgets_raw = raw.get("widgets")
+    if not isinstance(widgets_raw, list):
+        return None
+    widgets: list[dict[str, object]] = []
+    for item in widgets_raw[:10]:
+        if not isinstance(item, dict) or item.get("widget") not in WIDGET_TYPES:
+            continue
+        try:
+            x, y = int(item.get("x")), int(item.get("y"))
+            w, h = int(item.get("w")), int(item.get("h"))
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= x < 480 and 0 <= y < 160 and 24 <= w <= 480 and 20 <= h <= 160):
+            continue
+        if x + w > 480 or y + h > 160:
+            continue
+        entry: dict[str, object] = {"widget": item["widget"], "x": x, "y": y, "w": w, "h": h}
+        if item.get("limit") in ("primary", "secondary"):
+            entry["limit"] = item["limit"]
+        widgets.append(entry)
+    if not widgets:
+        return None
+    clean: dict[str, object] = {"widgets": widgets}
+    if isinstance(raw.get("divider"), bool):
+        clean["divider"] = raw["divider"]
+    return clean
+
+
+def resolve_layout(layout: dict[str, object] | None) -> dict[str, object]:
+    """A concrete {divider, widgets} arrangement from a sanitized layout document."""
+    if layout and isinstance(layout.get("preset"), str) and layout["preset"] in LAYOUT_PRESETS:
+        preset = LAYOUT_PRESETS[str(layout["preset"])]
+        return {"divider": preset.get("divider", True),
+                "widgets": [dict(widget) for widget in preset["widgets"]]}
+    if layout and isinstance(layout.get("widgets"), list):
+        return {"divider": layout.get("divider", True),
+                "widgets": [dict(widget) for widget in layout["widgets"]]}
+    return resolve_layout(dict(DEFAULT_LAYOUT))
+
 
 def sanitize_theme(raw: object) -> dict[str, object] | None:
     """Reduce arbitrary input to a safe theme document, or None if it isn't one at all.
@@ -141,6 +217,9 @@ def sanitize_theme(raw: object) -> dict[str, object] | None:
     display = raw.get("display")
     if isinstance(display, dict) and display.get("limitEmphasis") in ("percent", "time"):
         clean["display"] = {"limitEmphasis": display["limitEmphasis"]}
+    layout = _sanitize_layout(raw.get("layout"))
+    if layout is not None:
+        clean["layout"] = layout
     return clean
 
 
@@ -152,31 +231,38 @@ def read_theme_file() -> dict[str, object] | None:
     return sanitize_theme(raw)
 
 
-def load_providers(theme: dict[str, object] | None = None) -> tuple[dict[str, dict[str, object]], dict[str, object]]:
-    """(provider themes, display options): built-ins overlaid with a sanitized theme document
-    (the saved file when none is given). Any problem keeps the built-in look."""
+def load_providers(theme: dict[str, object] | None = None,
+                   ) -> tuple[dict[str, dict[str, object]], dict[str, object], dict[str, object]]:
+    """(provider themes, display options, layout): built-ins overlaid with a sanitized theme
+    document (the saved file when none is given). Any problem keeps the built-in look."""
     themes = {provider_id: dict(entry) for provider_id, entry in BUILTIN_PROVIDERS.items()}
     display = dict(DEFAULT_DISPLAY)
+    layout = dict(DEFAULT_LAYOUT)
     clean = theme if theme is not None else read_theme_file()
     if not clean:
-        return themes, display
+        return themes, display, layout
     for provider_id, overrides in clean.get("providers", {}).items():
         themes[provider_id].update(overrides)
     display.update(clean.get("display", {}))
-    return themes, display
+    if clean.get("layout"):
+        layout = dict(clean["layout"])
+    return themes, display, layout
 
 
 PROVIDERS: dict[str, dict[str, object]] = {}
 DISPLAY: dict[str, object] = {}
+LAYOUT: dict[str, object] = {}
 
 
 def apply_theme(theme: dict[str, object] | None = None) -> None:
     """Swap the active theme in place so every reference (renderer, frames) sees it."""
-    providers, display = load_providers(theme)
+    providers, display, layout = load_providers(theme)
     PROVIDERS.clear()
     PROVIDERS.update(providers)
     DISPLAY.clear()
     DISPLAY.update(display)
+    LAYOUT.clear()
+    LAYOUT.update(layout)
 
 
 apply_theme()
@@ -392,42 +478,222 @@ def short_reset(value: object) -> str:
     return label.removeprefix("RESETS IN ") if label.startswith("RESETS IN ") else "--"
 
 
-def render_limit_row(draw: ImageDraw.ImageDraw, limit: dict[str, object] | None, y: int,
-                     title: str, window: str, bar_color: object,
-                     theme: dict[str, object], s: int, emphasis: str = "percent") -> None:
-    label_font = load_font(FONT_UI_SEMIBOLD, 11 * s)
-    value_font = load_font(FONT_UI_DISPLAY, 27 * s)
-    footer_font = load_font(FONT_UI_MEDIUM, 9 * s)
-    raw_percent = limit.get("usedPercent") if limit else None
-    try:
-        percent = min(100.0, max(0.0, float(raw_percent)))
-        has_percent = True
-    except (TypeError, ValueError):
-        percent = 0
-        has_percent = False
+def pick_limit(ctx: dict[str, object], which: str) -> tuple[dict[str, object] | None, str, str]:
+    """(limit, title, window text) for the primary (session) or secondary (weekly) slot."""
+    by_label, limits = ctx["by_label"], ctx["limits"]
+    primary = by_label.get("Current session") or by_label.get("5-hour window")
+    secondary = by_label.get("Weekly limit") or by_label.get("Weekly window")
+    if primary is None and secondary is None:
+        primary = limits[0] if limits else None
+        secondary = limits[1] if len(limits) > 1 else None
+    if which == "secondary":
+        title = str(secondary.get("label") if secondary else "WEEKLY LIMIT").upper()
+        return secondary, title, window_label(secondary, "7-DAY WINDOW")
+    title = str(primary.get("label") if primary else "CURRENT SESSION").upper()
+    return primary, title, window_label(primary, "5-HOUR WINDOW")
 
+
+def limit_percent(limit: dict[str, object] | None) -> tuple[float, bool]:
+    try:
+        return min(100.0, max(0.0, float(limit.get("usedPercent")))), True
+    except (TypeError, ValueError, AttributeError):
+        return 0.0, False
+
+
+def rounded_bar(draw: ImageDraw.ImageDraw, x0: int, y0: int, x1: int, height: int,
+                percent: float, has_percent: bool, track: object, fill: object) -> None:
+    radius = height // 2
+    draw.rounded_rectangle((x0, y0, x1, y0 + height), radius=radius, fill=track)
+    if has_percent and percent > 0:
+        width = max(height, round((x1 - x0) * percent / 100))
+        draw.rounded_rectangle((x0, y0, x0 + width, y0 + height), radius=radius, fill=fill)
+
+
+# --- widgets: each renders inside rect (x, y, w, h in 1x units; multiply by s to draw) ---
+
+def widget_limit_bar(draw, image, rect, ctx, theme, s, options):
+    which = str(options.get("limit", "primary"))
+    limit, title, window = pick_limit(ctx, which)
+    bar_color = str(theme.get("bar", theme["accent"]))
+    if which == "secondary":
+        bar_color = blend_color(bar_color, str(theme["background"]), 0.62)
+    percent, has_percent = limit_percent(limit)
     resets_at = limit.get("resetsAt") if limit else None
-    if emphasis == "time":
+    if ctx["emphasis"] == "time":
         hero_value = short_reset(resets_at)
         footer_right = f"{round(percent)}% USED" if has_percent else "WAITING FOR DATA"
     else:
         hero_value = f"{round(percent)}%" if has_percent else "--"
         footer_right = reset_label(resets_at)
+    x, y, w = rect["x"], rect["y"], rect["w"]
+    x1 = x + w
+    draw_text(draw, (x * s, (y + 6) * s), title, load_font(FONT_UI_SEMIBOLD, 11 * s),
+              str(theme["text"]), "la")
+    draw_text(draw, (x1 * s, (y + 1) * s), hero_value, load_font(FONT_UI_DISPLAY, 27 * s),
+              str(theme["text"]), "ra")
+    rounded_bar(draw, x * s, (y + 33) * s, x1 * s, 12 * s, percent, has_percent,
+                str(theme["track"]), bar_color)
+    footer_font = load_font(FONT_UI_MEDIUM, 9 * s)
+    draw_text(draw, (x * s, (y + 51) * s), window, footer_font, str(theme["muted"]), "la")
+    draw_text(draw, (x1 * s, (y + 51) * s), footer_right, footer_font, str(theme["muted"]), "ra")
 
-    x0, x1 = 218 * s, 464 * s
-    draw_text(draw, (x0, y * s), title, label_font, str(theme["text"]), "la")
-    draw_text(draw, (x1, (y - 5) * s), hero_value, value_font, str(theme["text"]), "ra")
-    bar_y = (y + 27) * s
-    bar_height = 12 * s
-    radius = bar_height // 2
-    draw.rounded_rectangle((x0, bar_y, x1, bar_y + bar_height), radius=radius,
-                           fill=str(theme["track"]))
-    if has_percent and percent > 0:
-        width = max(bar_height, round((x1 - x0) * percent / 100))
-        draw.rounded_rectangle((x0, bar_y, x0 + width, bar_y + bar_height), radius=radius,
-                               fill=bar_color)
-    draw_text(draw, (x0, (y + 45) * s), window, footer_font, str(theme["muted"]), "la")
-    draw_text(draw, (x1, (y + 45) * s), footer_right, footer_font, str(theme["muted"]), "ra")
+
+def tokens_panel_content(ctx) -> tuple[str, str, str, str]:
+    provider, activity, today, limits = ctx["provider"], ctx["activity"], ctx["today"], ctx["limits"]
+    provider_id = str(provider.get("id"))
+    if provider.get("trackedTokenTotalsAvailable") is True or not (
+            provider_id not in ("claude", "codex") and (
+                limits or provider.get("creditsRemaining") is not None
+                or provider.get("providerCostUSD") is not None)
+            or provider.get("accountTokenTotalsAvailable") is False):
+        bottom_value = compact_number(activity.get("last30DaysTokens"))
+        cost_value = activity.get("last30DaysCostUSD")
+        try:
+            if cost_value is not None:
+                bottom_value = f"{bottom_value} · ${float(cost_value):.0f}"
+        except (TypeError, ValueError):
+            pass
+        return "TODAY TOKENS", compact_number(today.get("tokens")), "LAST 30 DAYS", bottom_value
+    if provider.get("accountTokenTotalsAvailable") is False:
+        return ("NATIVE ACCOUNT", str(provider.get("plan") or "CONNECTED").upper()[:16],
+                "TOKEN HISTORY", "UNAVAILABLE")
+    hero = str(provider.get("plan") or "CONNECTED").upper()[:18]
+    credits = provider.get("creditsRemaining")
+    provider_cost = provider.get("providerCostUSD")
+    if credits is not None:
+        return "SUBSCRIPTION", hero, "CREDITS LEFT", compact_number(credits)
+    if provider_cost is not None:
+        return "SUBSCRIPTION", hero, "PROVIDER COST", f"${float(provider_cost):.2f}"
+    return "SUBSCRIPTION", hero, "ACCOUNT LIMITS", "CONNECTED"
+
+
+def widget_tokens_today(draw, image, rect, ctx, theme, s, options):
+    top_label, hero, bottom_label, bottom_value = tokens_panel_content(ctx)
+    x, y, w, h = rect["x"], rect["y"], rect["w"], rect["h"]
+    draw_text(draw, ((x + 16) * s, (y + 12) * s), top_label,
+              load_font(FONT_UI_SEMIBOLD, 10 * s), str(theme["muted"]), "la")
+    hero_font = fit_text(draw, hero, FONT_UI_DISPLAY, 42 * s, 20 * s, (w - 20) * s)
+    draw_text(draw, ((x + 15) * s, (y + 26) * s), hero, hero_font, str(theme["text"]), "la")
+    draw.line(((x + 16) * s, (y + h - 36) * s, (x + w - 8) * s, (y + h - 36) * s),
+              fill=str(theme["line"]), width=s)
+    draw_text(draw, ((x + 16) * s, (y + h - 26) * s), bottom_label,
+              load_font(FONT_UI_SEMIBOLD, 9 * s), str(theme["muted"]), "la")
+    bottom_font = fit_text(draw, bottom_value, FONT_UI_BOLD, 15 * s, 10 * s, (w - 88) * s)
+    draw_text(draw, ((x + w - 8) * s, (y + h - 20) * s), bottom_value, bottom_font,
+              str(theme.get("bar", theme["accent"])), "rm")
+
+
+def widget_plan(draw, image, rect, ctx, theme, s, options):
+    provider = ctx["provider"]
+    x, y = rect["x"], rect["y"]
+    draw_text(draw, ((x + 16) * s, (y + 12) * s), "SUBSCRIPTION",
+              load_font(FONT_UI_SEMIBOLD, 10 * s), str(theme["muted"]), "la")
+    hero = str(provider.get("plan") or "CONNECTED").upper()[:18]
+    hero_font = fit_text(draw, hero, FONT_UI_DISPLAY, 34 * s, 18 * s, (rect["w"] - 20) * s)
+    draw_text(draw, ((x + 15) * s, (y + 28) * s), hero, hero_font, str(theme["text"]), "la")
+
+
+def widget_sparkline(draw, image, rect, ctx, theme, s, options):
+    activity = ctx["activity"]
+    days = [day for day in (activity.get("last7Days") or []) if isinstance(day, dict)]
+    values = [max(0.0, float(day.get("totalTokens") or 0)) for day in days]
+    x, y, w, h = rect["x"], rect["y"], rect["w"], rect["h"]
+    draw_text(draw, (x * s, (y + 6) * s), "7-DAY TOKENS",
+              load_font(FONT_UI_SEMIBOLD, 10 * s), str(theme["text"]), "la")
+    if len(values) < 2 or not max(values):
+        draw_text(draw, (x * s, (y + 30) * s), "WAITING FOR DATA",
+                  load_font(FONT_UI_MEDIUM, 9 * s), str(theme["muted"]), "la")
+        return
+    draw_text(draw, ((x + w) * s, (y + 7) * s), compact_number(max(values)),
+              load_font(FONT_UI_MEDIUM, 9 * s), str(theme["muted"]), "ra")
+    top_value = max(values)
+    chart_top, chart_bottom = (y + 24) * s, (y + h - 8) * s
+    points = []
+    for index, value in enumerate(values):
+        px = x * s + round(index * (w * s) / (len(values) - 1))
+        py = chart_bottom - round((value / top_value) * (chart_bottom - chart_top))
+        points.append((px, py))
+    bar_color = str(theme.get("bar", theme["accent"]))
+    area = points + [(points[-1][0], chart_bottom), (points[0][0], chart_bottom)]
+    draw.polygon(area, fill=blend_color(bar_color, str(theme["background"]), 0.28))
+    draw.line(points, fill=bar_color, width=2 * s, joint="curve")
+
+
+def widget_reset_countdown(draw, image, rect, ctx, theme, s, options):
+    which = str(options.get("limit", "secondary"))
+    limit, title, _ = pick_limit(ctx, which)
+    percent, has_percent = limit_percent(limit)
+    x, y, w = rect["x"], rect["y"], rect["w"]
+    draw_text(draw, (x * s, (y + 6) * s), title, load_font(FONT_UI_SEMIBOLD, 10 * s),
+              str(theme["text"]), "la")
+    hero = short_reset(limit.get("resetsAt") if limit else None)
+    draw_text(draw, (x * s, (y + 20) * s), hero, load_font(FONT_UI_DISPLAY, 26 * s),
+              str(theme.get("bar", theme["accent"])), "la")
+    footer = f"{round(percent)}% USED" if has_percent else "WAITING FOR DATA"
+    draw_text(draw, (x * s, (y + 51) * s), footer, load_font(FONT_UI_MEDIUM, 9 * s),
+              str(theme["muted"]), "la")
+
+
+def widget_clock(draw, image, rect, ctx, theme, s, options):
+    now = datetime.now().astimezone()
+    x, y, w, h = rect["x"], rect["y"], rect["w"], rect["h"]
+    draw_text(draw, (x * s, (y + h // 2) * s), now.strftime("%H:%M"),
+              load_font(FONT_UI_DISPLAY, min(30, h - 8) * s), str(theme["text"]), "lm")
+    draw_text(draw, ((x + w) * s, (y + h // 2) * s), now.strftime("%a %b %d").upper(),
+              load_font(FONT_UI_MEDIUM, 10 * s), str(theme["muted"]), "rm")
+
+
+def widget_provider_grid(draw, image, rect, ctx, theme, s, options):
+    snapshot = ctx["snapshot"]
+    providers = [
+        provider for provider in snapshot.get("providers", [])
+        if isinstance(provider, dict) and provider.get("id") in PROVIDER_IDS
+    ][:5]
+    if not providers:
+        return
+    x, y, w, h = rect["x"], rect["y"], rect["w"], rect["h"]
+    row_height = h // len(providers)
+    for index, provider in enumerate(providers):
+        provider_id = str(provider["id"])
+        row_theme = PROVIDERS.get(provider_id, theme)
+        row_y = y + index * row_height + row_height // 2
+        try:
+            logo = Image.open(PROVIDERS_PATH / str(row_theme["logo"])).convert("RGBA")
+            logo.thumbnail((14 * s, 14 * s), Image.Resampling.LANCZOS)
+            image.paste(logo, ((x + 2) * s, row_y * s - logo.height // 2), logo)
+        except OSError:
+            pass
+        draw_text(draw, ((x + 22) * s, row_y * s), str(row_theme["brand"]),
+                  load_font(FONT_UI_SEMIBOLD, 10 * s), str(theme["text"]), "lm")
+        row_ctx = {
+            "by_label": {item.get("label"): item for item in provider.get("limits", [])
+                         if isinstance(item, dict) and item.get("label")},
+            "limits": provider.get("limits") if isinstance(provider.get("limits"), list) else [],
+        }
+        limit, _, _ = pick_limit(row_ctx, "secondary")
+        if limit is None:
+            limit, _, _ = pick_limit(row_ctx, "primary")
+        percent, has_percent = limit_percent(limit)
+        bar_x0, bar_x1 = (x + w - 118) * s, (x + w - 34) * s
+        rounded_bar(draw, bar_x0, row_y * s - 3 * s, bar_x1, 6 * s, percent, has_percent,
+                    str(theme["track"]), str(row_theme.get("bar", row_theme["accent"])))
+        value = f"{round(percent)}%" if has_percent else "--"
+        draw_text(draw, ((x + w) * s, row_y * s), value,
+                  load_font(FONT_UI_BOLD, 11 * s), str(theme["text"]), "rm")
+        if provider.get("working") is True:
+            draw.ellipse(((x + 12) * s, (row_y - 7) * s, (x + 16) * s, (row_y - 3) * s),
+                         fill=str(row_theme["secondary"]))
+
+
+WIDGET_RENDERERS = {
+    "limitBar": widget_limit_bar,
+    "tokensToday": widget_tokens_today,
+    "plan": widget_plan,
+    "sparkline": widget_sparkline,
+    "resetCountdown": widget_reset_countdown,
+    "clock": widget_clock,
+    "providerGrid": widget_provider_grid,
+}
 
 
 def paste_provider_logo(image: Image.Image, provider_id: str, theme: dict[str, object],
@@ -619,6 +885,7 @@ def save_png_atomic(image: Image.Image, output_path: Path, compress_level: int |
 def compose_wallpaper(snapshot: dict[str, object], provider_id: str = "claude",
                       animation_frame: int = 0, theme_override: dict[str, object] | None = None,
                       display_override: dict[str, object] | None = None,
+                      layout_override: dict[str, object] | None = None,
                       ) -> tuple[Image.Image, dict[str, object]]:
     provider = find_provider(snapshot, provider_id)
     theme = theme_override or PROVIDERS[provider_id]
@@ -654,72 +921,19 @@ def compose_wallpaper(snapshot: dict[str, object], provider_id: str = "claude",
     draw_text(draw, ((GLYPH_CENTER[0] + 15) * s, GLYPH_CENTER[1] * s), status_text,
               load_font(FONT_UI_SEMIBOLD, 8 * s), status_color, "lm")
 
-    draw.line((204 * s, 14 * s, 204 * s, 146 * s), fill=str(theme["line"]), width=s)
     if usage_panel_visible(provider, limits):
-        # Left panel: one consistent hierarchy — small label, hero value, bottom detail row.
-        if provider.get("trackedTokenTotalsAvailable") is True:
-            top_label, hero = "TODAY TOKENS", compact_number(today.get("tokens"))
-            bottom_label = "LAST 30 DAYS"
-            bottom_value = compact_number(activity.get("last30DaysTokens"))
-            cost_value = activity.get("last30DaysCostUSD")
-            try:
-                if cost_value is not None:
-                    bottom_value = f"{bottom_value} · ${float(cost_value):.0f}"
-            except (TypeError, ValueError):
-                pass
-        elif provider_id not in ("claude", "codex") and (
-                limits or provider.get("creditsRemaining") is not None
-                or provider.get("providerCostUSD") is not None):
-            top_label = "SUBSCRIPTION"
-            hero = str(provider.get("plan") or "CONNECTED").upper()[:18]
-            credits = provider.get("creditsRemaining")
-            provider_cost = provider.get("providerCostUSD")
-            if credits is not None:
-                bottom_label, bottom_value = "CREDITS LEFT", compact_number(credits)
-            elif provider_cost is not None:
-                bottom_label, bottom_value = "PROVIDER COST", f"${float(provider_cost):.2f}"
-            else:
-                bottom_label, bottom_value = "ACCOUNT LIMITS", "CONNECTED"
-        elif provider.get("accountTokenTotalsAvailable") is False:
-            top_label = "NATIVE ACCOUNT"
-            hero = str(provider.get("plan") or "CONNECTED").upper()[:16]
-            bottom_label, bottom_value = "TOKEN HISTORY", "UNAVAILABLE"
-        else:
-            top_label, hero = "TODAY TOKENS", compact_number(today.get("tokens"))
-            cost_value = activity.get("last30DaysCostUSD")
-            bottom_label = "LAST 30 DAYS"
-            bottom_value = compact_number(activity.get("last30DaysTokens"))
-            try:
-                if cost_value is not None:
-                    bottom_value = f"{bottom_value} · ${float(cost_value):.0f}"
-            except (TypeError, ValueError):
-                pass
-
-        draw_text(draw, (16 * s, 56 * s), top_label,
-                  load_font(FONT_UI_SEMIBOLD, 10 * s), str(theme["muted"]), "la")
-        hero_font = fit_text(draw, hero, FONT_UI_DISPLAY, 42 * s, 20 * s, 176 * s)
-        draw_text(draw, (15 * s, 70 * s), hero, hero_font, str(theme["text"]), "la")
-        draw.line((16 * s, 124 * s, 188 * s, 124 * s), fill=str(theme["line"]), width=s)
-        draw_text(draw, (16 * s, 134 * s), bottom_label,
-                  load_font(FONT_UI_SEMIBOLD, 9 * s), str(theme["muted"]), "la")
-        bottom_font = fit_text(draw, bottom_value, FONT_UI_BOLD, 15 * s, 10 * s, 108 * s)
-        draw_text(draw, (188 * s, 140 * s), bottom_value, bottom_font,
-                  str(theme.get("bar", theme["accent"])), "rm")
-
-        primary = by_label.get("Current session") or by_label.get("5-hour window")
-        secondary = by_label.get("Weekly limit") or by_label.get("Weekly window")
-        if primary is None and secondary is None:
-            primary = limits[0] if limits else None
-            secondary = limits[1] if len(limits) > 1 else None
-        primary_title = str(primary.get("label") if primary else "CURRENT SESSION").upper()
-        secondary_title = str(secondary.get("label") if secondary else "WEEKLY LIMIT").upper()
-        bar_color = str(theme.get("bar", theme["accent"]))
-        render_limit_row(draw, primary, 16, primary_title,
-                         window_label(primary, "5-HOUR WINDOW"), bar_color, theme, s, emphasis)
-        render_limit_row(draw, secondary, 90, secondary_title,
-                         window_label(secondary, "7-DAY WINDOW"),
-                         blend_color(bar_color, top_color, 0.62), theme, s, emphasis)
+        ctx = {"provider": provider, "activity": activity, "today": today,
+               "limits": limits, "by_label": by_label, "snapshot": snapshot,
+               "emphasis": emphasis}
+        layout = resolve_layout(layout_override if layout_override is not None else LAYOUT)
+        if layout.get("divider"):
+            draw.line((204 * s, 14 * s, 204 * s, 146 * s), fill=str(theme["line"]), width=s)
+        for placement in layout["widgets"]:
+            renderer = WIDGET_RENDERERS.get(str(placement.get("widget")))
+            if renderer:
+                renderer(draw, image, placement, ctx, theme, s, placement)
     else:
+        draw.line((204 * s, 14 * s, 204 * s, 146 * s), fill=str(theme["line"]), width=s)
         render_setup(draw, provider, theme, s)
 
     image = image.resize((480, 160), Image.Resampling.LANCZOS)
@@ -1320,6 +1534,8 @@ class Handler(BaseHTTPRequestHandler):
                 "theme": read_theme_file() or {"schemaVersion": 1, "providers": {}},
                 "builtin": builtin,
                 "glyphStyles": sorted(GLYPH_STYLES),
+                "layoutPresets": sorted(LAYOUT_PRESETS),
+                "widgetTypes": sorted(WIDGET_TYPES),
             })
         else:
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
@@ -1360,7 +1576,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(HTTPStatus.BAD_REQUEST, {"error": "unknown provider"})
                     return
                 clean = sanitize_theme(body.get("theme"))
-                providers, display = load_providers(clean)
+                providers, display, layout = load_providers(clean)
                 with self.agent.lock:
                     snapshot = self.agent.snapshot
                 try:
@@ -1371,7 +1587,7 @@ class Handler(BaseHTTPRequestHandler):
                 image, _ = compose_wallpaper(
                     snapshot or build_preview_snapshot(provider_id), provider_id,
                     animation_frame=18, theme_override=providers[provider_id],
-                    display_override=display,
+                    display_override=display, layout_override=layout,
                 )
                 buffer = BytesIO()
                 image.save(buffer, format="PNG")

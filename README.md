@@ -72,6 +72,10 @@ Manage everything at `https://<comet-ip>/extras/ai-usage/`:
 - **Appearance** — customize the selected provider's wallpaper colors, working-glyph style, and
   whether limit rows lead with percent used or time to reset, with an instant live preview;
   themes are validated JSON stored on the KVM (export/import supported, one-click reset).
+- **Layouts** — pick a wallpaper arrangement (Classic, Detailed with a 7-day sparkline and
+  reset countdown, Compact with a clock, Multi-agent showing every provider's usage at once) or
+  build a custom one by assigning widgets — limit bars, token totals, sparkline, countdown,
+  clock, provider grid, plan — to named slots.
 - **Push devices** — enroll, rotate secrets, revoke, or delete devices; last-seen times shown.
 - **Display settings** — enable/disable the wallpaper, working animation, and refresh interval.
   A live wallpaper preview and health status are on the same page.
