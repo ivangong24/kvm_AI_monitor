@@ -61,11 +61,17 @@ kvm-ai-monitor
 There is also a menu bar companion app showing enrollment/push health with one-click actions —
 build it with `./desktop/build.sh` (see [`desktop/README.md`](desktop/README.md)).
 
-The classic scripted path from a clone still works and is what the wizard drives internally:
+From a clone, the same wizard runs with:
 
 ```bash
 git clone git@github.com:ivangong24/kvm_AI_monitor.git
 cd kvm_AI_monitor
+npm run setup
+```
+
+The classic step-by-step scripts still work and are what the wizard drives internally:
+
+```bash
 npm run kvm:configure
 npm run kvm:agent:install
 ```
