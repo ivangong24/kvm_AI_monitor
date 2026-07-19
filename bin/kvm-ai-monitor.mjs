@@ -306,7 +306,10 @@ async function enrollThisMac(host) {
 function healthCheck(host) {
   const status = webterm(host, "curl -s http://127.0.0.1:8199/api/status");
   try {
-    const parsed = JSON.parse(status.output.slice(status.output.indexOf("{")));
+    // The web terminal interleaves shell prompts around the payload; take the outermost braces.
+    const begin = status.output.indexOf("{");
+    const end = status.output.lastIndexOf("}");
+    const parsed = JSON.parse(status.output.slice(begin, end + 1));
     ok(`Agent healthy (wallpaper ${parsed.wallpaperReady ? "rendering" : "pending"}, ` +
        `${parsed.pushDevices?.filter((d) => !d.revoked).length ?? 0} push device(s))`);
   } catch {
