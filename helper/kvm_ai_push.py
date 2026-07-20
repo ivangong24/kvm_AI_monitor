@@ -20,6 +20,7 @@ import os
 import pathlib
 import re
 import secrets
+import select
 import shutil
 import ssl
 import subprocess
@@ -29,7 +30,10 @@ import urllib.error
 import urllib.request
 
 SCHEMA_VERSION = 1
-PROVIDER = "claude"
+# Default provider for the lifecycle-hook activity path (the Claude Code hook calls
+# `send-activity` with no --provider). Usage collection and the activity poller are NOT keyed to
+# this — they use the registries below so any selected provider is covered.
+DEFAULT_ACTIVITY_PROVIDER = "claude"
 ACTIVE_THROTTLE_SECONDS = 20
 
 if sys.platform == "darwin":
@@ -504,10 +508,126 @@ def now_iso():
     return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def build_usage_payload():
+# --- adapter c: codex usage from `codex app-server` -------------------------------------
+# Codex has no OAuth usage endpoint like Claude's; its ChatGPT plan windows and account-wide
+# daily token totals come from the app-server JSON-RPC (account/rateLimits/read + usage/read) —
+# the same source the KVM's SSH collector uses. Run locally here so a push-only device (no SSH)
+# still refreshes codex limits and TODAY TOKENS instead of leaving them blank/stale.
+
+def codex_binary():
+    found = shutil.which("codex")
+    if found:
+        return found
+    fallback = "/Applications/Codex.app/Contents/Resources/codex"
+    return fallback if os.access(fallback, os.X_OK) else None
+
+
+def _finite_number(value):
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result == result and abs(result) != float("inf") else None
+
+
+def _plan_label(value):
+    if not isinstance(value, str) or not value:
+        return None
+    return re.sub(r"\b\w", lambda match: match.group(0).upper(), re.sub(r"[_-]+", " ", value))
+
+
+def _codex_limit(value):
+    if not isinstance(value, dict) or _finite_number(value.get("usedPercent")) is None:
+        return None
+    minutes = _finite_number(value.get("windowDurationMins"))
+    entry = {"label": "Current session" if minutes and minutes <= 360 else "Weekly limit",
+             "usedPercent": max(0.0, min(100.0, _finite_number(value.get("usedPercent"))))}
+    if minutes is not None and minutes > 0:
+        entry["windowMinutes"] = minutes
+    resets = _finite_number(value.get("resetsAt"))
+    if resets is not None:
+        entry["resetsAt"] = datetime.datetime.fromtimestamp(
+            resets, datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+    return entry
+
+
+def codex_usage_payload():
+    """Codex plan/limits/daily-tokens via `codex app-server`, or None when codex is absent or the
+    handshake yields nothing. Never raises — usage collection must not break the push cycle."""
+    codex = codex_binary()
+    if not codex:
+        return None
+    messages = (
+        {"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "kvm-ai-monitor", "title": "KVM AI Monitor", "version": "1.0.0"}, "capabilities": {"experimentalApi": True}}},
+        {"method": "initialized", "params": {}},
+        {"id": 2, "method": "account/rateLimits/read", "params": {}},
+        {"id": 3, "method": "account/usage/read", "params": {}},
+    )
+    body = "\n".join(json.dumps(message, separators=(",", ":")) for message in messages) + "\n"
+    # Keep stdin open and read incrementally: app-server shuts down on stdin EOF, so closing it
+    # (as communicate does) drops the rateLimits/usage replies before they are sent. select() is
+    # POSIX-only, which is fine — codex usage is a macOS/Linux concern; on Windows this raises and
+    # we return None. Mirrors the KVM SSH collector's codex_native().
+    process = None
+    responses = {}
+    try:
+        process = subprocess.Popen(
+            (codex, "app-server", "--stdio"), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, bufsize=1,
+        )
+        process.stdin.write(body)
+        process.stdin.flush()
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and len(responses) < 2:
+            ready, _, _ = select.select((process.stdout,), (), (), max(0, deadline - time.monotonic()))
+            if not ready:
+                break
+            line = process.stdout.readline()
+            if not line:
+                break
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+            if message.get("id") in (2, 3) and isinstance(message.get("result"), dict):
+                responses[message["id"]] = message["result"]
+    except Exception:
+        return None
+    finally:
+        if process:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except Exception:
+                process.kill()
+    rate = responses.get(2, {}).get("rateLimits")
+    rate = rate if isinstance(rate, dict) else {}
+    usage = responses.get(3, {})
+    if not rate and not usage:
+        return None
+    limits = [entry for entry in (_codex_limit(rate.get("primary")), _codex_limit(rate.get("secondary"))) if entry]
+    buckets = usage.get("dailyUsageBuckets") if isinstance(usage.get("dailyUsageBuckets"), list) else []
+    daily = [
+        {"date": item.get("startDate"), "totalTokens": _finite_number(item.get("tokens")) or 0}
+        for item in buckets
+        if isinstance(item, dict) and isinstance(item.get("startDate"), str)
+    ]
+    payload = {"schemaVersion": SCHEMA_VERSION, "provider": "codex", "collectedAt": now_iso(), "loggedIn": True}
+    plan = _plan_label(rate.get("planType"))
+    if plan:
+        payload["plan"] = plan
+    if limits:
+        payload["limits"] = limits[:8]
+    if daily:
+        payload["daily"] = daily[-31:]
+    return payload
+
+
+def claude_usage_payload():
+    """Claude usage: auth/plan + account limits + local daily token totals."""
     logged_in, plan = claude_auth_status()
     limits = account_limits()
-    payload = {"schemaVersion": SCHEMA_VERSION, "provider": PROVIDER, "collectedAt": now_iso()}
+    payload = {"schemaVersion": SCHEMA_VERSION, "provider": "claude", "collectedAt": now_iso()}
     if logged_in is not None:
         payload["loggedIn"] = logged_in
     if plan:
@@ -518,6 +638,18 @@ def build_usage_payload():
     if daily:
         payload["daily"] = daily[-31:]
     return payload
+
+
+# Provider usage collectors. Each returns a push payload (provider/plan/limits/daily) or None when
+# that provider isn't installed/authed here. `send-usage` pushes every collector that returns
+# data, so the KVM holds usage for whichever provider the user selects on the web UI — none is
+# privileged. Adding a provider means adding its collector here and nothing else. (gemini/grok/
+# copilot expose no supported quota command, so they have no collector — their tiles show
+# connection state only, exactly as the KVM's own SSH collector treats them.)
+USAGE_COLLECTORS = {
+    "claude": claude_usage_payload,
+    "codex": codex_usage_payload,
+}
 
 
 def encode_body(payload):
@@ -554,7 +686,14 @@ def cmd_sign(args):
 
 
 def cmd_print_payload(_args):
-    print(json.dumps(build_usage_payload(), indent=2, sort_keys=True))
+    for provider_id, collect in USAGE_COLLECTORS.items():
+        try:
+            payload = collect()
+        except Exception as error:
+            print(f"# {provider_id}: collection failed: {error}", file=sys.stderr)
+            continue
+        if payload:
+            print(json.dumps(payload, indent=2, sort_keys=True))
 
 
 def cmd_store_secret(args):
@@ -588,21 +727,39 @@ def push_to_targets(backend_path, payload, timeout):
 
 
 def cmd_send_usage(_args):
-    try:
-        total, errors = push_to_targets("/push/v1/usage", build_usage_payload(), timeout=10)
-    except Exception as error:
-        print(f"kvm-ai-monitor: usage push failed: {error}", file=sys.stderr)
-        sys.exit(1)
-    for line in errors:
-        print(f"kvm-ai-monitor: usage push failed: {line}", file=sys.stderr)
-    if errors and len(errors) == total:
+    # Collect and push every provider that has data. Each collector is independent — one failing
+    # (or being absent) never blocks the others — so the KVM stays current for whichever provider
+    # the user selects.
+    considered = 0
+    pushed = 0
+    for provider_id, collect in USAGE_COLLECTORS.items():
+        try:
+            payload = collect()
+        except Exception as error:
+            print(f"kvm-ai-monitor: {provider_id} usage collection failed: {error}", file=sys.stderr)
+            continue
+        if not payload:
+            continue
+        considered += 1
+        try:
+            total, errors = push_to_targets("/push/v1/usage", payload, timeout=10)
+        except Exception as error:
+            print(f"kvm-ai-monitor: {provider_id} usage push failed: {error}", file=sys.stderr)
+            continue
+        for line in errors:
+            print(f"kvm-ai-monitor: {provider_id} usage push failed: {line}", file=sys.stderr)
+        if not (errors and len(errors) == total):
+            pushed += 1
+    # Fail (for launchd) only when we had data but none of it reached any KVM.
+    if considered and not pushed:
         sys.exit(1)
 
 
 def cmd_send_activity(args):
     if args.event == "active" and throttled():
         return
-    payload = {"schemaVersion": SCHEMA_VERSION, "provider": PROVIDER, "event": args.event}
+    provider = getattr(args, "provider", None) or DEFAULT_ACTIVITY_PROVIDER
+    payload = {"schemaVersion": SCHEMA_VERSION, "provider": provider, "event": args.event}
     try:
         total, errors = push_to_targets("/push/v1/activity", payload, timeout=3)
     except Exception as error:
@@ -614,6 +771,164 @@ def cmd_send_activity(args):
         print(f"kvm-ai-monitor: activity push failed: {line}", file=sys.stderr)
     if errors and len(errors) == total:
         sys.exit(1)
+
+
+# --- local activity poll (push-mode detection for CLIs without a lifecycle hook) --------
+# Claude Code reports working/idle through its own hooks (kvm-ai-claude-hook.sh). Codex has no
+# such hook, so on a device where the KVM cannot SSH in to run its own probe, codex would never
+# report a working state. This polls the same signals the KVM's SSH probe uses — a busy process
+# or a freshly written session log — and pushes `active`/`stop` itself. Runs from its own
+# LaunchAgent on a short interval; the KVM holds each working state for its own 120 s window and
+# we send an explicit `stop` on the first idle poll, so the tile lapses promptly once codex stops.
+
+# How recently codex's session transcript must have been written to count as "working". Codex
+# streams turn events (response_item/event_msg) into the rollout jsonl as it works, so during a
+# turn this file is written every few seconds; at an idle prompt it goes stale within seconds.
+# Kept short so the tile clears quickly once codex stops, but long enough to bridge normal gaps
+# between streamed events. (NB: codex's *.sqlite-wal churns every few seconds even when idle, so
+# it is NOT a working signal — only the rollout transcript is.)
+SESSION_ACTIVE_WINDOW_SECONDS = 60
+
+# Providers detected by polling (those without a Claude-Code-style lifecycle hook). Codex has a
+# session transcript to key on; the rest have no local usage/session artifact, so — exactly like
+# the KVM's SSH probe — they fall back to "a matching process is busy". Add a provider by adding a
+# spec here; `sessions` is optional. Claude is intentionally absent: its hook is a better signal.
+POLL_PROVIDERS = {
+    "codex": {
+        "process": re.compile(r"(?:^|/)codex(?:\s|$)", re.I),
+        "process_exclude": (" app-server", " --help", " --version"),
+        "sessions": pathlib.Path.home() / ".codex" / "sessions",
+    },
+    "copilot": {"process": re.compile(r"(?:^|/)(?:copilot|github-copilot)(?:\s|$)", re.I)},
+    "gemini": {"process": re.compile(r"(?:^|/)gemini(?:\s|$)", re.I)},
+    "grok": {"process": re.compile(r"(?:^|/)(?:grok|grok-build)(?:\s|$)", re.I)},
+}
+
+
+def _busy_processes():
+    """provider_id -> [running, busy] from one ps scan. POSIX only; returns empty where ps is
+    unavailable (Windows), leaving session-log recency as the sole signal."""
+    ps_bin = "/bin/ps" if os.path.exists("/bin/ps") else "ps"
+    try:
+        output = subprocess.run(
+            (ps_bin, "-axo", "pcpu=,command="), capture_output=True, text=True,
+            timeout=3, check=False,
+        ).stdout
+    except Exception:
+        return {}
+    result = {provider_id: [False, False] for provider_id in POLL_PROVIDERS}
+    for line in output.splitlines():
+        match = re.match(r"^\s*([\d.]+)\s+(.*\S)\s*$", line)
+        if not match:
+            continue
+        command = match.group(2)
+        try:
+            cpu = float(match.group(1))
+        except ValueError:
+            cpu = 0.0
+        lower = command.lower()
+        for provider_id, spec in POLL_PROVIDERS.items():
+            if not spec["process"].search(command):
+                continue
+            if any(token in lower for token in spec.get("process_exclude", ())):
+                continue
+            result[provider_id][0] = True
+            if cpu >= 0.2:
+                result[provider_id][1] = True
+    return result
+
+
+def _newest_session_mtime(root):
+    """(newest .jsonl mtime, any-.jsonl-found) under root, time/visit bounded so a large session
+    history can't stall the poll."""
+    root = pathlib.Path(root).expanduser()
+    if not root.is_dir():
+        return None, False
+    newest = None
+    found = False
+    visited = 0
+    deadline = time.monotonic() + 0.4
+    stack = [root]
+    while stack and visited < 4096 and time.monotonic() < deadline:
+        try:
+            entries = list(os.scandir(stack.pop()))
+        except OSError:
+            continue
+        for entry in entries:
+            visited += 1
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(pathlib.Path(entry.path))
+                elif entry.name.endswith(".jsonl") and entry.is_file(follow_symlinks=False):
+                    found = True
+                    mtime = entry.stat(follow_symlinks=False).st_mtime
+                    newest = mtime if newest is None else max(newest, mtime)
+            except OSError:
+                continue
+    return newest, found
+
+
+def detect_working():
+    processes = _busy_processes()
+    now = time.time()
+    states = {}
+    for provider_id, spec in POLL_PROVIDERS.items():
+        _running, busy = processes.get(provider_id, (False, False))
+        # A freshly-written session transcript is the signal a turn is in progress (codex); for
+        # providers without one, a briefly-busy process is the only local signal. Idle background
+        # sqlite churn is deliberately ignored — only the transcript counts as work.
+        recent = False
+        sessions = spec.get("sessions")
+        if sessions is not None:
+            mtime, _files = _newest_session_mtime(sessions)
+            recent = mtime is not None and now - mtime <= SESSION_ACTIVE_WINDOW_SECONDS
+        states[provider_id] = recent or busy
+    return states
+
+
+def poll_state_path():
+    return config_dir() / "poll-activity-state.json"
+
+
+def _load_poll_state():
+    try:
+        return json.loads(poll_state_path().read_text())
+    except Exception:
+        return {}
+
+
+def _save_poll_state(state):
+    try:
+        config_dir().mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = poll_state_path()
+        path.write_text(json.dumps(state))
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+
+
+def cmd_poll_activity(_args):
+    states = detect_working()
+    previous = _load_poll_state()
+    next_state = {}
+    for provider_id, working in states.items():
+        was_working = bool(previous.get(provider_id))
+        # `active` refreshes the KVM's working window each poll; `stop` clears it promptly on the
+        # first idle poll instead of waiting for the window to lapse.
+        if working:
+            event = "active"
+        elif was_working:
+            event = "stop"
+        else:
+            next_state[provider_id] = False
+            continue
+        payload = {"schemaVersion": SCHEMA_VERSION, "provider": provider_id, "event": event}
+        try:
+            push_to_targets("/push/v1/activity", payload, timeout=3)
+        except Exception as error:
+            print(f"kvm-ai-monitor: activity poll push failed: {error}", file=sys.stderr)
+        next_state[provider_id] = working
+    _save_poll_state(next_state)
 
 
 def build_parser():
@@ -632,7 +947,13 @@ def build_parser():
 
     activity_parser = sub.add_parser("send-activity", help="push a lifecycle activity event")
     activity_parser.add_argument("event", choices=("start", "active", "stop"))
+    activity_parser.add_argument("--provider", default=DEFAULT_ACTIVITY_PROVIDER,
+                                 help="provider this event is for (default: %(default)s)")
     activity_parser.set_defaults(func=cmd_send_activity)
+
+    sub.add_parser("poll-activity",
+                   help="detect local CLI activity (codex) and push active/stop events"
+                   ).set_defaults(func=cmd_poll_activity)
 
     sub.add_parser("print-payload", help="print the usage payload without sending it").set_defaults(func=cmd_print_payload)
 

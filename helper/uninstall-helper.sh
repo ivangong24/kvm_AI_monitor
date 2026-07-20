@@ -4,6 +4,8 @@ set -euo pipefail
 PROJECT_DIR="${0:A:h:h}"
 LABEL="com.kvm-ai-monitor.helper"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+ACTIVITY_LABEL="com.kvm-ai-monitor.activity"
+ACTIVITY_PLIST="$HOME/Library/LaunchAgents/$ACTIVITY_LABEL.plist"
 APP_SUPPORT="$HOME/Library/Application Support/kvm-ai-monitor"
 CONFIG_DIR="$HOME/.kvm-ai-monitor"
 PURGE=0
@@ -21,9 +23,10 @@ fi
 
 UID_NUM=$(id -u)
 launchctl bootout "gui/$UID_NUM/$LABEL" >/dev/null 2>&1 || true
-rm -f "$PLIST"
+launchctl bootout "gui/$UID_NUM/$ACTIVITY_LABEL" >/dev/null 2>&1 || true
+rm -f "$PLIST" "$ACTIVITY_PLIST"
 rm -rf "$APP_SUPPORT"
-rm -f "$CONFIG_DIR/last-activity"
+rm -f "$CONFIG_DIR/last-activity" "$CONFIG_DIR/poll-activity-state.json"
 
 if [[ "$PURGE" -eq 1 ]]; then
   if [[ -f "$CONFIG_DIR/helper.json" ]]; then

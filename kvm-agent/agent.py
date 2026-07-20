@@ -920,6 +920,12 @@ def compose_wallpaper(snapshot: dict[str, object], provider_id: str = "claude",
     status_color = str(theme["secondary"]) if is_active else str(theme["muted"])
     draw_text(draw, ((GLYPH_CENTER[0] + 15) * s, GLYPH_CENTER[1] * s), status_text,
               load_font(FONT_UI_SEMIBOLD, 8 * s), status_color, "lm")
+    # Current subscription plan (e.g. PRO / PLUS / MAX), drawn in the always-visible header so it
+    # shows for whichever provider is selected and updates automatically as the plan push changes.
+    plan_text = str(provider.get("plan") or "").strip().upper()[:14]
+    if plan_text and connection_state in ("", "ready"):
+        draw_text(draw, ((GLYPH_CENTER[0] + 15) * s, (GLYPH_CENTER[1] + 11) * s), plan_text,
+                  load_font(FONT_UI_SEMIBOLD, 8 * s), str(theme.get("bar", theme["accent"])), "lm")
 
     if usage_panel_visible(provider, limits):
         ctx = {"provider": provider, "activity": activity, "today": today,

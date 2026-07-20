@@ -32,6 +32,8 @@ fi
 APP_SUPPORT="$HOME/Library/Application Support/kvm-ai-monitor"
 LABEL="com.kvm-ai-monitor.helper"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+ACTIVITY_LABEL="com.kvm-ai-monitor.activity"
+ACTIVITY_PLIST="$HOME/Library/LaunchAgents/$ACTIVITY_LABEL.plist"
 
 if [[ "$UPDATE" -eq 0 ]]; then
   if [[ "$SECRET_STDIN" -eq 1 ]]; then
@@ -110,9 +112,39 @@ cat > "$PLIST" <<PLIST_EOF
 </plist>
 PLIST_EOF
 
+# Activity poller: pushes working/idle for CLIs without a lifecycle hook (codex). Short
+# interval so the tile animates promptly; the KVM holds each working state for 120 s.
+cat > "$ACTIVITY_PLIST" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$ACTIVITY_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>python3</string>
+    <string>$APP_SUPPORT/kvm_ai_push.py</string>
+    <string>poll-activity</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>30</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/kvm-ai-helper.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/kvm-ai-helper.log</string>
+</dict>
+</plist>
+PLIST_EOF
+
 UID_NUM=$(id -u)
 launchctl bootout "gui/$UID_NUM/$LABEL" >/dev/null 2>&1 || true
 launchctl bootstrap "gui/$UID_NUM" "$PLIST"
+launchctl bootout "gui/$UID_NUM/$ACTIVITY_LABEL" >/dev/null 2>&1 || true
+launchctl bootstrap "gui/$UID_NUM" "$ACTIVITY_PLIST"
 
 echo "LaunchAgent loaded. Running an initial usage push..."
 if python3 "$APP_SUPPORT/kvm_ai_push.py" send-usage; then
