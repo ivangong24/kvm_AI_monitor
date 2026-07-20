@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Offline unit tests for the macOS push helper. No network, no `claude`/`security` binaries,
 no real Keychain access — all subprocess/network adapters are patched. Run with:
-    python3 mac-helper/test_helper.py
+    python3 helper/test_helper.py
 """
 
 import datetime

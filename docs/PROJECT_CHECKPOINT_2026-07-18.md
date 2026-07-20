@@ -399,3 +399,50 @@ confirmed firing on a one-minute interval with `LastTaskResult = 0`.
   naming `KVM_TOKEN` as the escape hatch. Linux *monitored* devices are unaffected.
 - **`mac-helper/` now holds the Windows and Linux installers**, so the directory name is
   misleading.
+
+## Update - 2026-07-20: 7/19 open issues resolved
+
+All seven open issues above are addressed. Each is now historical; the resolutions:
+
+**`mac-helper/` renamed to `helper/`.** `git mv` plus a mechanical reference sweep across
+`package.json`, `bin/kvm-ai-monitor.mjs`, the CI workflow, `kvm-agent/index.html`, both
+READMEs, `docs/`, and every intra-directory script. Only this checkpoint's prose still says
+`mac-helper` (as history).
+
+**npm scripts are cross-platform.** `scripts/run-script.mjs` is a Node dispatcher behind every
+`kvm:*` / `helper:*` script: it runs the zsh/sh flavor on Unix, the `.ps1` flavor on Windows,
+and resolves a runnable Python for `helper:test` / `helper:hooks`. The Windows shell and Python
+probing moved out of `bin/` into `src/platform.js` (`posixShell`, `findPython`,
+`installedHookShim`), shared by the wizard, the dispatcher, and the signing test, with a
+PowerShell twin in `helper/find-python.ps1`. `kvm:configure` has no zsh/Keychain analogue off
+macOS, so there it maps to a new `kvm-ai-monitor authorize` CLI command (same sign-in +
+token-save flow against the platform vault). The `:win` scripts are kept as aliases.
+
+**`helper/helper-status.ps1`** mirrors `helper-status.sh`: config validity, DPAPI secret
+presence per host, `Get-ScheduledTaskInfo` health (decoding `LastTaskResult`, incl. 267011 =
+"has not run yet"), installed-file check, and `print-payload`. Routed through `helper:status`.
+
+**Wizard offers Claude Code hooks on all platforms.** `enrollThisDevice` calls a shared
+`installClaudeHooks()` that runs `claude_hooks.py install` against the installed shim
+(`kvm-ai-claude-hook.cmd` on Windows) with the probed interpreter; macOS keeps its zsh wrapper
+for the summary line. `claude_hooks.py` already quoted commands with `"` on `win32`.
+
+**The `helper.json` merge is extracted and tested.** `helper/merge-helper-config.ps1` holds the
+multi-KVM merge that was inline in `install-helper.ps1`; `test/helper-config-merge.test.js`
+drives it under real PowerShell (`powershell.exe` on Windows CI, `pwsh` elsewhere, skip with a
+reason when absent) covering fresh install, legacy single-target upgrade, append, host replace,
+unparseable input, and BOM-less/newline output. CI's parse check now covers all five `.ps1`.
+
+**Linux is a supported setup machine.** `secret-store.js` gained a libsecret (`secret-tool`)
+backend — the same service/account names `kvm_ai_push.py` uses — with the `KVM_TOKEN` error
+kept as the no-keyring fallback. `helperSupported()` and `runHelperInstaller()` now include
+`linux` (via `install-helper-linux.sh`), and `uninstall-helper-linux.sh` is new.
+
+**Logged-out push pause is documented, not fixed.** It is inherent to a per-user scheduler
+running as the interactive user on all three platforms. Now called out in `README.md`,
+`helper/README.md`, and the `helper-status.ps1` output rather than left implicit.
+
+Verified on macOS: `npm test` (5 pass, 7 merge tests skip cleanly for lack of local PowerShell),
+`npm run helper:test` through the dispatcher (38 offline tests), and `node --check` on every
+edited script. Windows/Linux paths are covered by CI; the merge and status `.ps1` await a live
+Windows run.

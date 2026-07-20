@@ -3,12 +3,14 @@
 // macOS keeps secrets in the login Keychain via /usr/bin/security. Windows has no equivalent
 // CLI that can read a secret back out, so we talk to the Credential Manager API (advapi32)
 // directly through a short PowerShell shim. That keeps the dependency list empty: every
-// Windows install already has powershell.exe and advapi32.
+// Windows install already has powershell.exe and advapi32. Linux uses libsecret's
+// secret-tool (the same backend kvm_ai_push.py prefers for push secrets); without it the
+// dispatch below names KVM_TOKEN as the escape hatch.
 //
-// Secrets are passed to PowerShell through the environment, never argv, so they do not show
-// up in the process list.
+// Secrets are passed to PowerShell through the environment and to secret-tool through stdin,
+// never argv, so they do not show up in the process list.
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 
 const CRED_TYPE_GENERIC = 1;
 const CRED_PERSIST_LOCAL_MACHINE = 2;
@@ -177,13 +179,47 @@ const windowsStore = {
   delete: (service, account) => void windowsRun("delete", service, account),
 };
 
+// --- Linux ------------------------------------------------------------------------------
+
+function linuxRun(args, input) {
+  return execFileSync("secret-tool", args, {
+    encoding: "utf8",
+    input,
+    stdio: [input === undefined ? "ignore" : "pipe", "pipe", "ignore"],
+  }).trim();
+}
+
+const linuxStore = {
+  get(service, account) {
+    return linuxRun(["lookup", "service", service, "account", account]);
+  },
+  set(service, account, secret) {
+    // `store` reads the secret from stdin; the label is what keyring UIs display.
+    linuxRun(
+      ["store", "--label", `KVM AI Monitor (${service})`, "service", service, "account", account],
+      secret,
+    );
+  },
+  delete(service, account) {
+    linuxRun(["clear", "service", service, "account", account]);
+  },
+};
+
+function hasSecretTool() {
+  return spawnSync("secret-tool", ["--help"], { stdio: "ignore" }).status === 0;
+}
+
 // --- dispatch ---------------------------------------------------------------------------
 
 function store() {
   if (process.platform === "darwin") return macStore;
   if (process.platform === "win32") return windowsStore;
+  if (process.platform === "linux" && hasSecretTool()) return linuxStore;
   throw new Error(
-    `No supported secret store on ${process.platform}. Set KVM_TOKEN in the environment instead.`,
+    process.platform === "linux"
+      ? `No secret store found: install libsecret's secret-tool (e.g. apt install ` +
+        `libsecret-tools) with an unlocked keyring, or set KVM_TOKEN in the environment instead.`
+      : `No supported secret store on ${process.platform}. Set KVM_TOKEN in the environment instead.`,
   );
 }
 
@@ -210,5 +246,6 @@ export function deleteSecret(service, account = "admin") {
 export function secretStoreName() {
   if (process.platform === "darwin") return "Keychain";
   if (process.platform === "win32") return "Windows Credential Manager";
+  if (process.platform === "linux") return "libsecret keyring";
   return "secret store";
 }

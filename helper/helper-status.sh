@@ -59,4 +59,4 @@ fi
 
 echo
 echo "== Payload that would be sent (print-payload) =="
-python3 "$PROJECT_DIR/mac-helper/kvm_ai_push.py" print-payload
+python3 "$PROJECT_DIR/helper/kvm_ai_push.py" print-payload

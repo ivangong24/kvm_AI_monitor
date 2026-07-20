@@ -2,25 +2,32 @@
 
 Implements the outbound-only side of `docs/PUSH_PROTOCOL.md`: a scheduled per-user task that
 reduces Claude usage to the whitelisted aggregate schema, HMAC-signs it, and pushes it to the
-KVM. Nothing here opens a listening port. (The directory name is historical — the same
-stdlib-only helper now runs on all three platforms.)
+KVM. Nothing here opens a listening port. The same stdlib-only Python helper runs on all three
+platforms; only the scheduler and secret vault differ.
 
 | | macOS | Linux | Windows |
 |---|---|---|---|
 | Installer | `install-helper.sh` | `install-helper-linux.sh` | `install-helper.ps1` |
+| Uninstaller | `uninstall-helper.sh` | `uninstall-helper-linux.sh` | `uninstall-helper.ps1` |
 | Scheduler | LaunchAgent (60 s) | systemd user timer (60 s) | Task Scheduler (1 min) |
 | Push secret | login Keychain | libsecret (`secret-tool`), else 0600 file | user-scoped DPAPI file |
 | Claude credentials | Keychain item (consent once) | `~/.claude/.credentials.json` | `~/.claude/.credentials.json` |
 | Claude hook shim | `kvm-ai-claude-hook.sh` | `kvm-ai-claude-hook.sh` | `kvm-ai-claude-hook.cmd` |
+| Status | `helper-status.sh` | `systemctl --user status` + `print-payload` | `helper-status.ps1` |
+
+Every scheduler runs in the logged-in user's session (LaunchAgent GUI domain / systemd `--user`
+/ Task Scheduler `InteractiveToken`), so pushes pause while that user is signed out and resume
+at the next sign-in. The npm scripts (`npm run helper:*`) dispatch to the right script for the
+current OS.
 
 Linux/Windows enrollment, with the device ID + one-time secret from the AI Usage page:
 
 ```bash
 # Linux (python3 + systemd user session)
-./mac-helper/install-helper-linux.sh --kvm <kvm-ip> --device <device-id>
+./helper/install-helper-linux.sh --kvm <kvm-ip> --device <device-id>
 
 # Windows (Python 3 on PATH, from PowerShell)
-powershell -ExecutionPolicy Bypass -File mac-helper\install-helper.ps1 -Kvm <kvm-ip> -Device <device-id>
+powershell -ExecutionPolicy Bypass -File helper\install-helper.ps1 -Kvm <kvm-ip> -Device <device-id>
 ```
 
 Both print the command that adds Claude Code activity hooks at the end. The
@@ -44,13 +51,16 @@ service. CI runs the helper test suite on macOS, Ubuntu, and Windows on every pu
 
 ## Install / uninstall / status
 
+These npm scripts work the same on macOS, Linux, and Windows (the dispatcher picks the right
+installer and resolves Git Bash / a runnable Python on Windows):
+
 ```bash
-npm run helper:install -- --kvm <kvm-host-or-ip> --device <device-id>   # enroll + load LaunchAgent
+npm run helper:install -- --kvm <kvm-host-or-ip> --device <device-id>   # enroll + schedule the push
 npm run helper:install -- --update                                     # refresh installed files after git pull (no secret needed)
 npm run helper:hooks                                                   # add Claude Code activity hooks
 npm run helper:status                                                  # audit what is configured/sent
 npm run helper:uninstall                                               # stop + remove installed files
-npm run helper:uninstall -- --purge                                    # also remove config + Keychain secret
+npm run helper:uninstall -- --purge                                    # also remove config + the push secret
 npm run helper:test                                                    # offline unit tests
 ```
 
@@ -59,7 +69,7 @@ npm run helper:test                                                    # offline
 install time.
 
 An additional device (e.g. a Mac mini used with the same subscription) needs only this
-directory — no Remote Login, no SSH key. Copy the repo (or just `mac-helper/`) to it and run
+directory — no Remote Login, no SSH key. Copy the repo (or just `helper/`) to it and run
 the same `helper:install` / `helper:hooks` commands with its own enrolled `--device` id.
 
 ## Privacy model

@@ -16,6 +16,7 @@ import { createInterface } from "node:readline";
 import https from "node:https";
 import { CometClient } from "../src/comet-client.js";
 import { getSecret, setSecret, secretStoreName } from "../src/secret-store.js";
+import { posixShell, findPython, installedHookShim } from "../src/platform.js";
 
 const PROJECT_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
 const CONFIG_DIR = join(homedir(), ".kvm-ai-monitor");
@@ -162,36 +163,6 @@ function webterm(host, command, { timeoutMs = 120_000 } = {}) {
   return { status: result.status ?? 1, output: body.trim(), stderr: `${result.stderr ?? ""}`.trim() };
 }
 
-// The install scripts are portable POSIX, but Windows has no `sh` on PATH. Git for Windows
-// ships one (along with tar/base64/mktemp), so locate it rather than requiring WSL — the
-// `bash.exe` in system32 is the WSL stub and fails outright when no distro is installed.
-function posixShell() {
-  if (process.env.KVM_SH) return process.env.KVM_SH;
-  if (process.platform !== "win32") return "sh";
-
-  const candidates = [];
-  const where = spawnSync("where.exe", ["git"], { encoding: "utf8" });
-  for (const line of `${where.stdout ?? ""}`.split(/\r?\n/)) {
-    const gitExe = line.trim();
-    // ...\Git\cmd\git.exe -> ...\Git\bin\bash.exe
-    // Prefer bin\bash.exe over usr\bin\sh.exe: only the former sets up the MSYS PATH, so
-    // sh.exe cannot find tar/base64/mktemp when launched straight from Windows.
-    if (gitExe.toLowerCase().endsWith("git.exe")) {
-      candidates.push(join(dirname(dirname(gitExe)), "bin", "bash.exe"));
-    }
-  }
-  for (const root of [process.env.ProgramFiles, process.env["ProgramFiles(x86)"], "C:\\Program Files"]) {
-    if (root) candidates.push(join(root, "Git", "bin", "bash.exe"));
-  }
-
-  const found = candidates.find((candidate) => existsSync(candidate));
-  if (found) return found;
-  throw new Error(
-    "This step needs a POSIX shell. Install Git for Windows (https://git-scm.com/download/win), " +
-    "or point KVM_SH at an sh.exe.",
-  );
-}
-
 function runScript(script, { args = [], env = {}, input } = {}) {
   const result = spawnSync(script, args, {
     cwd: PROJECT_DIR,
@@ -308,19 +279,22 @@ function readHelperTargets() {
   return [];
 }
 
-// kvm_ai_push.py is already cross-platform (DPAPI secrets, ~/.claude/.credentials.json on
-// Windows); only the scheduling differs, so each platform gets its own thin installer:
-// launchd via mac-helper/install-helper.sh, Task Scheduler via windows-helper/install-helper.ps1.
+// kvm_ai_push.py is already cross-platform; only the scheduling differs, so each platform has
+// its own thin installer: launchd (install-helper.sh), Task Scheduler (install-helper.ps1),
+// and a systemd user timer (install-helper-linux.sh).
 const HELPER_UNSUPPORTED =
-  `Enrolling this computer as a push device is supported on macOS and Windows only, so this ` +
-  `machine's own AI usage will not appear on the KVM. The KVM agent and wallpaper still work, ` +
-  `and any enrolled device keeps pushing.`;
+  `Enrolling this computer as a push device is supported on macOS, Windows, and Linux only, so ` +
+  `this machine's own AI usage will not appear on the KVM. The KVM agent and wallpaper still ` +
+  `work, and any enrolled device keeps pushing.`;
 
 function helperSupported() {
-  return process.platform === "darwin" || process.platform === "win32";
+  return ["darwin", "win32", "linux"].includes(process.platform);
 }
 
-// Runs the platform's helper installer with the same argument shape on both.
+const deviceLabel = () =>
+  process.platform === "win32" ? "PC" : process.platform === "darwin" ? "Mac" : "computer";
+
+// Runs the platform's helper installer with the same argument shape across platforms.
 function runHelperInstaller({ update = false, host, deviceId, secret } = {}) {
   const args = update
     ? (process.platform === "win32" ? ["-Update"] : ["--update"])
@@ -333,18 +307,43 @@ function runHelperInstaller({ update = false, host, deviceId, secret } = {}) {
     return runScript("powershell.exe", {
       args: [
         "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-        "-File", join(PROJECT_DIR, "mac-helper", "install-helper.ps1"),
+        "-File", join(PROJECT_DIR, "helper", "install-helper.ps1"),
         ...args,
       ],
       input,
     });
   }
-  return runScript(join(PROJECT_DIR, "mac-helper", "install-helper.sh"), { args, input });
+  if (process.platform === "linux") {
+    return runScript("sh", { args: [join(PROJECT_DIR, "helper", "install-helper-linux.sh"), ...args], input });
+  }
+  return runScript(join(PROJECT_DIR, "helper", "install-helper.sh"), { args, input });
+}
+
+// claude_hooks.py edits ~/.claude/settings.json the same way on every platform; only the shim
+// it points the hooks at differs. macOS keeps its zsh wrapper for its extra summary output.
+function installClaudeHooks() {
+  let status;
+  if (process.platform === "darwin") {
+    status = runScript(join(PROJECT_DIR, "helper", "install-claude-hooks.sh"), { input: "" }).status;
+  } else {
+    const shim = installedHookShim();
+    const python = findPython();
+    if (!python || !existsSync(shim)) {
+      info("Could not install hooks automatically; run later with: npm run helper:hooks");
+      return;
+    }
+    status = runScript(python, {
+      args: [join(PROJECT_DIR, "helper", "claude_hooks.py"), "install", shim],
+      input: "",
+    }).status;
+  }
+  if (status === 0) ok("Claude Code hooks installed");
+  else info("Hook install failed; run later with: npm run helper:hooks");
 }
 
 async function enrollThisDevice(host) {
   if (!helperSupported()) throw new Error(HELPER_UNSUPPORTED);
-  const label = process.platform === "win32" ? "PC" : "Mac";
+  const label = deviceLabel();
   if (readHelperTargets().some((target) => target?.kvmHost === host)) {
     if (runHelperInstaller({ update: true }).status === 0) {
       ok(`This ${label} is already enrolled; helper refreshed`);
@@ -373,12 +372,8 @@ async function enrollThisDevice(host) {
     throw new Error(`Helper install failed: ${detail}`);
   }
   ok(`This ${label} enrolled as "${name}" (${deviceId}); usage now pushes every minute`);
-  // The Claude Code hook installer is still a shell script, so it stays macOS-only for now.
-  if (process.platform === "darwin"
-      && await confirm("Also send exact working/idle events from Claude Code on this Mac?")) {
-    const hooks = runScript(join(PROJECT_DIR, "mac-helper", "install-claude-hooks.sh"), { input: "" });
-    if (hooks.status === 0) ok("Claude Code hooks installed");
-    else info("Hook install failed; run later with: npm run helper:hooks");
+  if (await confirm(`Also send exact working/idle events from Claude Code on this ${label}?`)) {
+    installClaudeHooks();
   }
 }
 
@@ -409,7 +404,7 @@ async function cmdSetup(kvmArg) {
   if (!helperSupported()) {
     info(HELPER_UNSUPPORTED);
   } else if (await confirm(
-    `Enroll this ${process.platform === "win32" ? "PC" : "Mac"} so its Claude usage shows on the KVM?`,
+    `Enroll this ${deviceLabel()} so its Claude usage shows on the KVM?`,
   )) {
     await enrollThisDevice(host);
   }
@@ -429,7 +424,7 @@ function cmdStatus() {
   const targets = readHelperTargets();
   const enrollment = targets.length
     ? targets.map((t) => `${t.kvmHost} (${t.deviceId})`).join(", ")
-    : helperSupported() ? "not enrolled" : "not enrolled (push helper is macOS/Windows only)";
+    : helperSupported() ? "not enrolled" : "not enrolled (push helper needs macOS, Windows, or Linux)";
   console.log(`This computer pushes to: ${enrollment}`);
   for (const host of kvms) {
     console.log(`Admin session for ${host}: ${hasToken(host) ? "saved" : "missing (rerun setup)"}`);
@@ -441,7 +436,8 @@ function usage() {
 
 Usage:
   kvm-ai-monitor [setup] [--kvm <ip>]   guided setup (discover, authorize, install, enroll)
-  kvm-ai-monitor enroll [--kvm <ip>]    enroll this Mac as a push device on a configured KVM
+  kvm-ai-monitor authorize [--kvm <ip>] sign in to a KVM and save the admin session token
+  kvm-ai-monitor enroll [--kvm <ip>]    enroll this computer as a push device on a configured KVM
   kvm-ai-monitor install-agent [--kvm <ip>]  redeploy the on-device agent
   kvm-ai-monitor discover [--json]      list Comet KVMs found on the local network
   kvm-ai-monitor status                 show configured KVMs and this Mac's enrollment
@@ -455,6 +451,14 @@ async function main() {
   const command = argv.find((arg) => !arg.startsWith("--") && arg !== kvmArg) ?? "setup";
   switch (command) {
     case "setup": await cmdSetup(kvmArg); break;
+    case "authorize": {
+      // The cross-platform stand-in for scripts/configure-kvm.sh (zsh + macOS Keychain).
+      const host = kvmArg ?? readRegistry().at(-1) ?? await ask("Comet IP address: ");
+      if (!host) throw new Error("No KVM given. Run: kvm-ai-monitor authorize --kvm <ip>");
+      await authorize(host);
+      rememberKvm(host);
+      break;
+    }
     case "discover": await cmdDiscover(argv.includes("--json")); break;
     case "status": cmdStatus(); break;
     case "install-agent": {

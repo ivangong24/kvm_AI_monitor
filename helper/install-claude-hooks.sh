@@ -11,6 +11,6 @@ if [[ ! -x "$HOOK_SCRIPT" ]]; then
   exit 1
 fi
 
-python3 "$PROJECT_DIR/mac-helper/claude_hooks.py" install "$HOOK_SCRIPT"
+python3 "$PROJECT_DIR/helper/claude_hooks.py" install "$HOOK_SCRIPT"
 echo "Claude Code lifecycle hooks installed in ~/.claude/settings.json"
 echo "(SessionStart/UserPromptSubmit/PostToolUse/Stop/SessionEnd -> $HOOK_SCRIPT)"

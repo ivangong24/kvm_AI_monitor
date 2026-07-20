@@ -265,7 +265,7 @@
               <div class="field"><span>Secret (shown only once)</span><code id="secret-value"></code></div>
               <p class="warn-note"><strong>Warning:</strong> This secret is not stored in a retrievable form and will not be shown again.</p>
               <div class="field"><span>Install command on that device (paste the secret when prompted)</span><code id="install-command"></code></div>
-              <div class="field"><span>For exact working-state animation, also run on that device</span><code>./mac-helper/install-claude-hooks.sh</code></div>
+              <div class="field"><span>For exact working-state animation, also run on that device</span><code>./helper/install-claude-hooks.sh</code></div>
               <div><button class="command" id="dismiss-secret" type="button">Dismiss</button></div>
             </div>
             <div id="devices-list"></div>
@@ -489,7 +489,7 @@
         elements["secret-device-id"].textContent = id;
         elements["secret-value"].textContent = secret;
         const host = window.location.hostname;
-        elements["install-command"].textContent = `./mac-helper/install-helper.sh --kvm ${host} --device ${id}  (Linux: install-helper-linux.sh · Windows: install-helper.ps1)`;
+        elements["install-command"].textContent = `./helper/install-helper.sh --kvm ${host} --device ${id}  (Linux: install-helper-linux.sh · Windows: install-helper.ps1)`;
         elements["secret-panel"].hidden = false;
       }
 

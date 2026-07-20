@@ -13,12 +13,13 @@ The shipped scripts contain no machine-specific values. A fresh installation nee
    `npm run kvm:agent:install`).
 3. One manual firmware step: Settings → System → Screen Display → Wallpaper Only.
 4. Per monitored Mac: either Remote Login + the KVM key (SSH path) or the push-device helper
-   (`./mac-helper/install-helper.sh`), plus optional Claude hooks.
+   (`./helper/install-helper.sh`), plus optional Claude hooks.
 
 Known constraints to address in future work rather than today: the CLI tooling manages a single
 Comet per setup computer (`~/.kvm-ai-monitor/kvm-host` holds one address and the helper pushes to
 one `kvmHost` — note this does **not** limit how many computers one Comet monitors, which already
-works); the setup machine and helper are macOS-only (zsh + Keychain + LaunchAgent); the firmware
+works); the setup machine and helper now run on macOS, Windows, and Linux (Keychain / Credential
+Manager / libsecret and LaunchAgent / Task Scheduler / systemd user timer); the firmware
 paths (`/etc/kvmd/user`, extras/nginx extension, ubus `custom_screen`, ttyd web terminal, GUI
 background directories) are verified against the current RM10 firmware and should be re-verified
 after firmware updates.

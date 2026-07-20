@@ -9,10 +9,11 @@ leave the monitored Mac; only whitelisted aggregate fields reach the KVM.
 
 - **KVM receiver** (`kvm-agent/push_receiver.py`, wired into `kvm-agent/agent.py`): verifies and
   stores pushed aggregates, merges them into the display snapshot, and expires working state.
-- **macOS helper** (`mac-helper/`): a LaunchAgent in the logged-in GUI session that reads Claude
-  usage natively (Keychain consent works there), reduces it to the strict schema below, signs, and
-  POSTs it to the KVM once per minute. The Mac listens on no port.
-- **Claude Code hooks** (`mac-helper/`): lifecycle hook commands that send minimal signed activity
+- **Device helper** (`helper/`): a per-user scheduled task (LaunchAgent on macOS, systemd user
+  timer on Linux, Task Scheduler on Windows) in the logged-in session that reads Claude usage
+  natively, reduces it to the strict schema below, signs, and POSTs it to the KVM once per minute.
+  The device listens on no port; pushes pause while the user is signed out.
+- **Claude Code hooks** (`helper/`): lifecycle hook commands that send minimal signed activity
   events (`start` / `active` / `stop`) so the KVM can animate exact working state from any enrolled
   device, including devices without Remote Login.
 

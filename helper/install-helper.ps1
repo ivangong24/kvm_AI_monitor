@@ -22,60 +22,9 @@ if ($Update) {
     Write-Error "Usage: install-helper.ps1 -Kvm <host> -Device <device-id> [-SecretStdin] | -Update"
 }
 
-# --- locate a usable Python --------------------------------------------------------------
-#
-# `python`/`python3` on PATH are usually the Microsoft Store alias stubs: they exist, so a
-# plain Get-Command finds them, but they exit 9009 without running anything. Probe candidates
-# and keep the first that actually executes. uv-managed interpreters are never on PATH.
-function Find-Python {
-    param([switch]$Windowed)
+# --- locate a usable Python (probing logic shared with helper-status.ps1) ----------------
 
-    $exe = if ($Windowed) { "pythonw.exe" } else { "python.exe" }
-    $candidates = @()
-
-    if ($env:KVM_PYTHON) {
-        $candidates += if ($Windowed) { $env:KVM_PYTHON -replace "python\.exe$", "pythonw.exe" } else { $env:KVM_PYTHON }
-    }
-
-    $uvRoot = Join-Path $env:APPDATA "uv\python"
-    if (Test-Path $uvRoot) {
-        # Sort by parsed version, not by name: a string sort ranks "cpython-3.9" above
-        # "cpython-3.14" and would pick the oldest interpreter installed.
-        $candidates += Get-ChildItem $uvRoot -Directory -ErrorAction SilentlyContinue |
-            ForEach-Object {
-                $version = New-Object Version(0, 0, 0)
-                if ($_.Name -match "cpython-(\d+)\.(\d+)(?:\.(\d+))?") {
-                    $patch = 0
-                    if ($Matches[3]) { $patch = [int]$Matches[3] }
-                    $version = New-Object Version([int]$Matches[1], [int]$Matches[2], $patch)
-                }
-                [pscustomobject]@{ Path = $_.FullName; Version = $version }
-            } |
-            Sort-Object Version -Descending |
-            ForEach-Object { Join-Path $_.Path $exe }
-    }
-
-    $candidates += (Get-Command $exe -All -ErrorAction SilentlyContinue | ForEach-Object { $_.Source })
-    if (-not $Windowed) {
-        $candidates += (Get-Command "python3.exe", "py.exe" -All -ErrorAction SilentlyContinue | ForEach-Object { $_.Source })
-    }
-
-    foreach ($candidate in $candidates) {
-        if (-not $candidate) { continue }
-        if ($candidate -like "*\WindowsApps\*") { continue }   # Store alias stub
-        if (-not (Test-Path $candidate)) { continue }
-        # pythonw has no console to print to, so always probe with the console build.
-        $probeExe = $candidate -replace "pythonw\.exe$", "python.exe"
-        if (-not (Test-Path $probeExe)) { continue }
-        try {
-            $probe = & $probeExe -c "print(1)" 2>$null
-            if ($LASTEXITCODE -eq 0 -and "$probe".Trim() -eq "1") { return $candidate }
-        } catch {
-            continue
-        }
-    }
-    return $null
-}
+. (Join-Path $PSScriptRoot "find-python.ps1")
 
 $python = Find-Python
 if (-not $python) {
@@ -89,7 +38,7 @@ if (-not $pythonw) { $pythonw = $python }
 # --- install the helper ------------------------------------------------------------------
 
 New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
-Copy-Item (Join-Path $ProjectDir "mac-helper\kvm_ai_push.py") (Join-Path $AppDir "kvm_ai_push.py") -Force
+Copy-Item (Join-Path $ProjectDir "helper\kvm_ai_push.py") (Join-Path $AppDir "kvm_ai_push.py") -Force
 New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
 
 $helperPath = Join-Path $AppDir "kvm_ai_push.py"
@@ -97,7 +46,7 @@ $helperPath = Join-Path $AppDir "kvm_ai_push.py"
 # The shipped hook calls a bare `pythonw`, which on most machines is the Store stub or absent;
 # the hook swallows all output and exits 0, so that failure would be silent. Bake in the
 # interpreter we just resolved.
-$hookSource = Get-Content (Join-Path $ProjectDir "mac-helper\kvm-ai-claude-hook.cmd") -Raw
+$hookSource = Get-Content (Join-Path $ProjectDir "helper\kvm-ai-claude-hook.cmd") -Raw
 $hookSource = $hookSource -replace 'start /b "" pythonw ', ('start /b "" "' + $pythonw + '" ')
 [IO.File]::WriteAllText((Join-Path $AppDir "kvm-ai-claude-hook.cmd"), $hookSource,
                         (New-Object Text.UTF8Encoding($false)))
@@ -130,28 +79,10 @@ if (-not $Update) {
     Remove-Variable Secret, bytes
     if ($process.ExitCode -ne 0) { Write-Error "Storing the secret failed." }
 
-    # Merge this KVM into the target list so one PC can push to several KVMs. Done in
-    # PowerShell rather than a generated .py file: Set-Content defaults to UTF-16 here, and
-    # Python cannot parse UTF-16 source.
-    $configPath = Join-Path $ConfigDir "helper.json"
-    $targets = @()
-    if (Test-Path $configPath) {
-        try {
-            $existing = Get-Content $configPath -Raw | ConvertFrom-Json
-            if ($existing.targets) {
-                $targets = @($existing.targets | Where-Object { $_.kvmHost -ne $Kvm })
-            } elseif ($existing.kvmHost -and $existing.deviceId) {
-                $targets = @([pscustomobject]@{ kvmHost = $existing.kvmHost; deviceId = $existing.deviceId })
-            }
-        } catch {
-            $targets = @()
-        }
-    }
-    $targets += [pscustomobject]@{ kvmHost = $Kvm; deviceId = $Device }
-    # -Depth: PS 5.1 defaults to 2 and would stringify the target objects.
-    $json = ConvertTo-Json @{ targets = @($targets) } -Depth 5
-    # Must be BOM-less: both Python's json.load and Node's JSON.parse reject a leading BOM.
-    [IO.File]::WriteAllText($configPath, $json + "`n", (New-Object Text.UTF8Encoding($false)))
+    # Merge this KVM into the target list so one PC can push to several KVMs. The merge lives
+    # in its own script so the test suite can exercise it (including on Windows CI).
+    & (Join-Path $PSScriptRoot "merge-helper-config.ps1") `
+        -ConfigPath (Join-Path $ConfigDir "helper.json") -Kvm $Kvm -Device $Device
 }
 
 # --- schedule the per-minute push ----------------------------------------------------------
@@ -241,4 +172,5 @@ if ($LASTEXITCODE -eq 0) {
 
 Write-Host ""
 Write-Host "To also send exact working/idle events from Claude Code on this device, run:"
-Write-Host "  & `"$python`" `"$(Join-Path $ProjectDir 'mac-helper\claude_hooks.py')`" install `"$(Join-Path $AppDir 'kvm-ai-claude-hook.cmd')`""
+Write-Host "  npm run helper:hooks"
+Write-Host "(or directly: & `"$python`" `"$(Join-Path $ProjectDir 'helper\claude_hooks.py')`" install `"$(Join-Path $AppDir 'kvm-ai-claude-hook.cmd')`")"

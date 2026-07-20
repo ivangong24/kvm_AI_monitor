@@ -15,8 +15,8 @@ for arg in "$@"; do
   esac
 done
 
-if [[ -x "$PROJECT_DIR/mac-helper/uninstall-claude-hooks.sh" ]]; then
-  "$PROJECT_DIR/mac-helper/uninstall-claude-hooks.sh" || true
+if [[ -x "$PROJECT_DIR/helper/uninstall-claude-hooks.sh" ]]; then
+  "$PROJECT_DIR/helper/uninstall-claude-hooks.sh" || true
 fi
 
 UID_NUM=$(id -u)

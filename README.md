@@ -38,10 +38,14 @@ npx github:ivangong24/kvm_AI_monitor        # or: brew install ivangong24/kvm-ai
 ```
 
 The wizard discovers the Comet, signs in (only a revocable session token is kept, in your
-Keychain or Windows Credential Manager), installs the on-device agent, switches the touchscreen
-to Wallpaper Only, enrolls the machine it runs on as a push device (on macOS, with optional
-Claude Code hooks for exact working-state animation), and finishes with a health check. From a
-clone: `npm run setup`.
+Keychain, Windows Credential Manager, or Linux libsecret keyring), installs the on-device
+agent, switches the touchscreen to Wallpaper Only, enrolls the machine it runs on as a push
+device (macOS, Windows, or Linux, with optional Claude Code hooks for exact working-state
+animation), and finishes with a health check. From a clone: `npm run setup`.
+
+The management commands (`npm run helper:install`, `helper:status`, `helper:hooks`,
+`kvm:agent:install`, …) run on all three platforms — a Node dispatcher selects the right
+implementation and finds Git Bash / a runnable Python for you on Windows.
 
 Usage from every enrolled device is summed on the KVM: daily token totals add up across
 machines, while plan and percentage limits come from the most recent push (they describe the
@@ -54,19 +58,23 @@ device ID and one-time secret, then on that device run:
 
 ```bash
 # macOS
-./mac-helper/install-helper.sh --kvm <comet-ip> --device <device-id>
+./helper/install-helper.sh --kvm <comet-ip> --device <device-id>
 
 # Linux (systemd user session)
-./mac-helper/install-helper-linux.sh --kvm <comet-ip> --device <device-id>
+./helper/install-helper-linux.sh --kvm <comet-ip> --device <device-id>
 
 # Windows (PowerShell; finds python.org, uv, and py-launcher interpreters automatically)
-powershell -ExecutionPolicy Bypass -File mac-helper\install-helper.ps1 -Kvm <comet-ip> -Device <device-id>
+powershell -ExecutionPolicy Bypass -File helper\install-helper.ps1 -Kvm <comet-ip> -Device <device-id>
 ```
 
 Each installer schedules a per-minute usage push (LaunchAgent / systemd timer / Task
 Scheduler), stores the secret in the platform vault (Keychain / libsecret / Windows DPAPI),
 and prints the command that adds Claude Code activity hooks. Details:
-[`mac-helper/README.md`](mac-helper/README.md).
+[`helper/README.md`](helper/README.md).
+
+Each scheduler runs in the logged-in user's session, so pushes pause while that user is signed
+out (the desktop is not counted until the next sign-in); they resume automatically. On Windows,
+`npm run helper:status` reads the scheduled task's `LastTaskResult` (`0` = last push succeeded).
 
 Optionally, a device can instead be read over SSH ("Connected device" on the page): enable
 Remote Login, authorize the KVM's public key, and enter the username. SSH devices provide
@@ -113,17 +121,20 @@ limits stays in memory on the device that owns it. Inspect exactly what would be
 
 ```bash
 npm run kvm:agent:uninstall    # remove the KVM extension (config preserved on the KVM)
-npm run helper:uninstall       # remove this Mac's helper (--purge also removes secrets)
+npm run helper:uninstall       # remove this device's helper (--purge also removes secrets)
 ```
 
 ## Development
 
 ```bash
-npm test                          # Node: Comet client, CLI, cross-language HMAC vector
-python3 mac-helper/test_helper.py # helper unit tests (also run on Linux/Windows in CI)
+npm test                          # Node: Comet client, CLI, HMAC vector, PowerShell config merge
+npm run helper:test               # helper unit tests (also run on Linux/Windows in CI)
 python3 kvm-agent/test_push_receiver.py
 python3 kvm-agent/test_ssh_collector.py
 ```
+
+The Node suite's PowerShell config-merge tests run against `powershell.exe` on Windows and
+`pwsh` elsewhere when present; they skip with a reason when no PowerShell is installed.
 
 CI runs the suite on macOS, Ubuntu, and Windows. Design history and device internals are in
 [`docs/PROJECT_CHECKPOINT_2026-07-18.md`](docs/PROJECT_CHECKPOINT_2026-07-18.md); future

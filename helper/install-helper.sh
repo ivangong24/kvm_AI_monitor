@@ -78,8 +78,8 @@ fi
 
 mkdir -p "$APP_SUPPORT"
 chmod 755 "$APP_SUPPORT"
-cp "$PROJECT_DIR/mac-helper/kvm_ai_push.py" "$APP_SUPPORT/kvm_ai_push.py"
-cp "$PROJECT_DIR/mac-helper/kvm-ai-claude-hook.sh" "$APP_SUPPORT/kvm-ai-claude-hook.sh"
+cp "$PROJECT_DIR/helper/kvm_ai_push.py" "$APP_SUPPORT/kvm_ai_push.py"
+cp "$PROJECT_DIR/helper/kvm-ai-claude-hook.sh" "$APP_SUPPORT/kvm-ai-claude-hook.sh"
 chmod 644 "$APP_SUPPORT/kvm_ai_push.py"
 chmod 755 "$APP_SUPPORT/kvm-ai-claude-hook.sh"
 

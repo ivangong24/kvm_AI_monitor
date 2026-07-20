@@ -13,15 +13,15 @@
   "scripts": {
     "setup": "node bin/kvm-ai-monitor.mjs setup",
     "test": "node --test",
-    "kvm:configure": "./scripts/configure-kvm.sh",
-    "kvm:agent:install": "./scripts/install-kvm-agent.sh",
-    "kvm:agent:uninstall": "./scripts/uninstall-kvm-agent.sh",
-    "helper:install": "./mac-helper/install-helper.sh",
-    "helper:uninstall": "./mac-helper/uninstall-helper.sh",
-    "helper:install:win": "powershell -NoProfile -ExecutionPolicy Bypass -File mac-helper/install-helper.ps1",
-    "helper:uninstall:win": "powershell -NoProfile -ExecutionPolicy Bypass -File mac-helper/uninstall-helper.ps1",
-    "helper:status": "./mac-helper/helper-status.sh",
-    "helper:hooks": "./mac-helper/install-claude-hooks.sh",
-    "helper:test": "python3 mac-helper/test_helper.py"
+    "kvm:configure": "node scripts/run-script.mjs kvm:configure",
+    "kvm:agent:install": "node scripts/run-script.mjs kvm:agent:install",
+    "kvm:agent:uninstall": "node scripts/run-script.mjs kvm:agent:uninstall",
+    "helper:install": "node scripts/run-script.mjs helper:install",
+    "helper:uninstall": "node scripts/run-script.mjs helper:uninstall",
+    "helper:install:win": "node scripts/run-script.mjs helper:install",
+    "helper:uninstall:win": "node scripts/run-script.mjs helper:uninstall",
+    "helper:status": "node scripts/run-script.mjs helper:status",
+    "helper:hooks": "node scripts/run-script.mjs helper:hooks",
+    "helper:test": "node scripts/run-script.mjs helper:test"
   }
 }

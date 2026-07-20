@@ -32,8 +32,8 @@ elif [ -z "$KVM_HOST" ] || [ -z "$DEVICE_ID" ]; then
 fi
 
 mkdir -p "$DATA_DIR"
-cp "$PROJECT_DIR/mac-helper/kvm_ai_push.py" "$DATA_DIR/kvm_ai_push.py"
-cp "$PROJECT_DIR/mac-helper/kvm-ai-claude-hook.sh" "$DATA_DIR/kvm-ai-claude-hook.sh"
+cp "$PROJECT_DIR/helper/kvm_ai_push.py" "$DATA_DIR/kvm_ai_push.py"
+cp "$PROJECT_DIR/helper/kvm-ai-claude-hook.sh" "$DATA_DIR/kvm-ai-claude-hook.sh"
 chmod 644 "$DATA_DIR/kvm_ai_push.py"
 chmod 755 "$DATA_DIR/kvm-ai-claude-hook.sh"
 
@@ -115,4 +115,5 @@ fi
 
 echo
 echo "To also send exact working/idle events from Claude Code on this device, run:"
-echo "  python3 $PROJECT_DIR/mac-helper/claude_hooks.py install \"$DATA_DIR/kvm-ai-claude-hook.sh\""
+echo "  npm run helper:hooks"
+echo "(or directly: python3 $PROJECT_DIR/helper/claude_hooks.py install \"$DATA_DIR/kvm-ai-claude-hook.sh\")"
