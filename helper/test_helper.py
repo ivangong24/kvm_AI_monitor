@@ -188,7 +188,7 @@ class PayloadNonDisclosureTests(HomeIsolatedTestCase):
     @mock.patch("kvm_ai_push.account_limits", return_value=[])
     @mock.patch("kvm_ai_push.claude_auth_status", return_value=(True, "Max"))
     def test_payload_has_only_whitelisted_fields_and_no_planted_secrets(self, _auth, _limits):
-        payload = helper.build_usage_payload()
+        payload = helper.claude_usage_payload()
         encoded = json.dumps(payload)
 
         self.assertNotIn(PLANTED_TOKEN, encoded)
@@ -213,7 +213,7 @@ class PayloadNonDisclosureTests(HomeIsolatedTestCase):
     @mock.patch("kvm_ai_push.account_limits", return_value=[])
     @mock.patch("kvm_ai_push.claude_auth_status", return_value=(None, None))
     def test_optional_fields_are_omitted_when_unavailable(self, _auth, _limits):
-        payload = helper.build_usage_payload()
+        payload = helper.claude_usage_payload()
         self.assertNotIn("loggedIn", payload)
         self.assertNotIn("plan", payload)
         self.assertNotIn("limits", payload)
@@ -340,13 +340,32 @@ class MultiTargetTests(HomeIsolatedTestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn("kvm-a", errors[0])
 
-    @mock.patch("kvm_ai_push.build_usage_payload", return_value={"schemaVersion": 1})
     @mock.patch("kvm_ai_push.post", side_effect=RuntimeError("down"))
     @mock.patch("kvm_ai_push.load_secret", return_value="s")
-    def test_send_usage_exits_only_when_all_targets_fail(self, _secret, _post, _payload):
+    def test_send_usage_exits_only_when_all_targets_fail(self, _secret, _post):
         self._write_config({"targets": [{"kvmHost": "kvm-a", "deviceId": "d-1"}]})
-        with self.assertRaises(SystemExit):
+        # One provider with data, and every target fails to receive it -> exit non-zero.
+        with mock.patch.dict(
+            "kvm_ai_push.USAGE_COLLECTORS",
+            {"claude": lambda: {"schemaVersion": 1, "provider": "claude"}}, clear=True,
+        ):
+            with self.assertRaises(SystemExit):
+                helper.cmd_send_usage(mock.Mock())
+
+    @mock.patch("kvm_ai_push.post")
+    @mock.patch("kvm_ai_push.load_secret", return_value="s")
+    def test_send_usage_pushes_every_provider_with_data(self, _secret, post):
+        self._write_config({"targets": [{"kvmHost": "kvm-a", "deviceId": "d-1"}]})
+        with mock.patch.dict(
+            "kvm_ai_push.USAGE_COLLECTORS",
+            {"claude": lambda: {"schemaVersion": 1, "provider": "claude"},
+             "codex": lambda: {"schemaVersion": 1, "provider": "codex"},
+             "absent": lambda: None},
+            clear=True,
+        ):
             helper.cmd_send_usage(mock.Mock())
+        pushed = [call.args[2]["provider"] for call in post.call_args_list]
+        self.assertEqual(sorted(pushed), ["claude", "codex"])
 
 
 class SecretBackendTests(HomeIsolatedTestCase):
