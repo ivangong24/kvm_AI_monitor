@@ -558,7 +558,11 @@ def cmd_print_payload(_args):
 
 
 def cmd_store_secret(args):
-    secret = sys.stdin.readline().strip()
+    # Read bytes, not text: PowerShell prefixes a UTF-8 BOM when it pipes into a native
+    # process, and the locale-dependent text decoding of stdin turns that into mojibake or
+    # lone surrogates that later fail to re-encode.
+    raw = sys.stdin.buffer.readline()
+    secret = raw.decode("utf-8-sig", errors="replace").strip()
     if not secret:
         print("kvm-ai-monitor: no secret on stdin", file=sys.stderr)
         sys.exit(1)

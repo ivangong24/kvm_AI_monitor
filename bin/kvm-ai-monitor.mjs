@@ -8,7 +8,6 @@
 // shipped, so the wizard and the manual path cannot drift apart.
 
 import { spawnSync } from "node:child_process";
-import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync, mkdirSync, existsSync, chmodSync } from "node:fs";
 import { homedir, hostname, networkInterfaces } from "node:os";
 import { join, dirname } from "node:path";
@@ -16,6 +15,7 @@ import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 import https from "node:https";
 import { CometClient } from "../src/comet-client.js";
+import { getSecret, setSecret, secretStoreName } from "../src/secret-store.js";
 
 const PROJECT_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
 const CONFIG_DIR = join(homedir(), ".kvm-ai-monitor");
@@ -83,16 +83,11 @@ function rememberKvm(host) {
   chmodSync(pointer, 0o600);
 }
 
-function keychain(args) {
-  return execFileSync("/usr/bin/security", args, {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "ignore"],
-  }).trim();
-}
+const tokenService = (host) => `kvm-ai-monitor-token:${host}`;
 
 function hasToken(host) {
   try {
-    keychain(["find-generic-password", "-a", "admin", "-s", `kvm-ai-monitor-token:${host}`, "-w"]);
+    getSecret(tokenService(host));
     return true;
   } catch {
     return false;
@@ -167,6 +162,36 @@ function webterm(host, command, { timeoutMs = 120_000 } = {}) {
   return { status: result.status ?? 1, output: body.trim(), stderr: `${result.stderr ?? ""}`.trim() };
 }
 
+// The install scripts are portable POSIX, but Windows has no `sh` on PATH. Git for Windows
+// ships one (along with tar/base64/mktemp), so locate it rather than requiring WSL — the
+// `bash.exe` in system32 is the WSL stub and fails outright when no distro is installed.
+function posixShell() {
+  if (process.env.KVM_SH) return process.env.KVM_SH;
+  if (process.platform !== "win32") return "sh";
+
+  const candidates = [];
+  const where = spawnSync("where.exe", ["git"], { encoding: "utf8" });
+  for (const line of `${where.stdout ?? ""}`.split(/\r?\n/)) {
+    const gitExe = line.trim();
+    // ...\Git\cmd\git.exe -> ...\Git\bin\bash.exe
+    // Prefer bin\bash.exe over usr\bin\sh.exe: only the former sets up the MSYS PATH, so
+    // sh.exe cannot find tar/base64/mktemp when launched straight from Windows.
+    if (gitExe.toLowerCase().endsWith("git.exe")) {
+      candidates.push(join(dirname(dirname(gitExe)), "bin", "bash.exe"));
+    }
+  }
+  for (const root of [process.env.ProgramFiles, process.env["ProgramFiles(x86)"], "C:\\Program Files"]) {
+    if (root) candidates.push(join(root, "Git", "bin", "bash.exe"));
+  }
+
+  const found = candidates.find((candidate) => existsSync(candidate));
+  if (found) return found;
+  throw new Error(
+    "This step needs a POSIX shell. Install Git for Windows (https://git-scm.com/download/win), " +
+    "or point KVM_SH at an sh.exe.",
+  );
+}
+
 function runScript(script, { args = [], env = {}, input } = {}) {
   const result = spawnSync(script, args, {
     cwd: PROJECT_DIR,
@@ -211,21 +236,32 @@ async function authorize(host) {
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     const password = await ask("Admin password: ", { hidden: true });
     const totp = await ask("6-digit 2FA code (press Enter if 2FA is off): ");
+    let token;
     try {
       const client = new CometClient({ host, password });
-      const result = await client.login(totp);
-      keychain(["add-generic-password", "-a", "admin", "-s", `kvm-ai-monitor-token:${host}`, "-w", result.token, "-U"]);
-      ok("Authorized; session token saved to your Keychain");
-      return;
+      token = (await client.login(totp)).token;
     } catch (error) {
       fail(`Sign-in failed: ${error.message}`);
       if (attempt === 3) throw new Error("Could not sign in to the Comet.");
+      continue;
     }
+    // Storing the token is a separate failure mode from signing in. Retrying with a different
+    // password cannot fix a broken secret store, so report it plainly and stop.
+    try {
+      setSecret(tokenService(host), token);
+    } catch (error) {
+      throw new Error(
+        `Signed in successfully, but could not save the session token to your ` +
+        `${secretStoreName()}: ${error.message}`,
+      );
+    }
+    ok(`Authorized; session token saved to your ${secretStoreName()}`);
+    return;
   }
 }
 
 function installAgent(host) {
-  const result = runScript("sh", { args: [join(PROJECT_DIR, "scripts", "install-kvm-agent.sh")], env: { KVM_IP: host } });
+  const result = runScript(posixShell(), { args: [join(PROJECT_DIR, "scripts", "install-kvm-agent.sh")], env: { KVM_IP: host } });
   if (result.status !== 0) {
     throw new Error(`Agent install failed: ${result.stderr.split("\n").filter(Boolean).at(-1) ?? "unknown error"}`);
   }
@@ -272,31 +308,74 @@ function readHelperTargets() {
   return [];
 }
 
-async function enrollThisMac(host) {
+// kvm_ai_push.py is already cross-platform (DPAPI secrets, ~/.claude/.credentials.json on
+// Windows); only the scheduling differs, so each platform gets its own thin installer:
+// launchd via mac-helper/install-helper.sh, Task Scheduler via windows-helper/install-helper.ps1.
+const HELPER_UNSUPPORTED =
+  `Enrolling this computer as a push device is supported on macOS and Windows only, so this ` +
+  `machine's own AI usage will not appear on the KVM. The KVM agent and wallpaper still work, ` +
+  `and any enrolled device keeps pushing.`;
+
+function helperSupported() {
+  return process.platform === "darwin" || process.platform === "win32";
+}
+
+// Runs the platform's helper installer with the same argument shape on both.
+function runHelperInstaller({ update = false, host, deviceId, secret } = {}) {
+  const args = update
+    ? (process.platform === "win32" ? ["-Update"] : ["--update"])
+    : process.platform === "win32"
+      ? ["-Kvm", host, "-Device", deviceId, "-SecretStdin"]
+      : ["--kvm", host, "--device", deviceId, "--secret-stdin"];
+  const input = update ? "" : secret + "\n";
+
+  if (process.platform === "win32") {
+    return runScript("powershell.exe", {
+      args: [
+        "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        "-File", join(PROJECT_DIR, "mac-helper", "install-helper.ps1"),
+        ...args,
+      ],
+      input,
+    });
+  }
+  return runScript(join(PROJECT_DIR, "mac-helper", "install-helper.sh"), { args, input });
+}
+
+async function enrollThisDevice(host) {
+  if (!helperSupported()) throw new Error(HELPER_UNSUPPORTED);
+  const label = process.platform === "win32" ? "PC" : "Mac";
   if (readHelperTargets().some((target) => target?.kvmHost === host)) {
-    const update = runScript(join(PROJECT_DIR, "mac-helper", "install-helper.sh"), { args: ["--update"], input: "" });
-    if (update.status === 0) {
-      ok("This Mac is already enrolled; helper refreshed");
+    if (runHelperInstaller({ update: true }).status === 0) {
+      ok(`This ${label} is already enrolled; helper refreshed`);
       return;
     }
   }
-  const name = hostname().replace(/\.local$/i, "").slice(0, 48) || "Mac";
+  const name = hostname().replace(/\.local$/i, "").slice(0, 48) || label;
   const create = webterm(
     host,
     `curl -s -X POST http://127.0.0.1:8199/api/devices -H 'Content-Type: application/json' -d '${JSON.stringify({ name }).replaceAll("'", "'\\''")}'`,
   );
   const match = create.output.match(/\{"id":\s*"(d-[0-9a-f]{8})",\s*"name":.*?"secret":\s*"([0-9a-f]{48})"\}/);
-  if (!match) throw new Error(`Device enrollment failed: ${create.output.slice(0, 200)}`);
-  const [, deviceId, secret] = match;
-  const install = runScript(join(PROJECT_DIR, "mac-helper", "install-helper.sh"), {
-    args: ["--kvm", host, "--device", deviceId, "--secret-stdin"],
-    input: secret + "\n",
-  });
-  if (install.status !== 0) {
-    throw new Error(`Helper install failed: ${install.stderr.split("\n").filter(Boolean).at(-1) ?? "unknown"}`);
+  if (!match) {
+    // A failed command channel leaves output empty, so fall back to stderr rather than
+    // reporting a blank reason.
+    const reason = create.output.trim() || create.stderr.trim() || "no response from the KVM";
+    throw new Error(`Device enrollment failed: ${reason.slice(0, 200)}`);
   }
-  ok(`This Mac enrolled as "${name}" (${deviceId}); usage now pushes every minute`);
-  if (await confirm("Also send exact working/idle events from Claude Code on this Mac?")) {
+  const [, deviceId, secret] = match;
+  const install = runHelperInstaller({ host, deviceId, secret });
+  if (install.status !== 0) {
+    const detail = [install.stderr, install.stdout]
+      .flatMap((stream) => stream.split("\n"))
+      .filter(Boolean)
+      .at(-1) ?? "unknown";
+    throw new Error(`Helper install failed: ${detail}`);
+  }
+  ok(`This ${label} enrolled as "${name}" (${deviceId}); usage now pushes every minute`);
+  // The Claude Code hook installer is still a shell script, so it stays macOS-only for now.
+  if (process.platform === "darwin"
+      && await confirm("Also send exact working/idle events from Claude Code on this Mac?")) {
     const hooks = runScript(join(PROJECT_DIR, "mac-helper", "install-claude-hooks.sh"), { input: "" });
     if (hooks.status === 0) ok("Claude Code hooks installed");
     else info("Hook install failed; run later with: npm run helper:hooks");
@@ -327,8 +406,12 @@ async function cmdSetup(kvmArg) {
   rememberKvm(host);
   installAgent(host);
   enableWallpaperMode(host);
-  if (await confirm("Enroll this Mac so its Claude usage shows on the KVM?")) {
-    await enrollThisMac(host);
+  if (!helperSupported()) {
+    info(HELPER_UNSUPPORTED);
+  } else if (await confirm(
+    `Enroll this ${process.platform === "win32" ? "PC" : "Mac"} so its Claude usage shows on the KVM?`,
+  )) {
+    await enrollThisDevice(host);
   }
   healthCheck(host);
 }
@@ -344,7 +427,10 @@ function cmdStatus() {
   const kvms = readRegistry();
   console.log(`Configured KVMs: ${kvms.length ? kvms.join(", ") : "none (run: kvm-ai-monitor setup)"}`);
   const targets = readHelperTargets();
-  console.log(`This Mac pushes to: ${targets.length ? targets.map((t) => `${t.kvmHost} (${t.deviceId})`).join(", ") : "not enrolled"}`);
+  const enrollment = targets.length
+    ? targets.map((t) => `${t.kvmHost} (${t.deviceId})`).join(", ")
+    : helperSupported() ? "not enrolled" : "not enrolled (push helper is macOS/Windows only)";
+  console.log(`This computer pushes to: ${enrollment}`);
   for (const host of kvms) {
     console.log(`Admin session for ${host}: ${hasToken(host) ? "saved" : "missing (rerun setup)"}`);
   }
@@ -380,7 +466,7 @@ async function main() {
     case "enroll": {
       const host = kvmArg ?? readRegistry().at(-1);
       if (!host) throw new Error("No KVM configured. Run: kvm-ai-monitor setup");
-      await enrollThisMac(host);
+      await enrollThisDevice(host);
       break;
     }
     case "version": console.log(VERSION); break;

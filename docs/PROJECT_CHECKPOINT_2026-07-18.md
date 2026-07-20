@@ -4,7 +4,7 @@ This document is the chronological design and status record for KVM AI Monitor. 
 contains no account email, organization ID, password, session token, OAuth token, cookie, private
 key, prompt, response, project name, or local network address.
 
-> **Status:** as of the final update at the end of this document, there is no unresolved work.
+> **Status:** see the final update at the end of this document for the current open-issue list.
 > Earlier sections (including "Unresolved requirements") describe the state at the moment they
 > were written and are kept as history.
 
@@ -293,3 +293,109 @@ retries. A reboot cleared the stuck threads; three safeguards now prevent recurr
 
 A device reboot invalidates the saved Comet web session token; rerun `npm run kvm:configure`
 before the next `npm run kvm:agent:install`.
+
+---
+
+## Update - 2026-07-19: Windows as a setup machine, and the push helper actually running there
+
+Until now the setup wizard assumed macOS. Running it on Windows failed at sign-in with
+`spawnSync /usr/bin/security ENOENT`: the Comet login had already succeeded and the crash came
+from the next statement, which stored the session token in the macOS Keychain. Because one
+`try` wrapped both steps, a storage failure was reported as `Sign-in failed`, which reads as a
+wrong password.
+
+### Setup machine portability
+
+- **`src/secret-store.js`** (new): platform-dispatching store for the Comet session token.
+  macOS keeps using `/usr/bin/security`; Windows uses Credential Manager through `CredRead` /
+  `CredWrite` / `CredDelete`, P/Invoked from a short PowerShell shim, so no dependency is added.
+  Secrets are passed through the environment rather than argv and never appear in the process
+  list. `bin/kvm-ai-monitor.mjs`, `scripts/kvm-webterm-command.mjs`, and `scripts/authorize-kvm.js`
+  all route through it.
+- **Sign-in and storage are now distinct failures.** A broken secret store reports that it signed
+  in successfully but could not save, and stops instead of re-prompting for a password that was
+  already correct.
+- **POSIX shell resolution**: the agent installer is portable POSIX but Windows has no `sh` on
+  PATH. `posixShell()` locates Git for Windows' `bin\bash.exe`, overridable with `KVM_SH`.
+  `usr\bin\sh.exe` is deliberately *not* used: only the `bin\bash.exe` wrapper sets up the MSYS
+  PATH, so `sh.exe` cannot find `tar`, `base64`, or `mktemp`. The `bash.exe` in `system32` is the
+  WSL stub and fails outright with no distro installed.
+- **`scripts/install-kvm-agent.sh`** invokes the web-terminal helper via `node` explicitly; the
+  executable bit is not preserved on Windows checkouts.
+
+### Windows push helper
+
+`mac-helper/kvm_ai_push.py` was already cross-platform (DPAPI secret backend,
+`~/.claude/.credentials.json`), and `mac-helper/install-helper.ps1` already existed. The installer
+had never worked, for three separate reasons, all fixed:
+
+1. `Get-Command python` resolved the Microsoft Store alias stubs, which exist on disk but exit
+   9009 without running. `Find-Python` now probes candidates and keeps the first that actually
+   executes, skipping anything under `WindowsApps`, and finds uv-managed interpreters (never on
+   PATH) sorted by parsed version rather than by name — a string sort ranks `cpython-3.9` above
+   `cpython-3.14`. `KVM_PYTHON` overrides.
+2. `$Secret | & $python` corrupted the secret: a PowerShell pipe into a native process prefixes a
+   UTF-8 BOM regardless of `$OutputEncoding`. The secret is now written as bytes to the raw stdin
+   stream via .NET. `ArgumentList` and `StandardInputEncoding` are .NET Core APIs absent from
+   Windows PowerShell 5.1, so arguments are quoted manually. `cmd_store_secret` also reads
+   `stdin.buffer` and decodes `utf-8-sig` as defence in depth.
+3. The `helper.json` merge ran from a generated `.py` file written with `Set-Content`, which
+   defaults to UTF-16 in PowerShell 5.1 — unparseable as Python source. The merge is now done in
+   PowerShell and written BOM-less, since both `json.load` and `JSON.parse` reject a leading BOM.
+
+Scheduling required two further corrections:
+
+- `Register-ScheduledTask` needs elevation (`0x80070005`) even for a task that only runs as the
+  current user. `schtasks.exe` does not, and is used for both install and uninstall.
+- **A `LogonTrigger` alone never fires for a task installed during an existing session.** The
+  first working version registered one and the task sat with an empty `NextRunTime` and
+  `SCHED_S_TASK_HAS_NOT_RUN` — the only data reaching the KVM was the installer's one-shot push.
+  The task now also carries a `TimeTrigger` with a start boundary in the past, so repetition
+  begins immediately; the logon trigger re-arms it after a reboot.
+
+The task is registered from XML rather than `schtasks /TR "..."` so the command and its arguments
+stay separate elements and paths containing spaces need no shell quoting; a `<Repetition>` with no
+`<Duration>` means indefinite. `mac-helper/uninstall-helper.ps1` is new. The installed
+`kvm-ai-claude-hook.cmd` gets the resolved `pythonw.exe` baked in, because it invoked a bare
+`pythonw` and swallows all output with `exit /b 0`, so that failure was silent.
+
+`test/helper-signing.test.js` uses the same interpreter probing and skips with a reason when no
+usable Python exists, instead of failing on the Store stub's exit 9009.
+
+### Cross-device aggregation
+
+No change was needed: `push_receiver.usage_overlay()` already sums daily token categories across
+every enrolled device. Plan and percentage limits are taken from the most recent push rather than
+summed, because they describe the Anthropic account, not the device.
+
+### Verified
+
+Node suite 5/5 passing, including the cross-language HMAC vector now genuinely executing on
+Windows. Verified on a Windows setup machine: credential round-trip through Credential Manager
+(including non-ASCII), Git Bash resolution and the agent installer running `tar`/`base64`/`mktemp`
+under `set -eu`, DPAPI secret round-trip with the on-disk blob confirmed encrypted, `helper.json`
+parsing in both Python and Node, scheduled-task registration unelevated, a live signed push
+accepted by the deployed KVM, and `-Purge` uninstall leaving no residue. The recurring task was
+confirmed firing on a one-minute interval with `LastTaskResult = 0`.
+
+### Open issues
+
+- **Most npm scripts remain Unix-only on Windows.** `kvm:configure`, `kvm:agent:install`,
+  `kvm:agent:uninstall`, `helper:install`, `helper:uninstall`, `helper:status`, and `helper:hooks`
+  are shell scripts, and `helper:test` calls `python3`, which is the Store stub. Only `setup`,
+  `test`, and the two `:win` scripts work. The wizard covers the important paths, so this bites
+  only when reaching for a script directly.
+- **No Windows equivalent of `helper:status`.** Health must be read from
+  `Get-ScheduledTaskInfo -TaskName kvm-ai-monitor-helper` (`LastTaskResult = 0` means the last
+  push succeeded).
+- **Claude Code hooks are not offered by the wizard on Windows**; the installer prints the command
+  instead. `claude_hooks.py install` has not been exercised on Windows. Hooks affect only the
+  working/idle animation, not usage totals.
+- **Pushes pause while logged out.** The task runs with `InteractiveToken`, mirroring the macOS
+  GUI LaunchAgent, so a signed-out desktop reports nothing.
+- **The multi-KVM merge in `helper.json` is untested on Windows**; only a single target was
+  exercised.
+- **Linux is still unsupported as a *setup* machine.** `secret-store.js` raises a clear error
+  naming `KVM_TOKEN` as the escape hatch. Linux *monitored* devices are unaffected.
+- **`mac-helper/` now holds the Windows and Linux installers**, so the directory name is
+  misleading.

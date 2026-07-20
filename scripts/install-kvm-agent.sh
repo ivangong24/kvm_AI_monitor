@@ -18,8 +18,8 @@ PAYLOAD=$(base64 < "$ARCHIVE" | tr -d '\n')
     printf '%s\n' "python3 -m py_compile /tmp/kvm-ai-usage-install/kvm-agent/agent.py /tmp/kvm-ai-usage-install/kvm-agent/ssh_collector.py /tmp/kvm-ai-usage-install/kvm-agent/push_receiver.py"
     printf '%s\n' "/tmp/kvm-ai-usage-install/kvm-agent/install-on-device.sh"
     printf '%s\n' "rm -rf /tmp/kvm-ai-usage-install /tmp/kvm-ai-usage.tar.gz"
-} | "$PROJECT_DIR/scripts/kvm-webterm-command.mjs" --stdin
+} | node "$PROJECT_DIR/scripts/kvm-webterm-command.mjs" --stdin
 
 sleep 7
-"$PROJECT_DIR/scripts/kvm-webterm-command.mjs" \
+node "$PROJECT_DIR/scripts/kvm-webterm-command.mjs" \
     "curl -fsS http://127.0.0.1:8199/api/status"

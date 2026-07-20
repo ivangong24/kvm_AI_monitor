@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { connect } from "node:tls";
+import { getSecret, secretStoreName } from "../src/secret-store.js";
 
 function configuredHost() {
   if (process.env.KVM_IP) return process.env.KVM_IP;
@@ -18,11 +18,24 @@ function configuredHost() {
 }
 
 const host = configuredHost();
-const token = process.env.KVM_TOKEN ?? execFileSync(
-  "/usr/bin/security",
-  ["find-generic-password", "-a", "admin", "-s", `kvm-ai-monitor-token:${host}`, "-w"],
-  { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
-).trim();
+function savedToken() {
+  if (process.env.KVM_TOKEN) return process.env.KVM_TOKEN;
+  try {
+    return getSecret(`kvm-ai-monitor-token:${host}`);
+  } catch {
+    throw new Error(
+      `No saved session for ${host} in your ${secretStoreName()}. Run: kvm-ai-monitor setup`,
+    );
+  }
+}
+
+let token;
+try {
+  token = savedToken();
+} catch (error) {
+  console.error(error.message);
+  process.exit(1);
+}
 const command = process.argv[2] === "--stdin"
   ? readFileSync(0, "utf8")
   : process.argv.slice(2).join(" ");

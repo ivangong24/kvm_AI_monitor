@@ -20,22 +20,32 @@ animated working indicator whenever an agent is actively processing on any enrol
 ## Prerequisites
 
 - A GL.iNet Comet Pro with its admin password (2FA supported), reachable on your LAN.
-- A macOS machine with Node.js 22+ to run the setup wizard (Linux/Windows *monitored* devices
-  are supported; the setup machine itself is macOS-only for now).
+- A macOS or Windows machine with Node.js 22+ to run the setup wizard. On Windows you also need
+  [Git for Windows](https://git-scm.com/download/win) (the agent installer needs its bundled
+  `bash`/`tar`/`base64`), and the session token is stored in Windows Credential Manager instead
+  of the Keychain.
+- Python 3 on the setup machine if you enroll it as a push device. `python`/`python3` on Windows
+  are usually Microsoft Store stubs that do not run; a `uv python install` interpreter is found
+  automatically, or set `KVM_PYTHON` to a `python.exe`.
 - On each monitored device: Python 3 and Claude Code signed in (`claude` CLI) for Claude data.
 
 ## Install
 
-One command on a Mac on the same network:
+One command on a Mac or Windows PC on the same network:
 
 ```bash
 npx github:ivangong24/kvm_AI_monitor        # or: brew install ivangong24/kvm-ai-monitor/kvm-ai-monitor && kvm-ai-monitor
 ```
 
 The wizard discovers the Comet, signs in (only a revocable session token is kept, in your
-Keychain), installs the on-device agent, switches the touchscreen to Wallpaper Only, enrolls
-the Mac it runs on as a push device (with optional Claude Code hooks for exact working-state
-animation), and finishes with a health check. From a clone: `npm run setup`.
+Keychain or Windows Credential Manager), installs the on-device agent, switches the touchscreen
+to Wallpaper Only, enrolls the machine it runs on as a push device (on macOS, with optional
+Claude Code hooks for exact working-state animation), and finishes with a health check. From a
+clone: `npm run setup`.
+
+Usage from every enrolled device is summed on the KVM: daily token totals add up across
+machines, while plan and percentage limits come from the most recent push (they describe the
+Anthropic account, not the device, so they are not additive).
 
 ### Enrolling more devices
 
@@ -49,7 +59,7 @@ device ID and one-time secret, then on that device run:
 # Linux (systemd user session)
 ./mac-helper/install-helper-linux.sh --kvm <comet-ip> --device <device-id>
 
-# Windows (PowerShell, Python 3 on PATH)
+# Windows (PowerShell; finds python.org, uv, and py-launcher interpreters automatically)
 powershell -ExecutionPolicy Bypass -File mac-helper\install-helper.ps1 -Kvm <comet-ip> -Device <device-id>
 ```
 

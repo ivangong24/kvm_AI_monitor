@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { CometClient } from "../src/comet-client.js";
+import { getSecret, setSecret, deleteSecret, secretStoreName } from "../src/secret-store.js";
 
 function configuredHost() {
   if (process.env.KVM_IP) return process.env.KVM_IP;
@@ -18,34 +18,21 @@ function configuredHost() {
 
 function keychainSecret(service) {
   try {
-    return execFileSync(
-      "/usr/bin/security",
-      ["find-generic-password", "-a", "admin", "-s", service, "-w"],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
-    ).trim();
+    return getSecret(service);
   } catch {
-    throw new Error("No KVM password was found in Keychain. Run: npm run kvm:configure");
+    throw new Error(
+      `No KVM password was found in your ${secretStoreName()}. Run: npm run kvm:configure`,
+    );
   }
 }
 
 function saveToken(service, token) {
-  execFileSync(
-    "/usr/bin/security",
-    ["add-generic-password", "-a", "admin", "-s", service, "-w", token, "-U"],
-    { stdio: "ignore" },
-  );
+  setSecret(service, token);
 }
 
 function deleteKeychainSecret(service) {
-  try {
-    execFileSync(
-      "/usr/bin/security",
-      ["delete-generic-password", "-a", "admin", "-s", service],
-      { stdio: "ignore" },
-    );
-  } catch {
-    // The password may have been supplied only through KVM_PASSWORD.
-  }
+  // The password may have been supplied only through KVM_PASSWORD; a missing entry is fine.
+  deleteSecret(service);
 }
 
 async function main() {

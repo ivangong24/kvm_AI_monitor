@@ -18,6 +18,8 @@
     "kvm:agent:uninstall": "./scripts/uninstall-kvm-agent.sh",
     "helper:install": "./mac-helper/install-helper.sh",
     "helper:uninstall": "./mac-helper/uninstall-helper.sh",
+    "helper:install:win": "powershell -NoProfile -ExecutionPolicy Bypass -File mac-helper/install-helper.ps1",
+    "helper:uninstall:win": "powershell -NoProfile -ExecutionPolicy Bypass -File mac-helper/uninstall-helper.ps1",
     "helper:status": "./mac-helper/helper-status.sh",
     "helper:hooks": "./mac-helper/install-claude-hooks.sh",
     "helper:test": "python3 mac-helper/test_helper.py"
