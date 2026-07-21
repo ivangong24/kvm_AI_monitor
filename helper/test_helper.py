@@ -561,8 +561,9 @@ class CometHealthCacheTests(HomeIsolatedTestCase):
 
     def test_cache_file_is_owner_only(self):
         helper.write_comet_health("host", self.RESPONSE)
-        mode = helper.comet_health_cache_path().stat().st_mode & 0o777
-        self.assertEqual(mode, 0o600)
+        if os.name == "posix":
+            mode = helper.comet_health_cache_path().stat().st_mode & 0o777
+            self.assertEqual(mode, 0o600)
 
     def test_stale_health_is_not_served(self):
         path = helper.comet_health_cache_path()
