@@ -1,9 +1,9 @@
 # Device helper (macOS, Linux, Windows)
 
 Implements the outbound-only side of `docs/PUSH_PROTOCOL.md`: a scheduled per-user task that
-reduces Claude usage to the whitelisted aggregate schema, HMAC-signs it, and pushes it to the
-KVM. Nothing here opens a listening port. The same stdlib-only Python helper runs on all three
-platforms; only the scheduler and secret vault differ.
+reduces supported AI-provider usage to the whitelisted aggregate schema, HMAC-signs it, and
+pushes it to the KVM. Nothing here opens a listening port. The same stdlib-only Python helper
+runs on all three platforms; only the scheduler and secret vault differ.
 
 | | macOS | Linux | Windows |
 |---|---|---|---|
@@ -26,7 +26,7 @@ Linux/Windows enrollment, with the device ID + one-time secret from the AI Usage
 # Linux (python3 + systemd user session)
 ./helper/install-helper-linux.sh --kvm <kvm-ip> --device <device-id>
 
-# Windows (Python 3 on PATH, from PowerShell)
+# Windows (finds python.org, uv, and py-launcher interpreters, from PowerShell)
 powershell -ExecutionPolicy Bypass -File helper\install-helper.ps1 -Kvm <kvm-ip> -Device <device-id>
 ```
 

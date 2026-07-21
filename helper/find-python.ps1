@@ -2,7 +2,8 @@
 #
 # `python`/`python3` on PATH are usually the Microsoft Store alias stubs: they exist, so a
 # plain Get-Command finds them, but they exit 9009 without running anything. Probe candidates
-# and keep the first that actually executes. uv-managed interpreters are never on PATH.
+# and keep the first that actually executes. uv-managed interpreters and python.org installs
+# made without "Add python.exe to PATH" are found in their default install directories.
 # KVM_PYTHON overrides. (src/platform.js mirrors this logic for the Node entry points.)
 function Find-Python {
     param([switch]$Windowed)
@@ -31,6 +32,32 @@ function Find-Python {
             Sort-Object Version -Descending |
             ForEach-Object { Join-Path $_.Path $exe }
     }
+
+    # The python.org installer defaults to a per-user directory when installed just for the
+    # current user, and to Program Files for an all-users install. Neither location is found by
+    # Get-Command when the installer's optional PATH checkbox was left unchecked.
+    $pythonOrgRoots = @()
+    if ($env:LOCALAPPDATA) {
+        $pythonOrgRoots += Join-Path $env:LOCALAPPDATA "Programs\Python"
+    }
+    if ($env:ProgramFiles) { $pythonOrgRoots += $env:ProgramFiles }
+    if (${env:ProgramFiles(x86)}) { $pythonOrgRoots += ${env:ProgramFiles(x86)} }
+
+    $pythonOrgDirs = foreach ($root in $pythonOrgRoots) {
+        if (-not (Test-Path $root)) { continue }
+        Get-ChildItem $root -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match "^Python\d+" } |
+            ForEach-Object {
+                $version = New-Object Version(0, 0, 0)
+                if ($_.Name -match "^Python(\d)(\d+)") {
+                    $version = New-Object Version([int]$Matches[1], [int]$Matches[2], 0)
+                }
+                [pscustomobject]@{ Path = $_.FullName; Version = $version }
+            }
+    }
+    $candidates += $pythonOrgDirs |
+        Sort-Object Version -Descending |
+        ForEach-Object { Join-Path $_.Path $exe }
 
     $candidates += (Get-Command $exe -All -ErrorAction SilentlyContinue | ForEach-Object { $_.Source })
     if (-not $Windowed) {

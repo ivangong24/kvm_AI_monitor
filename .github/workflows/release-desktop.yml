@@ -1,0 +1,20 @@
+name: Release macOS companion
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build universal app archive
+        run: ./desktop/package-release.sh
+      - name: Attach app to the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: desktop/dist/KVM-AI-Monitor-v*.zip

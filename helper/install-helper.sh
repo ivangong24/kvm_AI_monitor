@@ -35,6 +35,13 @@ PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 ACTIVITY_LABEL="com.kvm-ai-monitor.activity"
 ACTIVITY_PLIST="$HOME/Library/LaunchAgents/$ACTIVITY_LABEL.plist"
 
+# Preserve a push cadence the companion app may have chosen (set-push-interval) across reinstalls.
+PUSH_INTERVAL=60
+if [[ -f "$CONFIG_DIR/helper.json" ]]; then
+  STORED_INTERVAL=$(sed -n 's/.*"pushIntervalSeconds"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' "$CONFIG_DIR/helper.json" | head -n 1)
+  [[ -n "$STORED_INTERVAL" ]] && PUSH_INTERVAL="$STORED_INTERVAL"
+fi
+
 if [[ "$UPDATE" -eq 0 ]]; then
   if [[ "$SECRET_STDIN" -eq 1 ]]; then
     IFS= read -r SECRET  # piped by the setup wizard; never echoed or logged
@@ -101,7 +108,7 @@ cat > "$PLIST" <<PLIST_EOF
     <string>send-usage</string>
   </array>
   <key>StartInterval</key>
-  <integer>60</integer>
+  <integer>$PUSH_INTERVAL</integer>
   <key>RunAtLoad</key>
   <true/>
   <key>StandardOutPath</key>

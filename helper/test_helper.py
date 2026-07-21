@@ -4,6 +4,7 @@ no real Keychain access — all subprocess/network adapters are patched. Run wit
     python3 helper/test_helper.py
 """
 
+import base64
 import datetime
 import json
 import os
@@ -466,6 +467,85 @@ class AccountLimitsCacheTests(HomeIsolatedTestCase):
         self.assertEqual(set(cache), {"fetchedAt", "attemptedAt", "limits"})
         for entry in cache["limits"]:
             self.assertTrue(set(entry) <= {"label", "usedPercent", "windowMinutes", "resetsAt"})
+
+
+class ExtraUsageTests(unittest.TestCase):
+    def test_extra_usage_and_spend_are_mapped(self):
+        extra = helper.oauth_extra_usage(STRUCTURED_RESPONSE)
+        self.assertEqual(extra, {"enabled": True, "utilization": 4.54, "spendPercent": 5})
+
+    def test_absent_extra_usage_returns_none(self):
+        self.assertIsNone(helper.oauth_extra_usage({"limits": []}))
+        self.assertIsNone(helper.oauth_extra_usage("nope"))
+
+
+class AccountDetectionTests(HomeIsolatedTestCase):
+    # JWT: header.payload.signature where payload base64url-decodes to {"email": "chatgpt@example.com"}.
+    ID_TOKEN = "h." + base64.urlsafe_b64encode(
+        json.dumps({"email": "chatgpt@example.com"}).encode()).decode().rstrip("=") + ".s"
+
+    def _write_codex_auth(self, data):
+        codex_dir = pathlib.Path(self.tempdir.name) / ".codex"
+        codex_dir.mkdir(parents=True, exist_ok=True)
+        (codex_dir / "auth.json").write_text(json.dumps(data))
+
+    def test_jwt_email_extracted(self):
+        self.assertEqual(helper._jwt_email(self.ID_TOKEN), "chatgpt@example.com")
+        self.assertIsNone(helper._jwt_email("not-a-jwt"))
+
+    def test_codex_chatgpt_and_apikey_accounts(self):
+        self._write_codex_auth({"auth_mode": "chatgpt", "OPENAI_API_KEY": "sk-x",
+                                "tokens": {"id_token": self.ID_TOKEN}})
+        accounts = helper.codex_accounts()
+        by_mode = {a["authMode"]: a for a in accounts}
+        self.assertEqual(by_mode["chatgpt"]["email"], "chatgpt@example.com")
+        self.assertTrue(by_mode["chatgpt"]["active"])
+        self.assertEqual(by_mode["apikey"]["email"], "API key")
+        self.assertFalse(by_mode["apikey"]["active"])
+
+    def test_codex_accounts_empty_without_auth_file(self):
+        self.assertEqual(helper.codex_accounts(), [])
+
+
+class CostEstimateTests(unittest.TestCase):
+    def test_cost_from_detail_applies_per_model_prices(self):
+        # 1M output Opus tokens = $75; 1M input Haiku = $0.80.
+        detail = {"claude-opus-4-8": {"input": 0, "output": 1_000_000, "cacheRead": 0, "cacheWrite": 0},
+                  "claude-haiku-4-5": {"input": 1_000_000, "output": 0, "cacheRead": 0, "cacheWrite": 0}}
+        self.assertEqual(helper._cost_from_detail(detail), 75.80)
+
+    def test_unknown_model_falls_back_to_default_price(self):
+        self.assertEqual(helper._price_for_model("mystery-model"), helper.DEFAULT_CLAUDE_PRICE)
+
+    def test_claude_cost_splits_today_and_month(self):
+        detail = {"month": {"claude-sonnet-4": {"input": 1_000_000, "output": 0, "cacheRead": 0, "cacheWrite": 0}},
+                  "today": {}}
+        cost = helper.claude_cost(detail)
+        self.assertEqual(cost, {"currency": "USD", "estimated": True, "today": 0.0, "month": 3.0})
+        self.assertIsNone(helper.claude_cost({"month": {}, "today": {}}))
+
+    def test_codex_cost_is_blended_and_flagged_rough(self):
+        daily = [{"date": DAY0, "totalTokens": 1_000_000}, {"date": DAY1, "totalTokens": 1_000_000}]
+        cost = helper.codex_cost(daily)
+        self.assertTrue(cost["rough"])
+        self.assertEqual(cost["today"], round(helper.CODEX_BLENDED_PRICE_PER_MTOK, 2))
+        self.assertEqual(cost["month"], round(2 * helper.CODEX_BLENDED_PRICE_PER_MTOK, 2))
+
+
+class AppUsageEnrichmentTests(unittest.TestCase):
+    """The app-only enrichment must attach account/extra fields, while the pushed collector payload
+    must not — the privacy boundary between app-usage and the KVM push."""
+
+    def test_claude_enrichment_adds_account_but_push_payload_does_not(self):
+        account = {"provider": "claude", "id": "claude", "email": "a@b.com", "level": "Max"}
+        with mock.patch("kvm_ai_push.claude_account", return_value=account), \
+             mock.patch("kvm_ai_push.claude_extra_usage", return_value={"enabled": True}), \
+             mock.patch("kvm_ai_push.claude_scan", return_value=([], [], [], {"month": {}, "today": {}})):
+            payload = {"provider": "claude"}
+            helper.enrich_app_payload("claude", payload)
+        self.assertEqual(payload["account"], {"email": "a@b.com", "level": "Max"})
+        self.assertEqual(payload["extraUsage"], {"enabled": True})
+        self.assertNotIn("email", json.dumps(account["id"]))  # sanity: id carries no PII
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
 //
 // `kvm-ai-monitor` (or `kvm-ai-monitor setup`) walks a user with no terminal experience from an
 // unconfigured Comet Pro to a working AI-usage wallpaper: discover the KVM on the LAN, authorize,
-// install the on-device agent, switch the touchscreen to Wallpaper Only, enroll this Mac as a
+// install the on-device agent, switch the touchscreen to Wallpaper Only, enroll this computer as a
 // push device, and run a health check. Every step reuses the same scripts the repo has always
 // shipped, so the wizard and the manual path cannot drift apart.
 
@@ -404,7 +404,7 @@ async function cmdSetup(kvmArg) {
   if (!helperSupported()) {
     info(HELPER_UNSUPPORTED);
   } else if (await confirm(
-    `Enroll this ${deviceLabel()} so its Claude usage shows on the KVM?`,
+    `Enroll this ${deviceLabel()} so its AI provider usage shows on the KVM?`,
   )) {
     await enrollThisDevice(host);
   }
@@ -440,7 +440,7 @@ Usage:
   kvm-ai-monitor enroll [--kvm <ip>]    enroll this computer as a push device on a configured KVM
   kvm-ai-monitor install-agent [--kvm <ip>]  redeploy the on-device agent
   kvm-ai-monitor discover [--json]      list Comet KVMs found on the local network
-  kvm-ai-monitor status                 show configured KVMs and this Mac's enrollment
+  kvm-ai-monitor status                 show configured KVMs and this computer's enrollment
   kvm-ai-monitor version | help`);
 }
 

@@ -12,6 +12,7 @@ socket is ever opened."""
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime
 import hashlib
 import hmac
@@ -346,6 +347,25 @@ def oauth_usage_limits(payload):
     return limits
 
 
+def oauth_extra_usage(payload):
+    """Extra-usage / spend signals from the same usage response (companion-app display only, never
+    pushed to the KVM). `extra_usage` is Claude's pay-as-you-go overage; `spend` is its budget."""
+    if not isinstance(payload, dict):
+        return None
+    extra = payload.get("extra_usage") if isinstance(payload.get("extra_usage"), dict) else {}
+    spend = payload.get("spend") if isinstance(payload.get("spend"), dict) else {}
+    result = {}
+    if isinstance(extra.get("is_enabled"), bool):
+        result["enabled"] = extra["is_enabled"]
+    utilization = number(extra.get("utilization"))
+    if utilization is not None:
+        result["utilization"] = max(0.0, utilization)
+    spend_percent = number(spend.get("percent"))
+    if spend_percent is not None:
+        result["spendPercent"] = max(0.0, min(100.0, spend_percent))
+    return result or None
+
+
 # --- adapter c: Keychain OAuth token -> api.anthropic.com/api/oauth/usage ----------------
 
 def extract_access_token(data):
@@ -396,7 +416,12 @@ def keychain_oauth_limits():
         )
         with urllib.request.urlopen(request, timeout=10) as response:
             body = response.read()
-        return oauth_usage_limits(json.loads(body))
+        payload = json.loads(body)
+        # Side effect: stash the app-only extra-usage/spend signals on the same fetch so the
+        # companion app never triggers a second call to this rate-limited endpoint. Kept out of
+        # the returned value (and the limits cache) so the push path and its tests are unchanged.
+        write_extra_usage_cache(oauth_extra_usage(payload))
+        return oauth_usage_limits(payload)
     except Exception:
         return []
     finally:
@@ -437,6 +462,37 @@ def write_limits_cache(cache):
         pass
 
 
+# --- extra-usage cache: populated as a side effect of the limits fetch above (same cadence and
+# --- rate limiting), read back by cmd_app_usage. Local display only; never pushed to the KVM.
+
+def extra_usage_cache_path():
+    return config_dir() / "extra-usage-cache.json"
+
+
+def write_extra_usage_cache(extra):
+    try:
+        config_dir().mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = extra_usage_cache_path()
+        path.write_text(json.dumps({"fetchedAt": time.time(), "extra": extra}))
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+
+
+def claude_extra_usage():
+    """The cached extra-usage/spend signals, or None when unavailable or older than the limits TTL."""
+    try:
+        cache = json.loads(extra_usage_cache_path().read_text())
+    except Exception:
+        return None
+    if not isinstance(cache, dict):
+        return None
+    if 0 <= time.time() - (number(cache.get("fetchedAt")) or 0) < LIMITS_MAX_AGE_SECONDS:
+        extra = cache.get("extra")
+        return extra if isinstance(extra, dict) else None
+    return None
+
+
 def account_limits():
     now = time.time()
     cache = read_limits_cache()
@@ -456,18 +512,100 @@ def account_limits():
     return []
 
 
+# --- account detection: linked subscription identities for the companion app's account switcher.
+# --- Local display only (email/level never pushed to the KVM). The provider CLIs each expose only
+# --- the one login they currently hold; codex additionally distinguishes ChatGPT vs API-key mode.
+
+def _jwt_email(token):
+    """Best-effort email from an unverified JWT payload (used only to label an account)."""
+    if not isinstance(token, str) or token.count(".") < 2:
+        return None
+    try:
+        segment = token.split(".")[1]
+        segment += "=" * (-len(segment) % 4)
+        data = json.loads(base64.urlsafe_b64decode(segment))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    for value in (data.get("email"),) + tuple(data.get(key) for key in data if "profile" in str(key)):
+        if isinstance(value, str) and "@" in value:
+            return value
+        if isinstance(value, dict) and isinstance(value.get("email"), str):
+            return value["email"]
+    return None
+
+
+def claude_account():
+    """The signed-in Claude identity from `claude auth status --json`, or None."""
+    if not shutil.which("claude"):
+        return None
+    try:
+        status = json.loads(run(("claude", "auth", "status", "--json"), 10))
+    except Exception:
+        return None
+    if not isinstance(status, dict) or status.get("loggedIn") is not True:
+        return None
+    account = {"provider": "claude", "id": "claude", "active": True}
+    if isinstance(status.get("email"), str) and status["email"]:
+        account["email"] = status["email"]
+    level = plan_label(status.get("subscriptionType"))
+    if level:
+        account["level"] = level
+    if isinstance(status.get("orgName"), str) and status["orgName"]:
+        account["org"] = status["orgName"]
+    return account
+
+
+def codex_accounts():
+    """Detected Codex logins from ~/.codex/auth.json: the ChatGPT identity and, when present, a
+    stored API key — each an 'account' the app can display. `active` follows the file's auth_mode."""
+    try:
+        data = json.loads((pathlib.Path.home() / ".codex" / "auth.json").read_text())
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    mode = data.get("auth_mode")
+    tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
+    accounts = []
+    id_token = tokens.get("id_token")
+    if isinstance(id_token, str) and id_token:
+        entry = {"provider": "codex", "id": "codex-chatgpt", "authMode": "chatgpt",
+                 "active": mode != "apikey"}
+        email = _jwt_email(id_token)
+        if email:
+            entry["email"] = email
+        accounts.append(entry)
+    if data.get("OPENAI_API_KEY"):
+        accounts.append({"provider": "codex", "id": "codex-apikey", "authMode": "apikey",
+                         "email": "API key", "active": mode == "apikey"})
+    return accounts
+
+
+def detect_accounts():
+    accounts = []
+    claude = claude_account()
+    if claude:
+        accounts.append(claude)
+    accounts.extend(codex_accounts())
+    return accounts
+
+
 # --- adapter d: local daily token totals (faithful port of ssh_collector.claude_daily) ---
 
 def claude_scan():
-    """One pass over Claude transcripts → (per-day totals, per-model totals, per-platform totals)
-    for the last 30 days. Platform is the transcript `entrypoint` (cli / claude-desktop / sdk-cli);
-    web and API usage are server-side and never appear locally. Shared by claude_daily() and the
-    usage payload so the files are read only once."""
+    """One pass over Claude transcripts → (per-day totals, per-model totals, per-platform totals,
+    cost detail) for the last 30 days. Cost detail is per-model token-type sums for the whole window
+    and for today, used only for the companion app's USD estimate. Platform is the transcript
+    `entrypoint` (cli / claude-desktop / sdk-cli); web and API usage are server-side and never appear
+    locally. Shared by claude_daily() and the usage payload so the files are read only once."""
     root = pathlib.Path.home() / ".claude/projects"
+    today_iso = datetime.date.today().isoformat()
     cutoff = datetime.date.today() - datetime.timedelta(days=29)
     messages = {}
     if not root.is_dir():
-        return [], [], []
+        return [], [], [], {"month": {}, "today": {}}
     for path in root.rglob("*.jsonl"):
         try:
             with path.open(errors="replace") as stream:
@@ -507,6 +645,9 @@ def claude_scan():
     by_day = {}
     by_model = {}
     by_platform = {}
+    detail = {"month": {}, "today": {}}
+    detail_keys = (("input", "inputTokens"), ("output", "outputTokens"),
+                   ("cacheRead", "cacheReadTokens"), ("cacheWrite", "cacheCreationTokens"))
     for value in messages.values():
         day = by_day.setdefault(value["date"], {"date": value["date"], "inputTokens": 0, "outputTokens": 0, "cacheReadTokens": 0, "cacheCreationTokens": 0, "totalTokens": 0})
         subtotal = 0
@@ -517,6 +658,11 @@ def claude_scan():
         model = value.get("model") or ""
         if model and not model.startswith("<"):
             by_model[model] = by_model.get(model, 0) + subtotal
+            windows = ["month"] + (["today"] if value["date"] == today_iso else [])
+            for window in windows:
+                bucket = detail[window].setdefault(model, {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0})
+                for cost_key, token_key in detail_keys:
+                    bucket[cost_key] += value[token_key]
         platform = value.get("platform") or ""
         if platform:
             by_platform[platform] = by_platform.get(platform, 0) + subtotal
@@ -525,11 +671,65 @@ def claude_scan():
               for name in sorted(by_model, key=lambda name: -by_model[name]) if by_model[name] > 0]
     platforms = [{"platform": name, "tokens": by_platform[name]}
                  for name in sorted(by_platform, key=lambda name: -by_platform[name]) if by_platform[name] > 0]
-    return daily, models, platforms
+    return daily, models, platforms, detail
 
 
 def claude_daily():
     return claude_scan()[0]
+
+
+# --- cost estimate (companion-app display only, never pushed) ----------------------------------
+# Approximate published API list prices in USD per million tokens (input / output / cache-read /
+# cache-write). Used to show a codexbar-style "what these tokens would cost at API rates" figure —
+# an estimate, not a bill. Update as public pricing changes (values as of early 2026).
+MODEL_PRICES = {
+    "opus":   {"input": 15.0, "output": 75.0, "cacheRead": 1.5,  "cacheWrite": 18.75},
+    "sonnet": {"input": 3.0,  "output": 15.0, "cacheRead": 0.30, "cacheWrite": 3.75},
+    "haiku":  {"input": 0.80, "output": 4.0,  "cacheRead": 0.08, "cacheWrite": 1.0},
+    "fable":  {"input": 3.0,  "output": 15.0, "cacheRead": 0.30, "cacheWrite": 3.75},
+}
+DEFAULT_CLAUDE_PRICE = MODEL_PRICES["sonnet"]
+# Codex exposes only a daily total (no input/output split), so a single blended gpt-5-class rate is
+# applied — a rough estimate flagged as such in the payload.
+CODEX_BLENDED_PRICE_PER_MTOK = 2.0
+
+
+def _price_for_model(model):
+    lowered = (model or "").lower()
+    for key, price in MODEL_PRICES.items():
+        if key in lowered:
+            return price
+    return DEFAULT_CLAUDE_PRICE
+
+
+def _cost_from_detail(detail):
+    total = 0.0
+    for model, tokens in (detail or {}).items():
+        price = _price_for_model(model)
+        total += (tokens.get("input", 0) * price["input"]
+                  + tokens.get("output", 0) * price["output"]
+                  + tokens.get("cacheRead", 0) * price["cacheRead"]
+                  + tokens.get("cacheWrite", 0) * price["cacheWrite"]) / 1_000_000
+    return round(total, 2)
+
+
+def claude_cost(detail):
+    if not detail or (not detail.get("month") and not detail.get("today")):
+        return None
+    return {"currency": "USD", "estimated": True,
+            "today": _cost_from_detail(detail.get("today")),
+            "month": _cost_from_detail(detail.get("month"))}
+
+
+def codex_cost(daily):
+    if not daily:
+        return None
+    today_iso = datetime.date.today().isoformat()
+    today_tokens = sum(number(item.get("totalTokens")) or 0 for item in daily if item.get("date") == today_iso)
+    month_tokens = sum(number(item.get("totalTokens")) or 0 for item in daily)
+    usd = lambda tokens: round(tokens / 1_000_000 * CODEX_BLENDED_PRICE_PER_MTOK, 2)
+    return {"currency": "USD", "estimated": True, "rough": True,
+            "today": usd(today_tokens), "month": usd(month_tokens)}
 
 
 # --- payload assembly (whitelisted fields only, docs/PUSH_PROTOCOL.md "POST /push/v1/usage") ---
@@ -592,6 +792,7 @@ def codex_usage_fresh():
         {"method": "initialized", "params": {}},
         {"id": 2, "method": "account/rateLimits/read", "params": {}},
         {"id": 3, "method": "account/usage/read", "params": {}},
+        {"id": 4, "method": "account/read", "params": {}},
     )
     body = "\n".join(json.dumps(message, separators=(",", ":")) for message in messages) + "\n"
     # Keep stdin open and read incrementally: app-server shuts down on stdin EOF, so closing it
@@ -608,7 +809,7 @@ def codex_usage_fresh():
         process.stdin.write(body)
         process.stdin.flush()
         deadline = time.monotonic() + 15
-        while time.monotonic() < deadline and len(responses) < 2:
+        while time.monotonic() < deadline and len(responses) < 3:
             ready, _, _ = select.select((process.stdout,), (), (), max(0, deadline - time.monotonic()))
             if not ready:
                 break
@@ -619,10 +820,13 @@ def codex_usage_fresh():
                 message = json.loads(line)
             except ValueError:
                 continue
-            if message.get("id") in (2, 3) and isinstance(message.get("result"), dict):
-                responses[message["id"]] = message["result"]
+            # Store an empty dict for error replies too, so the loop terminates promptly when
+            # account/read (id 4) is unsupported instead of waiting out the deadline.
+            if message.get("id") in (2, 3, 4):
+                result = message.get("result")
+                responses[message["id"]] = result if isinstance(result, dict) else {}
     except Exception:
-        return None
+        return None, None
     finally:
         if process:
             process.terminate()
@@ -630,11 +834,14 @@ def codex_usage_fresh():
                 process.wait(timeout=2)
             except Exception:
                 process.kill()
-    rate = responses.get(2, {}).get("rateLimits")
+    rate_result = responses.get(2, {})
+    rate = rate_result.get("rateLimits")
     rate = rate if isinstance(rate, dict) else {}
     usage = responses.get(3, {})
+    account = responses.get(4, {}).get("account")
+    account = account if isinstance(account, dict) else {}
     if not rate and not usage:
-        return None
+        return None, None
     limits = [entry for entry in (_codex_limit(rate.get("primary")), _codex_limit(rate.get("secondary"))) if entry]
     buckets = usage.get("dailyUsageBuckets") if isinstance(usage.get("dailyUsageBuckets"), list) else []
     daily = [
@@ -650,7 +857,30 @@ def codex_usage_fresh():
         payload["limits"] = limits[:8]
     if daily:
         payload["daily"] = daily[-31:]
-    return payload
+    return payload, _codex_extras(rate_result, rate, account)
+
+
+def _codex_extras(rate_result, rate, account):
+    """Credit balance, free rate-limit resets, and account email/plan — companion-app only."""
+    extras = {}
+    credits = rate.get("credits") if isinstance(rate.get("credits"), dict) else None
+    if credits is not None:
+        entry = {"hasCredits": bool(credits.get("hasCredits")), "unlimited": bool(credits.get("unlimited"))}
+        balance = _finite_number(credits.get("balance"))
+        if balance is not None:
+            entry["balance"] = balance
+        extras["credits"] = entry
+    reset_credits = rate_result.get("rateLimitResetCredits")
+    if isinstance(reset_credits, dict):
+        free_resets = _finite_number(reset_credits.get("availableCount"))
+        if free_resets is not None:
+            extras["freeResets"] = int(free_resets)
+    if isinstance(account.get("email"), str) and account["email"]:
+        extras["email"] = account["email"]
+    plan = _plan_label(account.get("planType"))
+    if plan:
+        extras["planType"] = plan
+    return extras or None
 
 
 # --- codex usage cache: `codex app-server` is a heavy Node process (~275 MB) spawned only to read
@@ -665,6 +895,19 @@ def codex_cache_path():
 
 
 def codex_usage_payload():
+    """The push payload only (no extras) — this is the collector `send-usage` calls."""
+    return codex_usage_cached()[0]
+
+
+def codex_app_extras():
+    """The companion-app-only extras (credits/free-resets/account); reads the shared cache without
+    a second app-server spawn when the push path already refreshed it this run."""
+    return codex_usage_cached()[1]
+
+
+def codex_usage_cached():
+    """(push payload, app-only extras) with heavy-fetch throttling. Extras are cached alongside the
+    payload in a 0600 local file but returned separately so they are never included in the push."""
     now = time.time()
     try:
         cache = json.loads(codex_cache_path().read_text())
@@ -675,13 +918,15 @@ def codex_usage_payload():
         fetched_age = now - (number(cache.get("fetchedAt")) or 0)
         if 0 <= attempted_age < CODEX_MIN_FETCH_SECONDS:
             payload = cache.get("payload")
-            return payload if (payload and 0 <= fetched_age < CODEX_MAX_AGE_SECONDS) else None
-    payload = codex_usage_fresh()
+            fresh = payload and 0 <= fetched_age < CODEX_MAX_AGE_SECONDS
+            return (payload, cache.get("extras")) if fresh else (None, None)
+    payload, extras = codex_usage_fresh()
     previous = cache if isinstance(cache, dict) else {}
     entry = {
         "attemptedAt": now,
         "fetchedAt": now if payload else (number(previous.get("fetchedAt")) or 0),
         "payload": payload if payload else previous.get("payload"),
+        "extras": extras if payload else previous.get("extras"),
     }
     try:
         config_dir().mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -691,10 +936,10 @@ def codex_usage_payload():
     except Exception:
         pass
     if payload:
-        return payload
+        return payload, extras
     if 0 <= (now - (number(previous.get("fetchedAt")) or 0)) < CODEX_MAX_AGE_SECONDS:
-        return previous.get("payload")
-    return None
+        return previous.get("payload"), previous.get("extras")
+    return None, None
 
 
 def claude_usage_payload():
@@ -708,7 +953,7 @@ def claude_usage_payload():
         payload["plan"] = plan
     if limits:
         payload["limits"] = limits[:8]
-    daily, models, platforms = claude_scan()
+    daily, models, platforms, _detail = claude_scan()
     if daily:
         payload["daily"] = daily[-31:]
     if models:
@@ -774,10 +1019,45 @@ def cmd_print_payload(_args):
             print(json.dumps(payload, indent=2, sort_keys=True))
 
 
+def enrich_app_payload(provider_id, payload):
+    """Attach companion-app-only fields (account / credits / extra-usage / cost) to a provider
+    payload. Called only from cmd_app_usage, so none of this reaches the KVM push path."""
+    if provider_id == "claude":
+        account = claude_account()
+        if account:
+            fields = {key: account[key] for key in ("email", "level", "org") if key in account}
+            if fields:
+                payload["account"] = fields
+        extra = claude_extra_usage()
+        if extra:
+            payload["extraUsage"] = extra
+        cost = claude_cost(claude_scan()[3])
+        if cost:
+            payload["cost"] = cost
+    elif provider_id == "codex":
+        extras = codex_app_extras() or {}
+        account = {}
+        if extras.get("email"):
+            account["email"] = extras["email"]
+        level = extras.get("planType") or payload.get("plan")
+        if level:
+            account["level"] = level
+        if account:
+            payload["account"] = account
+        if extras.get("credits"):
+            payload["credits"] = extras["credits"]
+        if "freeResets" in extras:
+            payload["freeResets"] = extras["freeResets"]
+        cost = codex_cost(payload.get("daily") or [])
+        if cost:
+            payload["cost"] = cost
+
+
 def cmd_app_usage(_args):
     """Emit one JSON object for the menu-bar companion: each provider's usage payload (plan,
-    limits, daily token history) plus the current local working state. Read-only — never pushes.
-    Errors go to stderr so stdout stays a single parseable JSON line."""
+    limits, daily token history) enriched with app-only account/credits/extra-usage/cost fields,
+    plus the current local working state and the detected linked accounts. Read-only — never
+    pushes. Errors go to stderr so stdout stays a single parseable JSON line."""
     providers = []
     for provider_id, collect in USAGE_COLLECTORS.items():
         try:
@@ -786,12 +1066,22 @@ def cmd_app_usage(_args):
             print(f"# {provider_id}: {error}", file=sys.stderr)
             continue
         if payload:
+            try:
+                enrich_app_payload(provider_id, payload)
+            except Exception as error:
+                print(f"# {provider_id} extras: {error}", file=sys.stderr)
             providers.append(payload)
     try:
         working = {key: bool(value) for key, value in detect_working().items()}
     except Exception:
         working = {}
-    print(json.dumps({"providers": providers, "working": working, "generatedAt": now_iso()}))
+    try:
+        accounts = detect_accounts()
+    except Exception as error:
+        print(f"# accounts: {error}", file=sys.stderr)
+        accounts = []
+    print(json.dumps({"providers": providers, "working": working,
+                      "accounts": accounts, "generatedAt": now_iso()}))
 
 
 def cmd_store_secret(args):
@@ -1153,6 +1443,49 @@ def cmd_hooks_status(args):
     print("on" if hooks_installed() else "off")
 
 
+PUSH_AGENT_LABEL = "com.kvm-ai-monitor.helper"
+
+
+def push_agent_plist():
+    return pathlib.Path.home() / "Library" / "LaunchAgents" / (PUSH_AGENT_LABEL + ".plist")
+
+
+def cmd_set_push_interval(args):
+    """Change how often usage is pushed to the KVM by rewriting the send-usage LaunchAgent's
+    StartInterval and reloading it (macOS only). Records the value in helper.json so a helper
+    reinstall keeps the chosen cadence."""
+    seconds = max(30, min(24 * 3600, int(args.seconds)))
+    if sys.platform != "darwin":
+        print("kvm-ai-monitor: set-push-interval is macOS-only", file=sys.stderr)
+        sys.exit(1)
+    plist_path = push_agent_plist()
+    try:
+        import plistlib
+        with plist_path.open("rb") as stream:
+            plist = plistlib.load(stream)
+        plist["StartInterval"] = seconds
+        with plist_path.open("wb") as stream:
+            plistlib.dump(plist, stream)
+    except Exception as error:
+        print(f"kvm-ai-monitor: could not update the push schedule: {error}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        config = json.loads(config_path().read_text()) if config_path().exists() else {}
+        if not isinstance(config, dict):
+            config = {}
+        config["pushIntervalSeconds"] = seconds
+        config_dir().mkdir(mode=0o700, parents=True, exist_ok=True)
+        config_path().write_text(json.dumps(config, indent=2))
+    except Exception:
+        pass
+    uid = str(os.getuid())
+    subprocess.run(("/bin/launchctl", "bootout", f"gui/{uid}/{PUSH_AGENT_LABEL}"),
+                   capture_output=True, timeout=10, check=False)
+    subprocess.run(("/bin/launchctl", "bootstrap", f"gui/{uid}", str(plist_path)),
+                   capture_output=True, timeout=10, check=False)
+    print(f"push interval set to {seconds}s")
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="kvm_ai_push.py")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1183,6 +1516,11 @@ def build_parser():
     store_parser = sub.add_parser("store-secret", help="store the device push secret (read from stdin)")
     store_parser.add_argument("--kvm", required=True)
     store_parser.set_defaults(func=cmd_store_secret)
+
+    interval_parser = sub.add_parser("set-push-interval",
+                                     help="set how often usage is pushed to the KVM, in seconds (macOS)")
+    interval_parser.add_argument("seconds", type=int)
+    interval_parser.set_defaults(func=cmd_set_push_interval)
 
     sub.add_parser("install-hooks", help="enable opt-in Claude Code working-state hooks").set_defaults(func=cmd_install_hooks)
     sub.add_parser("uninstall-hooks", help="disable Claude Code working-state hooks").set_defaults(func=cmd_uninstall_hooks)

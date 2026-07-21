@@ -108,7 +108,7 @@ $taskXml = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>Pushes this PC's Claude usage to the GL.iNet Comet KVM.</Description>
+    <Description>Pushes this PC's AI provider usage to the GL.iNet Comet KVM.</Description>
   </RegistrationInfo>
   <Triggers>
     <!-- A LogonTrigger alone is not enough: it fires only at the moment of logon, so a task

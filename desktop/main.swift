@@ -17,10 +17,56 @@ struct PushTarget: Identifiable, Hashable {
 
 enum Panel { case home, usage, settings }
 
-// Shapes matching `kvm_ai_push.py app-usage` — this Mac's local usage snapshot.
+// A terminal the companion can open for the guided setup / device management. Terminal and iTerm are
+// driven by their AppleScript dictionaries (a command lands in a new window, ready to run). Terminals
+// with a documented "run this command" launch flag are opened through `open --args`. Anything else
+// (Warp, Hyper, …) can't be reliably told to run a command, so we open it and copy the command to the
+// clipboard for the user to paste — which works for every terminal.
+struct TerminalOption: Identifiable, Hashable {
+    enum Launch: Hashable {
+        case terminalApp                // Terminal.app dictionary
+        case iterm                      // iTerm2 dictionary
+        case openArgs([String])         // open -na <name> --args <these…> <command>
+        case clipboard                  // open the app; user pastes the copied command
+    }
+    let id: String                      // stable key persisted in preferences
+    let name: String                    // display name and `open -a` target
+    let bundleID: String
+    let launch: Launch
+
+    // Ordered by popularity; only the installed ones are offered.
+    static let all: [TerminalOption] = [
+        .init(id: "terminal",  name: "Terminal",  bundleID: "com.apple.Terminal",     launch: .terminalApp),
+        .init(id: "iterm",     name: "iTerm",     bundleID: "com.googlecode.iterm2",  launch: .iterm),
+        .init(id: "warp",      name: "Warp",      bundleID: "dev.warp.Warp-Stable",   launch: .clipboard),
+        .init(id: "ghostty",   name: "Ghostty",   bundleID: "com.mitchellh.ghostty",  launch: .openArgs(["-e", "/bin/zsh", "-lc"])),
+        .init(id: "kitty",     name: "kitty",     bundleID: "net.kovidgoyal.kitty",   launch: .openArgs(["/bin/zsh", "-lc"])),
+        .init(id: "alacritty", name: "Alacritty", bundleID: "org.alacritty",          launch: .openArgs(["-e", "/bin/zsh", "-lc"])),
+        .init(id: "wezterm",   name: "WezTerm",   bundleID: "com.github.wez.wezterm", launch: .openArgs(["start", "--", "/bin/zsh", "-lc"])),
+        .init(id: "hyper",     name: "Hyper",     bundleID: "co.zeit.hyper",          launch: .clipboard),
+    ]
+}
+
+// The latest GitHub release, used by the "check for updates" flow.
+struct GitHubRelease: Decodable {
+    let tag_name: String
+    let html_url: String
+}
+
+enum UpdateStatus: Equatable {
+    case idle
+    case checking
+    case upToDate
+    case available(version: String, page: URL)
+    case failed(String)
+}
+
+// Shapes matching `kvm_ai_push.py app-usage` — this Mac's local usage snapshot. Account, cost,
+// credits and extra-usage fields are local-only enrichments; they are never in the KVM push.
 struct AppUsage: Decodable {
     let providers: [ProviderPayload]
     let working: [String: Bool]
+    let accounts: [AccountInfo]?
 }
 
 struct ProviderPayload: Decodable {
@@ -31,6 +77,41 @@ struct ProviderPayload: Decodable {
     let daily: [DailyPayload]?
     let models: [ModelPayload]?
     let platforms: [PlatformPayload]?
+    let account: AccountInfo?
+    let extraUsage: ExtraUsage?
+    let credits: CreditInfo?
+    let freeResets: Int?
+    let cost: CostSummary?
+}
+
+struct AccountInfo: Decodable {
+    let provider: String?
+    let id: String?
+    let email: String?
+    let level: String?
+    let org: String?
+    let authMode: String?
+    let active: Bool?
+}
+
+struct ExtraUsage: Decodable {
+    let enabled: Bool?
+    let utilization: Double?
+    let spendPercent: Double?
+}
+
+struct CreditInfo: Decodable {
+    let balance: Double?
+    let hasCredits: Bool?
+    let unlimited: Bool?
+}
+
+struct CostSummary: Decodable {
+    let today: Double?
+    let month: Double?
+    let currency: String?
+    let estimated: Bool?
+    let rough: Bool?
 }
 
 struct ModelPayload: Decodable {
@@ -77,6 +158,57 @@ final class MonitorModel: ObservableObject {
     @Published var usageLoading = false
     @Published var usageError: String?
     private var usageLoadedAt: Date?
+    private var refreshTimer: Timer?
+
+    // Show the codex credits / claude extra-usage sections. On by default; user can hide them.
+    @Published var showExtras: Bool =
+        UserDefaults.standard.object(forKey: "showExtras") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(showExtras, forKey: "showExtras") }
+    }
+    // How often to re-read local usage while the app is open, in seconds; 0 = off. This also drives
+    // the KVM push cadence (see setPushInterval).
+    @Published var refreshInterval: Int =
+        UserDefaults.standard.object(forKey: "refreshInterval") as? Int ?? 300 {
+        didSet {
+            UserDefaults.standard.set(refreshInterval, forKey: "refreshInterval")
+            applyRefreshInterval()
+        }
+    }
+
+    @Published var updateStatus: UpdateStatus = .idle
+    @Published var preferredTerminalID: String =
+        UserDefaults.standard.string(forKey: "preferredTerminalID") ?? TerminalOption.all[0].id {
+        didSet { UserDefaults.standard.set(preferredTerminalID, forKey: "preferredTerminalID") }
+    }
+
+    // Terminals actually present on this Mac; the picker only offers these.
+    var installedTerminals: [TerminalOption] {
+        TerminalOption.all.filter {
+            NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0.bundleID) != nil
+        }
+    }
+
+    // The chosen terminal, falling back to the first installed one (Terminal always exists on macOS).
+    var selectedTerminal: TerminalOption {
+        let installed = installedTerminals
+        return installed.first { $0.id == preferredTerminalID }
+            ?? installed.first
+            ?? TerminalOption.all[0]
+    }
+
+    var currentVersion: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+    }
+
+    var updateDetail: String {
+        switch updateStatus {
+        case .idle: return "Check GitHub for the newest companion release."
+        case .checking: return "Checking…"
+        case .upToDate: return "You’re on the latest release."
+        case .available(let version, _): return "Version \(version) is available."
+        case .failed(let message): return message
+        }
+    }
 
     private var configDir: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".kvm-ai-monitor")
@@ -242,13 +374,100 @@ final class MonitorModel: ObservableObject {
 
     func runSetupInTerminal() {
         let command = "command -v kvm-ai-monitor >/dev/null 2>&1 || brew install ivangong24/kvm-ai-monitor/kvm-ai-monitor; kvm-ai-monitor"
-        let source = """
-        tell application "Terminal"
-            activate
-            do script "\(command)"
-        end tell
-        """
-        NSAppleScript(source: source)?.executeAndReturnError(nil)
+        let terminal = selectedTerminal
+        notice = nil
+        switch terminal.launch {
+        case .terminalApp:
+            runAppleScript("""
+            tell application "Terminal"
+                activate
+                do script "\(escapeForAppleScript(command))"
+            end tell
+            """)
+        case .iterm:
+            runAppleScript("""
+            tell application "iTerm"
+                activate
+                set newWindow to (create window with default profile)
+                tell current session of newWindow to write text "\(escapeForAppleScript(command))"
+            end tell
+            """)
+        case .openArgs(let prefix):
+            Task.detached {
+                _ = Self.run("/usr/bin/open", ["-na", terminal.name, "--args"] + prefix + [command])
+            }
+        case .clipboard:
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(command, forType: .string)
+            _ = Self.run("/usr/bin/open", ["-a", terminal.name])
+            notice = "Setup command copied — paste it into \(terminal.name) and press Return."
+        }
+    }
+
+    private func runAppleScript(_ source: String) {
+        var error: NSDictionary?
+        NSAppleScript(source: source)?.executeAndReturnError(&error)
+        if error != nil {
+            notice = "Couldn’t open \(selectedTerminal.name). Allow control in System Settings › Privacy › Automation, or pick a different terminal."
+        }
+    }
+
+    // AppleScript string literals need backslashes and quotes escaped so the command survives verbatim.
+    private func escapeForAppleScript(_ text: String) -> String {
+        text.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
+    func checkForUpdates() {
+        if case .checking = updateStatus { return }
+        updateStatus = .checking
+        let current = currentVersion
+        Task {
+            let result = await Self.fetchLatestRelease()
+            switch result {
+            case .success(let release):
+                let latest = release.tag_name.hasPrefix("v")
+                    ? String(release.tag_name.dropFirst()) : release.tag_name
+                if Self.isVersion(latest, newerThan: current), let page = URL(string: release.html_url) {
+                    updateStatus = .available(version: latest, page: page)
+                } else {
+                    updateStatus = .upToDate
+                }
+            case .failure:
+                updateStatus = .failed("Couldn’t reach GitHub. Check your connection and try again.")
+            }
+        }
+    }
+
+    nonisolated private static func fetchLatestRelease() async -> Result<GitHubRelease, Error> {
+        let url = URL(string: "https://api.github.com/repos/ivangong24/kvm_AI_monitor/releases/latest")!
+        var request = URLRequest(url: url)
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.setValue("KVM-AI-Monitor", forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 15
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                return .failure(URLError(.badServerResponse))
+            }
+            return .success(try JSONDecoder().decode(GitHubRelease.self, from: data))
+        } catch {
+            return .failure(error)
+        }
+    }
+
+    // Numeric semver compare ("0.8.0" newer than "0.7.0"); non-numeric suffixes are ignored.
+    nonisolated static func isVersion(_ candidate: String, newerThan base: String) -> Bool {
+        func parts(_ text: String) -> [Int] {
+            text.split(separator: ".").map { Int($0.prefix { $0.isNumber }) ?? 0 }
+        }
+        let lhs = parts(candidate), rhs = parts(base)
+        for index in 0..<max(lhs.count, rhs.count) {
+            let left = index < lhs.count ? lhs[index] : 0
+            let right = index < rhs.count ? rhs[index] : 0
+            if left != right { return left > right }
+        }
+        return false
     }
 
     func toggleLaunchAtLogin() {
@@ -318,6 +537,32 @@ final class MonitorModel: ObservableObject {
             }
         }
     }
+
+    // MARK: Refresh interval
+
+    // Restart the auto-refresh timer to match the chosen interval (0 = off). Called on change and
+    // when the Usage tab appears. Each tick re-reads local usage so the view stays current.
+    func applyRefreshInterval() {
+        refreshTimer?.invalidate()
+        refreshTimer = nil
+        guard refreshInterval > 0 else { return }
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: Double(refreshInterval), repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.loadUsage(force: true) }
+        }
+    }
+
+    // Match the KVM push cadence to the app's refresh interval (clamped by the helper to ≥30s).
+    func setPushInterval(_ seconds: Int) {
+        guard helperInstalled, seconds > 0 else { return }
+        let script = helperScript.path
+        Task.detached {
+            _ = Self.run("/usr/bin/env", ["python3", script, "set-push-interval", String(seconds)])
+        }
+    }
+
+    // MARK: Accounts
+
+    var detectedAccounts: [AccountInfo] { appUsage?.accounts ?? [] }
 
     static func providerName(_ id: String) -> String {
         ["claude": "Claude Code", "codex": "Codex", "copilot": "GitHub Copilot",
@@ -685,6 +930,25 @@ struct CompanionPanel: View {
                         .labelsHidden()
                         .toggleStyle(.switch)
                 }
+                Divider()
+                SettingRow(title: "Show credits & extra usage",
+                           detail: "Display Codex credits and Claude extra-usage sections on the Usage tab.") {
+                    Toggle("", isOn: Binding(get: { model.showExtras }, set: { model.showExtras = $0 }))
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                }
+                Divider()
+                SettingRow(title: "Refresh interval",
+                           detail: "How often usage refreshes here and updates on your Comet Pro.") {
+                    Picker("", selection: Binding(get: { model.refreshInterval },
+                                                  set: { model.refreshInterval = $0; model.setPushInterval($0) })) {
+                        Text("Off").tag(0)
+                        Text("1 min").tag(60)
+                        Text("5 min").tag(300)
+                        Text("15 min").tag(900)
+                    }
+                    .labelsHidden().pickerStyle(.menu).frame(maxWidth: 110)
+                }
             }
 
             settingsGroup(title: "Claude activity") {
@@ -716,6 +980,38 @@ struct CompanionPanel: View {
                                  detail: "Pair a Comet Pro or enroll another Mac.")
                 }
                 .buttonStyle(.plain)
+                if model.installedTerminals.count > 1 {
+                    Divider()
+                    SettingRow(title: "Open setup in",
+                               detail: "Choose which terminal runs the guided setup and device management.") {
+                        Picker("", selection: Binding(get: { model.preferredTerminalID },
+                                                      set: { model.preferredTerminalID = $0 })) {
+                            ForEach(model.installedTerminals) { Text($0.name).tag($0.id) }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        .frame(maxWidth: 130)
+                    }
+                }
+            }
+
+            settingsGroup(title: "About") {
+                SettingRow(title: "Version \(model.currentVersion)", detail: model.updateDetail) {
+                    switch model.updateStatus {
+                    case .checking:
+                        ProgressView().controlSize(.small)
+                    case .available(_, let page):
+                        Button { NSWorkspace.shared.open(page) } label: {
+                            Label("Get update", systemImage: "arrow.down.circle.fill")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                    default:
+                        Button("Check for updates") { model.checkForUpdates() }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                    }
+                }
             }
 
             if let notice = model.notice {
@@ -986,8 +1282,14 @@ struct UsagePanel: View {
                 infoCard("Set up this Mac", "Enroll this Mac from the Home tab to see its AI usage here.")
             } else if let provider = selected {
                 if providers.count > 1 { providerPicker }
+                accountCard(provider)
                 workingCard(provider)
+                if provider.cost != nil { costCard(provider) }
                 limitsCard(provider)
+                if model.showExtras {
+                    if provider.extraUsage != nil { extraUsageCard(provider) }
+                    if provider.credits != nil || provider.freeResets != nil { creditsCard(provider) }
+                }
                 dailyCard(provider)
                 modelsCard(provider)
                 platformsCard(provider)
@@ -998,7 +1300,110 @@ struct UsagePanel: View {
             }
         }
         .padding(16)
-        .onAppear { model.loadUsage() }
+        .onAppear { model.loadUsage(); model.applyRefreshInterval() }
+    }
+
+    // Detected accounts for this provider (usually one; codex may add an API-key entry).
+    private func accounts(for provider: String) -> [AccountInfo] {
+        model.detectedAccounts.filter { $0.provider == provider }
+    }
+
+    private func accountCard(_ provider: ProviderPayload) -> some View {
+        let list = accounts(for: provider.provider)
+        let email = provider.account?.email ?? list.first(where: { $0.email != nil })?.email
+        let level = provider.account?.level ?? provider.plan
+        return card("Linked account") {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    Image(systemName: "person.crop.circle").foregroundStyle(accent)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(email ?? "Signed in").font(.system(size: 13, weight: .semibold))
+                        if let level { Text(level.uppercased()).font(.system(size: 10, weight: .bold)).tracking(0.5).foregroundStyle(accent) }
+                    }
+                }
+                if list.count > 1 {
+                    Divider()
+                    ForEach(list, id: \.id) { account in
+                        HStack(spacing: 6) {
+                            Image(systemName: account.active == true ? "checkmark.circle.fill" : "circle")
+                                .font(.system(size: 11))
+                                .foregroundStyle(account.active == true ? accent : Color.secondary)
+                            Text(account.email ?? (account.authMode.map { $0.capitalized } ?? "Account"))
+                                .font(.system(size: 12))
+                            if let mode = account.authMode {
+                                Text(mode == "apikey" ? "API key" : "ChatGPT")
+                                    .font(.system(size: 9, weight: .semibold))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    Text("Tracks whichever login the \(MonitorModel.providerName(provider.provider)) CLI is signed in with. Switch logins in the CLI to change it.")
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func costCard(_ provider: ProviderPayload) -> some View {
+        let cost = provider.cost
+        return card("Estimated cost") {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 24) {
+                    costFigure("Today", cost?.today)
+                    costFigure("Last 30 days", cost?.month)
+                }
+                Text((cost?.rough == true
+                      ? "Rough estimate at API-equivalent rates — Codex reports only total tokens."
+                      : "Estimate at API-equivalent rates, not your actual subscription bill."))
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func costFigure(_ label: String, _ value: Double?) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label).font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+            Text(value.map { String(format: "$%.2f", $0) } ?? "—")
+                .font(.system(size: 18, weight: .semibold))
+        }
+    }
+
+    private func extraUsageCard(_ provider: ProviderPayload) -> some View {
+        let extra = provider.extraUsage
+        return card("Extra usage") {
+            VStack(spacing: 12) {
+                if let util = extra?.utilization {
+                    UsageLimitBar(title: extra?.enabled == true ? "Pay-as-you-go used" : "Extra usage (off)",
+                                  limit: LimitPayload(label: nil, usedPercent: util, windowMinutes: nil, resetsAt: nil),
+                                  tint: accent)
+                }
+                if let spend = extra?.spendPercent {
+                    UsageLimitBar(title: "Spend budget",
+                                  limit: LimitPayload(label: nil, usedPercent: spend, windowMinutes: nil, resetsAt: nil),
+                                  tint: accent)
+                }
+            }
+        }
+    }
+
+    private func creditsCard(_ provider: ProviderPayload) -> some View {
+        card("Credits") {
+            HStack(spacing: 24) {
+                if let balance = provider.credits?.balance {
+                    creditFigure("Balance", provider.credits?.unlimited == true ? "Unlimited" : "\(Int(balance))")
+                }
+                if let resets = provider.freeResets {
+                    creditFigure("Free resets", "\(resets)")
+                }
+            }
+        }
+    }
+
+    private func creditFigure(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label).font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+            Text(value).font(.system(size: 18, weight: .semibold))
+        }
     }
 
     private var providerPicker: some View {

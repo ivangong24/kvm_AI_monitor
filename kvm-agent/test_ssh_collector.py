@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 
 import json
+import socket
+import tempfile
 import unittest
 from datetime import datetime
+from pathlib import Path
+from unittest import mock
 
-from agent import Agent, usage_panel_visible
+from agent import Agent, read_kvm_identity, usage_panel_visible
 from ssh_collector import (
     REMOTE_ACTIVITY_PROBE,
     REMOTE_COLLECTOR,
@@ -16,6 +20,22 @@ from ssh_collector import (
 
 
 class SnapshotTests(unittest.TestCase):
+    def test_kvm_identity_reads_rm10_firmware_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "etc").mkdir()
+            (root / "etc/version").write_text("RK_MODEL=RM10\nRK_VERSION=V1.9.1 release1\n")
+            (root / "etc/os-release").write_text('PRETTY_NAME="Buildroot 2024.02"\n')
+            with mock.patch.object(socket, "gethostname", return_value="glkvm"):
+                identity = read_kvm_identity(root)
+        self.assertEqual(identity, {
+            "model": "GL.iNet Comet Pro",
+            "modelCode": "RM10",
+            "firmwareVersion": "V1.9.1 release1",
+            "platformVersion": "Buildroot 2024.02",
+            "hostname": "glkvm",
+        })
+
     def test_remote_collector_is_valid_python(self):
         compile(REMOTE_COLLECTOR, "<remote_collector>", "exec")
         compile(REMOTE_ACTIVITY_PROBE, "<remote_activity_probe>", "exec")

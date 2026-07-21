@@ -43,6 +43,52 @@ export function posixShell() {
 // Mirrors Find-Python in helper/find-python.ps1: probe candidates and keep the first that
 // actually executes, skipping the Store stubs under WindowsApps. Returns null when nothing
 // usable exists — callers decide whether that is fatal.
+function versionParts(name) {
+  const uv = name.match(/cpython-(\d+)\.(\d+)(?:\.(\d+))?/i);
+  if (uv) return [Number(uv[1]), Number(uv[2]), Number(uv[3] ?? 0)];
+  // python.org's default directories are named Python313, Python312, etc.
+  const pythonOrg = name.match(/^Python(\d)(\d+)/i);
+  return pythonOrg ? [Number(pythonOrg[1]), Number(pythonOrg[2]), 0] : [0, 0, 0];
+}
+
+function byVersionDesc(a, b) {
+  const [a1, a2, a3] = versionParts(a);
+  const [b1, b2, b3] = versionParts(b);
+  return b1 - a1 || b2 - a2 || b3 - a3;
+}
+
+// A python.org install is usable even when the user leaves "Add python.exe to PATH"
+// unchecked. Cover the per-user and all-users default locations; KVM_PYTHON remains the
+// escape hatch for a custom installation directory.
+export function pythonOrgInstallCandidates(env = process.env) {
+  const roots = [];
+  if (env.LOCALAPPDATA) {
+    roots.push(join(env.LOCALAPPDATA, "Programs", "Python"));
+  }
+  for (const root of [env.ProgramFiles, env["ProgramFiles(x86)"]]) {
+    if (root) roots.push(root);
+  }
+
+  const found = [];
+  for (const root of roots) {
+    if (!existsSync(root)) continue;
+    let entries;
+    try {
+      entries = readdirSync(root, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    const directories = entries
+      .filter((item) => item.isDirectory())
+      .sort((a, b) => byVersionDesc(a.name, b.name));
+    for (const entry of directories) {
+      if (!/^Python\d+/i.test(entry.name)) continue;
+      found.push(join(root, entry.name, "python.exe"));
+    }
+  }
+  return found;
+}
+
 export function findPython() {
   if (process.env.KVM_PYTHON) return process.env.KVM_PYTHON;
 
@@ -52,19 +98,11 @@ export function findPython() {
     if (existsSync(uvRoot)) {
       // Sort by parsed version, not by name: a string sort ranks "cpython-3.9" above
       // "cpython-3.14" and would pick the oldest interpreter installed.
-      const version = (name) => {
-        const match = name.match(/cpython-(\d+)\.(\d+)(?:\.(\d+))?/);
-        return match ? [Number(match[1]), Number(match[2]), Number(match[3] ?? 0)] : [0, 0, 0];
-      };
-      const byVersionDesc = (a, b) => {
-        const [a1, a2, a3] = version(a);
-        const [b1, b2, b3] = version(b);
-        return b1 - a1 || b2 - a2 || b3 - a3;
-      };
       for (const dir of readdirSync(uvRoot).sort(byVersionDesc)) {
         candidates.push(join(uvRoot, dir, "python.exe"));
       }
     }
+    candidates.push(...pythonOrgInstallCandidates());
     const where = spawnSync("where.exe", ["python.exe", "python3.exe", "py.exe"], { encoding: "utf8" });
     for (const line of `${where.stdout ?? ""}`.split(/\r?\n/)) {
       const exe = line.trim();
