@@ -477,7 +477,10 @@ def claude_scan():
                         message = event.get("message") if isinstance(event.get("message"), dict) else {}
                         usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
                         timestamp = str(event.get("timestamp") or "")
-                        day = datetime.date.fromisoformat(timestamp[:10])
+                        # Transcript timestamps are UTC; bucket by LOCAL date so "today" matches the
+                        # KVM's own local day (it rejects and renders by local date). Bucketing by the
+                        # raw UTC date pushed evening usage into a "tomorrow" bucket the KVM dropped.
+                        day = datetime.datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone().date()
                         if event.get("type") != "assistant" or day < cutoff or not usage:
                             continue
                         message_id = message.get("id") or event.get("uuid") or (path.name + ":" + str(index))
@@ -578,7 +581,7 @@ def _codex_limit(value):
     return entry
 
 
-def codex_usage_payload():
+def codex_usage_fresh():
     """Codex plan/limits/daily-tokens via `codex app-server`, or None when codex is absent or the
     handshake yields nothing. Never raises — usage collection must not break the push cycle."""
     codex = codex_binary()
@@ -648,6 +651,50 @@ def codex_usage_payload():
     if daily:
         payload["daily"] = daily[-31:]
     return payload
+
+
+# --- codex usage cache: `codex app-server` is a heavy Node process (~275 MB) spawned only to read
+# --- usage, so run it at most once per CODEX_MIN_FETCH_SECONDS and reuse the last good payload,
+# --- keeping each per-minute push light. Working state is separate (poll-activity) and unaffected.
+CODEX_MIN_FETCH_SECONDS = 240
+CODEX_MAX_AGE_SECONDS = 24 * 3600
+
+
+def codex_cache_path():
+    return config_dir() / "codex-usage-cache.json"
+
+
+def codex_usage_payload():
+    now = time.time()
+    try:
+        cache = json.loads(codex_cache_path().read_text())
+    except Exception:
+        cache = None
+    if isinstance(cache, dict):
+        attempted_age = now - (number(cache.get("attemptedAt")) or 0)
+        fetched_age = now - (number(cache.get("fetchedAt")) or 0)
+        if 0 <= attempted_age < CODEX_MIN_FETCH_SECONDS:
+            payload = cache.get("payload")
+            return payload if (payload and 0 <= fetched_age < CODEX_MAX_AGE_SECONDS) else None
+    payload = codex_usage_fresh()
+    previous = cache if isinstance(cache, dict) else {}
+    entry = {
+        "attemptedAt": now,
+        "fetchedAt": now if payload else (number(previous.get("fetchedAt")) or 0),
+        "payload": payload if payload else previous.get("payload"),
+    }
+    try:
+        config_dir().mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = codex_cache_path()
+        path.write_text(json.dumps(entry))
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+    if payload:
+        return payload
+    if 0 <= (now - (number(previous.get("fetchedAt")) or 0)) < CODEX_MAX_AGE_SECONDS:
+        return previous.get("payload")
+    return None
 
 
 def claude_usage_payload():
