@@ -15,7 +15,9 @@ test("macOS app and Homebrew cask versions match the package", () => {
   assert.match(cask, /KVM-AI-Monitor-v#\{version\}\.zip/);
 });
 
-test("desktop release packager remains executable", () => {
+// The executable bit is a POSIX concept; Windows checkouts don't carry it, and the release only
+// runs on the macOS runner. Skip this assertion on Windows rather than fail spuriously.
+test("desktop release packager remains executable", { skip: process.platform === "win32" }, () => {
   const mode = statSync(join(root, "desktop", "package-release.sh")).mode;
   assert.notEqual(mode & 0o111, 0);
 });
