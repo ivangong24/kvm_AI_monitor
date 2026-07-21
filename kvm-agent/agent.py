@@ -946,6 +946,67 @@ def save_png_atomic(image: Image.Image, output_path: Path, compress_level: int |
             os.unlink(temporary)
 
 
+def read_system_stats() -> dict[str, object]:
+    """Best-effort Comet Pro (Linux) health — CPU %, memory, temperature, load, uptime. Returns
+    only the fields it can read; on a non-Linux host (e.g. a dev Mac) it returns an empty dict, so
+    the web console simply hides the panel there."""
+    stats: dict[str, object] = {}
+    try:
+        meminfo: dict[str, int] = {}
+        with open("/proc/meminfo") as stream:
+            for line in stream:
+                key, _, rest = line.partition(":")
+                meminfo[key.strip()] = int(rest.strip().split()[0])
+        total = meminfo.get("MemTotal", 0)
+        available = meminfo.get("MemAvailable", meminfo.get("MemFree", 0))
+        if total:
+            used = max(0, total - available)
+            stats["memTotalMb"] = round(total / 1024)
+            stats["memUsedMb"] = round(used / 1024)
+            stats["memPercent"] = round(100 * used / total)
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        def sample() -> tuple[int, int]:
+            with open("/proc/stat") as stream:
+                fields = [int(value) for value in stream.readline().split()[1:]]
+            idle = fields[3] + (fields[4] if len(fields) > 4 else 0)
+            return sum(fields), idle
+        total1, idle1 = sample()
+        time.sleep(0.12)
+        total2, idle2 = sample()
+        delta = total2 - total1
+        if delta > 0:
+            stats["cpuPercent"] = max(0, min(100, round(100 * (delta - (idle2 - idle1)) / delta)))
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        temperatures: list[float] = []
+        thermal_root = "/sys/class/thermal"
+        for zone in os.listdir(thermal_root):
+            if not zone.startswith("thermal_zone"):
+                continue
+            try:
+                with open(os.path.join(thermal_root, zone, "temp")) as stream:
+                    temperatures.append(int(stream.read().strip()) / 1000)
+            except (OSError, ValueError):
+                continue
+        if temperatures:
+            stats["tempC"] = round(max(temperatures), 1)
+    except OSError:
+        pass
+    try:
+        stats["load1"] = round(os.getloadavg()[0], 2)
+    except OSError:
+        pass
+    try:
+        with open("/proc/uptime") as stream:
+            stats["uptimeSec"] = int(float(stream.read().split()[0]))
+    except (OSError, ValueError):
+        pass
+    return stats
+
+
 def compose_wallpaper(snapshot: dict[str, object], provider_id: str = "claude",
                       animation_frame: int = 0, theme_override: dict[str, object] | None = None,
                       display_override: dict[str, object] | None = None,
@@ -982,13 +1043,25 @@ def compose_wallpaper(snapshot: dict[str, object], provider_id: str = "claude",
     else:
         status_text = "WORK" if is_active else "READY"
     status_color = str(theme["secondary"]) if is_active else str(theme["muted"])
-    draw_text(draw, ((GLYPH_CENTER[0] + 15) * s, GLYPH_CENTER[1] * s), status_text,
-              load_font(FONT_UI_SEMIBOLD, 8 * s), status_color, "lm")
+    # Working-status chip: a rounded pill with a leading dot behind the WORK/READY label, mirroring
+    # the web console's live-view design so the two surfaces match.
+    status_font = load_font(FONT_UI_SEMIBOLD, 8 * s)
+    status_x = (GLYPH_CENTER[0] + 18) * s
+    status_y = GLYPH_CENTER[1] * s
+    status_w = draw.textlength(status_text, font=status_font)
+    pill_half = 7 * s
+    draw.rounded_rectangle(
+        ((GLYPH_CENTER[0] + 11) * s, status_y - pill_half, status_x + status_w + 6 * s, status_y + pill_half),
+        radius=pill_half, fill=blend_color(status_color, top_color, 0.20))
+    dot_r = 2 * s
+    dot_cx = (GLYPH_CENTER[0] + 14.5) * s
+    draw.ellipse((dot_cx - dot_r, status_y - dot_r, dot_cx + dot_r, status_y + dot_r), fill=status_color)
+    draw_text(draw, (status_x, status_y), status_text, status_font, status_color, "lm")
     # Current subscription plan (e.g. PRO / PLUS / MAX), drawn in the always-visible header so it
     # shows for whichever provider is selected and updates automatically as the plan push changes.
     plan_text = str(provider.get("plan") or "").strip().upper()[:14]
     if plan_text and connection_state in ("", "ready"):
-        draw_text(draw, ((GLYPH_CENTER[0] + 15) * s, (GLYPH_CENTER[1] + 11) * s), plan_text,
+        draw_text(draw, ((GLYPH_CENTER[0] + 18) * s, (GLYPH_CENTER[1] + 12) * s), plan_text,
                   load_font(FONT_UI_SEMIBOLD, 8 * s), str(theme.get("bar", theme["accent"])), "lm")
 
     if usage_panel_visible(provider, limits):
@@ -1182,12 +1255,14 @@ class Agent:
         }
 
     def status(self) -> dict[str, object]:
+        system = read_system_stats()  # samples CPU over ~0.12s; done outside the lock
         with self.lock:
             return {
                 **self.config,
                 **self.state,
                 "agentVersion": AGENT_VERSION,
                 "kvmIdentity": self.kvm_identity,
+                "system": system,
                 "resolvedDeviceHost": self.resolved_device_host,
                 "sshPublicKey": self.collector.public_key(),
                 "collectionMode": "kvm-ssh-pull",

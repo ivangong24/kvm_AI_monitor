@@ -214,31 +214,22 @@ final class MonitorModel: ObservableObject {
 // everything is live; a hollow screen means setup is still needed. Template art adapts to the
 // menu bar's light/dark tint automatically.
 func statusBarIcon(healthy: Bool) -> NSImage {
-    let size = NSSize(width: 19, height: 15)
+    let size = NSSize(width: 18, height: 14)
     let image = NSImage(size: size)
     image.lockFocus()
     NSColor.black.setStroke()
     NSColor.black.setFill()
 
-    // Depth hint: a short top-back edge for the 3/4 look.
-    let topEdge = NSBezierPath()
-    topEdge.move(to: NSPoint(x: 4.5, y: 12.4))
-    topEdge.line(to: NSPoint(x: 7.5, y: 13.6))
-    topEdge.line(to: NSPoint(x: 16.5, y: 13.6))
-    topEdge.lineWidth = 1.2
-    topEdge.lineCapStyle = .round
-    topEdge.lineJoinStyle = .round
-    topEdge.stroke()
-
-    let body = NSBezierPath(roundedRect: NSRect(x: 2, y: 1.6, width: 13, height: 10.8), xRadius: 2.2, yRadius: 2.2)
-    body.lineWidth = 1.3
+    let body = NSBezierPath(roundedRect: NSRect(x: 1.6, y: 1.7, width: 14.8, height: 10.6), xRadius: 2.6, yRadius: 2.6)
+    body.lineWidth = 1.4
     body.stroke()
 
-    let screen = NSBezierPath(roundedRect: NSRect(x: 4.1, y: 5.2, width: 8.8, height: 4.6), xRadius: 1, yRadius: 1)
+    // Filled screen means everything is live; a hollow screen means setup is still needed.
+    let screen = NSBezierPath(roundedRect: NSRect(x: 4.2, y: 4.6, width: 9.6, height: 4.8), xRadius: 1.2, yRadius: 1.2)
     if healthy {
         screen.fill()
     } else {
-        screen.lineWidth = 1.1
+        screen.lineWidth = 1.2
         screen.stroke()
     }
     image.unlockFocus()
