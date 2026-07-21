@@ -29,10 +29,16 @@ struct ProviderPayload: Decodable {
     let limits: [LimitPayload]?
     let daily: [DailyPayload]?
     let models: [ModelPayload]?
+    let platforms: [PlatformPayload]?
 }
 
 struct ModelPayload: Decodable {
     let model: String
+    let tokens: Double
+}
+
+struct PlatformPayload: Decodable {
+    let platform: String
     let tokens: Double
 }
 
@@ -508,7 +514,7 @@ struct CompanionPanel: View {
         }
         .frame(width: 382, height: 560)
         .background(.regularMaterial)
-        .onAppear { model.refresh() }
+        .onAppear { model.refresh(); model.loadUsage() }
     }
 
     // MARK: Header
@@ -551,6 +557,7 @@ struct CompanionPanel: View {
         VStack(alignment: .leading, spacing: 14) {
             statusIntro
             if model.kvms.isEmpty { emptyState } else { kvmList }
+            touchscreenSection
             metrics
             actions
             if let notice = model.notice {
@@ -561,6 +568,21 @@ struct CompanionPanel: View {
             }
         }
         .padding(16)
+    }
+
+    @ViewBuilder
+    private var touchscreenSection: some View {
+        if let usage = model.appUsage, let first = usage.providers.first {
+            let workingId = usage.working.first(where: { $0.value })?.key
+            let provider = usage.providers.first(where: { $0.provider == workingId })
+                ?? usage.providers.first(where: { $0.provider == model.usageProvider })
+                ?? first
+            VStack(alignment: .leading, spacing: 8) {
+                Text("COMET PRO TOUCHSCREEN")
+                    .font(.system(size: 9, weight: .bold)).tracking(0.9).foregroundStyle(.secondary)
+                TouchscreenCard(provider: provider, working: usage.working[provider.provider] ?? false)
+            }
+        }
     }
 
     private var statusIntro: some View {
@@ -809,6 +831,17 @@ func prettyModel(_ raw: String) -> String {
     return parts.isEmpty ? name : "\(name) \(parts.joined(separator: "."))"
 }
 
+// Transcript `entrypoint` → friendly surface name.
+func prettyPlatform(_ raw: String) -> String {
+    switch raw.lowercased() {
+    case "cli": return "CLI"
+    case "claude-desktop": return "Desktop app"
+    case "sdk-cli", "sdk": return "SDK"
+    case "vscode": return "VS Code"
+    default: return raw.replacingOccurrences(of: "-", with: " ").capitalized
+    }
+}
+
 func resetRelative(_ iso: String?) -> String? {
     guard let iso else { return nil }
     let formatter = ISO8601DateFormatter()
@@ -946,7 +979,8 @@ struct UsagePanel: View {
                 workingCard(provider)
                 limitsCard(provider)
                 dailyCard(provider)
-                compositionCard(provider)
+                modelsCard(provider)
+                platformsCard(provider)
             } else if model.usageLoading {
                 loadingView
             } else {
@@ -1016,25 +1050,36 @@ struct UsagePanel: View {
         }
     }
 
-    private func compositionCard(_ provider: ProviderPayload) -> some View {
+    private func donutCard(_ title: String, pairs: [(String, Double)], emptyNote: String) -> some View {
         let palette: [Color] = [
             accent, Color(red: 0.28, green: 0.7, blue: 0.55), Color(red: 0.85, green: 0.6, blue: 0.25),
             Color(red: 0.6, green: 0.45, blue: 0.85), Color(red: 0.9, green: 0.42, blue: 0.42), Color.gray,
         ]
-        let models = (provider.models ?? []).filter { $0.tokens > 0 }
-        var slices: [DonutSlice] = models.prefix(5).enumerated().map { index, model in
-            DonutSlice(label: prettyModel(model.model), value: model.tokens, color: palette[index % palette.count])
+        let filtered = pairs.filter { $0.1 > 0 }
+        var slices: [DonutSlice] = Array(filtered.prefix(5).enumerated()).map { index, pair in
+            DonutSlice(label: pair.0, value: pair.1, color: palette[index % palette.count])
         }
-        let remainder = models.dropFirst(5).reduce(0) { $0 + $1.tokens }
+        let remainder = filtered.dropFirst(5).reduce(0) { $0 + $1.1 }
         if remainder > 0 { slices.append(DonutSlice(label: "Other", value: remainder, color: palette[5])) }
-        return card("Models · 30 days") {
+        return card(title) {
             if slices.isEmpty {
-                Text("Per-model usage isn’t reported by \(MonitorModel.providerName(provider.provider)).")
-                    .font(.system(size: 12)).foregroundStyle(.secondary)
+                Text(emptyNote).font(.system(size: 12)).foregroundStyle(.secondary)
             } else {
                 DonutChart(slices: slices)
             }
         }
+    }
+
+    private func modelsCard(_ provider: ProviderPayload) -> some View {
+        donutCard("Models · 30 days",
+                  pairs: (provider.models ?? []).map { (prettyModel($0.model), $0.tokens) },
+                  emptyNote: "Per-model usage isn’t reported by \(MonitorModel.providerName(provider.provider)).")
+    }
+
+    private func platformsCard(_ provider: ProviderPayload) -> some View {
+        donutCard("Where it runs · 30 days",
+                  pairs: (provider.platforms ?? []).map { (prettyPlatform($0.platform), $0.tokens) },
+                  emptyNote: "Per-platform usage isn’t reported by \(MonitorModel.providerName(provider.provider)).")
     }
 
     private func card<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
@@ -1064,6 +1109,147 @@ struct UsagePanel: View {
             Text("Reading usage from this Mac…").font(.system(size: 12)).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity).padding(24)
+    }
+}
+
+// MARK: - Live touchscreen (native reproduction of the KVM screen)
+
+extension Color {
+    init(hex: String) {
+        let string = hex.hasPrefix("#") ? String(hex.dropFirst()) : hex
+        var value: UInt64 = 0
+        Scanner(string: string).scanHexInt64(&value)
+        self.init(.sRGB, red: Double((value >> 16) & 0xff) / 255,
+                  green: Double((value >> 8) & 0xff) / 255, blue: Double(value & 0xff) / 255, opacity: 1)
+    }
+}
+
+struct ScreenTheme { let background, text, muted, line, bar, secondary: Color }
+
+func screenTheme(_ id: String) -> ScreenTheme {
+    switch id {
+    case "codex": return ScreenTheme(background: Color(hex: "f5f5f2"), text: Color(hex: "101312"), muted: Color(hex: "68716e"), line: Color(hex: "cbd1ce"), bar: Color(hex: "10a37f"), secondary: Color(hex: "10a37f"))
+    case "copilot": return ScreenTheme(background: Color(hex: "f6f8fa"), text: Color(hex: "24292f"), muted: Color(hex: "68717c"), line: Color(hex: "d0d7de"), bar: Color(hex: "8534f3"), secondary: Color(hex: "fe4c25"))
+    case "gemini": return ScreenTheme(background: Color(hex: "f7f9fc"), text: Color(hex: "202124"), muted: Color(hex: "6c727b"), line: Color(hex: "d2d8e2"), bar: Color(hex: "4285f4"), secondary: Color(hex: "9168c0"))
+    case "grok": return ScreenTheme(background: Color(hex: "050505"), text: Color(hex: "f7f7f7"), muted: Color(hex: "a0a0a0"), line: Color(hex: "353535"), bar: Color(hex: "f7f7f7"), secondary: Color(hex: "8d99a1"))
+    default: return ScreenTheme(background: Color(hex: "0d1112"), text: Color(hex: "f4f5f2"), muted: Color(hex: "939b98"), line: Color(hex: "303637"), bar: Color(hex: "d97757"), secondary: Color(hex: "53d59c"))
+    }
+}
+
+func providerBrand(_ id: String) -> (String, String) {
+    ["claude": ("CLAUDE", "CODE"), "codex": ("CODEX", "OPENAI"), "copilot": ("COPILOT", "GITHUB"),
+     "gemini": ("GEMINI", "CLI"), "grok": ("GROK", "BUILD")][id] ?? (id.uppercased(), "")
+}
+
+func providerLogoImage(_ id: String) -> NSImage? {
+    guard let url = Bundle.main.resourceURL?.appendingPathComponent("providers/\(id).png") else { return nil }
+    return NSImage(contentsOf: url)
+}
+
+private struct WorkingGlyph: View {
+    let working: Bool
+    let color: Color
+
+    var body: some View {
+        if working {
+            TimelineView(.animation) { context in
+                let time = context.date.timeIntervalSinceReferenceDate
+                HStack(spacing: 1.6) {
+                    ForEach(0..<4, id: \.self) { index in
+                        Capsule().fill(color).frame(width: 2.2, height: 4 + 8 * abs(sin(time * 3 + Double(index) * 0.6)))
+                    }
+                }
+                .frame(height: 12)
+            }
+        } else {
+            Circle().fill(color).frame(width: 6, height: 6)
+        }
+    }
+}
+
+struct TouchscreenCard: View {
+    let provider: ProviderPayload
+    let working: Bool
+
+    var body: some View {
+        let theme = screenTheme(provider.provider)
+        let brand = providerBrand(provider.provider)
+        let today = (provider.daily ?? []).last?.totalTokens ?? 0
+        let limits = Array((provider.limits ?? []).prefix(2))
+        return VStack {
+            screen(theme: theme, brand: brand, today: today, limits: limits)
+                .padding(11)
+                .frame(maxWidth: .infinity)
+                .aspectRatio(3, contentMode: .fit)
+                .background(theme.background)
+                .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+        }
+        .padding(11)
+        .background(LinearGradient(colors: [Color(white: 0.2), Color(white: 0.08)], startPoint: .top, endPoint: .bottom))
+        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .shadow(color: .black.opacity(0.3), radius: 8, y: 3)
+    }
+
+    private func screen(theme: ScreenTheme, brand: (String, String), today: Double, limits: [LimitPayload]) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Group {
+                    if let image = providerLogoImage(provider.provider) {
+                        Image(nsImage: image).resizable().scaledToFit()
+                    } else {
+                        RoundedRectangle(cornerRadius: 5).fill(theme.bar)
+                    }
+                }
+                .frame(width: 22, height: 22)
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(brand.0).font(.system(size: 12, weight: .heavy)).foregroundStyle(theme.text)
+                    Text(brand.1).font(.system(size: 8, weight: .semibold)).tracking(0.5).foregroundStyle(theme.muted)
+                }
+                Spacer()
+                HStack(spacing: 5) {
+                    WorkingGlyph(working: working, color: working ? theme.secondary : theme.muted)
+                    Text(working ? "WORK" : "READY").font(.system(size: 9, weight: .bold)).foregroundStyle(working ? theme.secondary : theme.muted)
+                }
+                .padding(.horizontal, 8).padding(.vertical, 4)
+                .background((working ? theme.secondary : theme.muted).opacity(0.16), in: Capsule())
+            }
+            Spacer(minLength: 2)
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("TODAY").font(.system(size: 8, weight: .semibold)).tracking(0.5).foregroundStyle(theme.muted)
+                    Text(tokenShort(today)).font(.system(size: 20, weight: .heavy)).foregroundStyle(theme.text)
+                }
+                Rectangle().fill(theme.line).frame(width: 1).frame(maxHeight: .infinity)
+                VStack(spacing: 7) {
+                    if limits.isEmpty {
+                        Text("Waiting for usage").font(.system(size: 9)).foregroundStyle(theme.muted).frame(maxWidth: .infinity, alignment: .leading)
+                    } else {
+                        ForEach(Array(limits.enumerated()), id: \.offset) { _, limit in
+                            miniLimit(limit, theme: theme)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity)
+            }
+        }
+    }
+
+    private func miniLimit(_ limit: LimitPayload, theme: ScreenTheme) -> some View {
+        let percent = limit.usedPercent ?? 0
+        return VStack(alignment: .leading, spacing: 3) {
+            HStack {
+                Text((limit.label ?? "Limit").uppercased()).font(.system(size: 7, weight: .semibold)).tracking(0.3).foregroundStyle(theme.muted)
+                Spacer()
+                Text(limit.usedPercent == nil ? "--" : "\(Int(percent))%").font(.system(size: 8, weight: .semibold)).foregroundStyle(theme.text)
+            }
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(theme.line).frame(height: 5)
+                    Capsule().fill(theme.bar).frame(width: max(5, geo.size.width * CGFloat(min(100, percent)) / 100), height: 5)
+                }
+            }
+            .frame(height: 5)
+        }
     }
 }
 

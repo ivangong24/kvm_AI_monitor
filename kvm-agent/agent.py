@@ -26,7 +26,7 @@ from push_receiver import DeviceStore, PushReceiver
 from ssh_collector import SshCollector, build_usage_snapshot
 
 
-AGENT_VERSION = "1.6.0"  # Keep in step with package.json; surfaced on /api/status for updates.
+AGENT_VERSION = "0.7.0"  # Keep in step with package.json; surfaced on /api/status for updates.
 
 ROOT = Path(os.environ.get("KVM_AI_USAGE_ROOT", "/etc/kvmd/user/ai-usage"))
 CONFIG_PATH = Path(os.environ.get("KVM_AI_USAGE_CONFIG", ROOT / "config.json"))

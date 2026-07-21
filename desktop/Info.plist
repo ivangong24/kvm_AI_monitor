@@ -8,10 +8,12 @@
   <string>com.kvm-ai-monitor.menubar</string>
   <key>CFBundleExecutable</key>
   <string>KVM AI Monitor</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.6.0</string>
+  <string>0.7.0</string>
   <key>CFBundleVersion</key>
-  <string>1.6.0</string>
+  <string>0.7.0</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>LSMinimumSystemVersion</key>

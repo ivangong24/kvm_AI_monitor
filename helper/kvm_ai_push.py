@@ -459,13 +459,15 @@ def account_limits():
 # --- adapter d: local daily token totals (faithful port of ssh_collector.claude_daily) ---
 
 def claude_scan():
-    """One pass over Claude transcripts → (per-day token totals, per-model token totals) for the
-    last 30 days. Shared by claude_daily() and the usage payload so the files are read only once."""
+    """One pass over Claude transcripts → (per-day totals, per-model totals, per-platform totals)
+    for the last 30 days. Platform is the transcript `entrypoint` (cli / claude-desktop / sdk-cli);
+    web and API usage are server-side and never appear locally. Shared by claude_daily() and the
+    usage payload so the files are read only once."""
     root = pathlib.Path.home() / ".claude/projects"
     cutoff = datetime.date.today() - datetime.timedelta(days=29)
     messages = {}
     if not root.is_dir():
-        return [], []
+        return [], [], []
     for path in root.rglob("*.jsonl"):
         try:
             with path.open(errors="replace") as stream:
@@ -482,6 +484,7 @@ def claude_scan():
                         values = {
                             "date": day.isoformat(),
                             "model": str(message.get("model") or ""),
+                            "platform": str(event.get("entrypoint") or ""),
                             "inputTokens": number(usage.get("input_tokens")) or 0,
                             "outputTokens": number(usage.get("output_tokens")) or 0,
                             "cacheReadTokens": number(usage.get("cache_read_input_tokens")) or 0,
@@ -492,6 +495,7 @@ def claude_scan():
                             for key in ("inputTokens", "outputTokens", "cacheReadTokens", "cacheCreationTokens"):
                                 values[key] = max(values[key], previous[key])
                             values["model"] = values["model"] or previous.get("model", "")
+                            values["platform"] = values["platform"] or previous.get("platform", "")
                         messages[message_id] = values
                     except Exception:
                         continue
@@ -499,6 +503,7 @@ def claude_scan():
             continue
     by_day = {}
     by_model = {}
+    by_platform = {}
     for value in messages.values():
         day = by_day.setdefault(value["date"], {"date": value["date"], "inputTokens": 0, "outputTokens": 0, "cacheReadTokens": 0, "cacheCreationTokens": 0, "totalTokens": 0})
         subtotal = 0
@@ -509,10 +514,15 @@ def claude_scan():
         model = value.get("model") or ""
         if model and not model.startswith("<"):
             by_model[model] = by_model.get(model, 0) + subtotal
+        platform = value.get("platform") or ""
+        if platform:
+            by_platform[platform] = by_platform.get(platform, 0) + subtotal
     daily = [by_day[key] for key in sorted(by_day)]
     models = [{"model": name, "tokens": by_model[name]}
               for name in sorted(by_model, key=lambda name: -by_model[name]) if by_model[name] > 0]
-    return daily, models
+    platforms = [{"platform": name, "tokens": by_platform[name]}
+                 for name in sorted(by_platform, key=lambda name: -by_platform[name]) if by_platform[name] > 0]
+    return daily, models, platforms
 
 
 def claude_daily():
@@ -651,11 +661,13 @@ def claude_usage_payload():
         payload["plan"] = plan
     if limits:
         payload["limits"] = limits[:8]
-    daily, models = claude_scan()
+    daily, models, platforms = claude_scan()
     if daily:
         payload["daily"] = daily[-31:]
     if models:
         payload["models"] = models
+    if platforms:
+        payload["platforms"] = platforms
     return payload
 
 
