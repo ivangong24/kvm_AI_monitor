@@ -43,6 +43,7 @@ FONTS_PATH = Path(os.environ.get("KVM_AI_USAGE_FONTS", ROOT / "fonts"))
 THEME_PATH = Path(os.environ.get("KVM_AI_USAGE_THEME", ROOT / "themes" / "default.json"))
 INDEX_PATH = Path(os.environ.get("KVM_AI_USAGE_INDEX", ROOT / "index.html"))
 ICON_PATH = Path(os.environ.get("KVM_AI_USAGE_ICON", ROOT / "icon.svg"))
+COMET_IMAGE_PATH = Path(os.environ.get("KVM_AI_USAGE_COMET_IMAGE", ROOT / "comet-pro.jpg"))
 SSH_KEY_PATH = Path(os.environ.get("KVM_AI_USAGE_SSH_KEY", ROOT / "device-key"))
 PORT = int(os.environ.get("KVM_AI_USAGE_PORT", "8199"))
 PUBLISH_ENABLED = os.environ.get("KVM_AI_USAGE_NO_PUBLISH") != "1"
@@ -75,6 +76,7 @@ ANIMATION_RENDER_SCALE = 4
 ANIMATION_FRAMES_DIR = ANIMATION_FRAMES_ROOT / "kvm-ai-frames"
 WORKING_POLL_SECONDS = 5.0
 PUSH_BODY_LIMIT = 64 * 1024
+KVM_MODEL_NAMES = {"RM10": "GL.iNet Comet Pro"}
 
 # Built-in provider themes; kvm-agent/themes/default.json ships the same values as editable
 # data and load_providers() validates and overlays it, falling back here on any problem.
@@ -117,6 +119,35 @@ THEME_COLOR_KEYS = (
 THEME_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 GLYPH_STYLES = frozenset(BUILTIN_PROVIDERS)
 DEFAULT_DISPLAY = {"limitEmphasis": "percent"}
+
+
+def _key_value_file(path: Path) -> dict[str, str]:
+    """Read the small KEY=value files shipped by the Comet firmware."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")[:4096]
+    except OSError:
+        return {}
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip('"\'')
+    return values
+
+
+def read_kvm_identity(root: Path = Path("/")) -> dict[str, str]:
+    """Return non-sensitive hardware/firmware facts for the dashboard device drawer."""
+    version = _key_value_file(root / "etc/version")
+    os_release = _key_value_file(root / "etc/os-release")
+    model_code = version.get("RK_MODEL", "RM10")
+    return {
+        "model": KVM_MODEL_NAMES.get(model_code, model_code or "GL.iNet Comet Pro"),
+        "modelCode": model_code,
+        "firmwareVersion": version.get("RK_VERSION") or os_release.get("VERSION") or "Unknown",
+        "platformVersion": os_release.get("PRETTY_NAME") or os_release.get("NAME") or "Buildroot",
+        "hostname": socket.gethostname(),
+    }
 
 # --- widget layouts: everything below the fixed brand/status header is composed from widget
 # --- placements (rects in 1x canvas units). Presets ship the arrangements; custom layouts
@@ -786,6 +817,38 @@ def draw_activity_glyph(image: Image.Image, provider_id: str, center: tuple[int,
     image.paste(glyph, (center[0] - size // 2, center[1] - size // 2))
 
 
+def summarize_usage(provider: dict[str, object]) -> dict[str, object]:
+    """Compact numeric usage for the web console's live on-screen reproduction. The touchscreen
+    itself is rendered server-side to a PNG; the browser rebuilds the same content as crisp vectors
+    from this block instead of upscaling that image."""
+    now = datetime.now(timezone.utc)
+    limits_raw = provider.get("limits") if isinstance(provider.get("limits"), list) else []
+    limits: list[dict[str, object]] = []
+    for item in limits_raw:
+        if not isinstance(item, dict):
+            continue
+        percent, has_percent = limit_percent(item)
+        window = window_label(item, "")
+        limits.append({
+            "label": item.get("label"),
+            "usedPercent": round(percent) if has_percent else None,
+            "windowLabel": window or None,
+            "resetsAt": item.get("resetsAt"),
+            "resetLabel": short_reset(item.get("resetsAt")) if item.get("resetsAt") else None,
+        })
+    activity = provider.get("activity") if isinstance(provider.get("activity"), dict) else {}
+    today = activity.get("today") if isinstance(activity.get("today"), dict) else {}
+    return {
+        "trackedTokenTotalsAvailable": provider.get("trackedTokenTotalsAvailable") is True,
+        "creditsRemaining": provider.get("creditsRemaining"),
+        "limits": limits,
+        "todayTokens": today.get("tokens"),
+        "last30DaysTokens": activity.get("last30DaysTokens"),
+        "lastUsedAt": activity.get("lastUsedAt"),
+        "generatedAt": now.isoformat(),
+    }
+
+
 def summarize_provider(provider: dict[str, object]) -> dict[str, object]:
     installation = provider.get("installation") if isinstance(provider.get("installation"), dict) else {}
     authentication = provider.get("authentication") if isinstance(provider.get("authentication"), dict) else {}
@@ -803,6 +866,7 @@ def summarize_provider(provider: dict[str, object]) -> dict[str, object]:
         "capabilityNote": provider.get("capabilityNote"),
         "installation": installation,
         "authentication": authentication,
+        "usage": summarize_usage(provider),
     }
 
 
@@ -1094,6 +1158,7 @@ class Agent:
         self.collector = SshCollector(SSH_KEY_PATH)
         self.devices = DeviceStore(DEVICES_PATH)
         self.push = PushReceiver(self.devices, PUSH_STATE_PATH)
+        self.kvm_identity = read_kvm_identity()
         self.resolved_device_host: str | None = None
         self.snapshot: dict[str, object] | None = None
         self.animation_frames: list[Path] = []
@@ -1122,6 +1187,7 @@ class Agent:
                 **self.config,
                 **self.state,
                 "agentVersion": AGENT_VERSION,
+                "kvmIdentity": self.kvm_identity,
                 "resolvedDeviceHost": self.resolved_device_host,
                 "sshPublicKey": self.collector.public_key(),
                 "collectionMode": "kvm-ssh-pull",
@@ -1519,6 +1585,8 @@ class Handler(BaseHTTPRequestHandler):
             self.serve_file(INDEX_PATH, "text/html; charset=utf-8")
         elif path == "/icon.svg":
             self.serve_file(ICON_PATH, "image/svg+xml", "public, max-age=3600")
+        elif path == "/comet-pro.jpg":
+            self.serve_file(COMET_IMAGE_PATH, "image/jpeg", "public, max-age=86400")
         elif path.startswith("/providers/") and path.endswith(".png"):
             name = path.removeprefix("/providers/")
             if name.removesuffix(".png") in PROVIDER_IDS and "/" not in name:

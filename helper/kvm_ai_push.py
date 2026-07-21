@@ -789,11 +789,19 @@ def cmd_send_activity(args):
 # it is NOT a working signal — only the rollout transcript is.)
 SESSION_ACTIVE_WINDOW_SECONDS = 60
 
-# Providers detected by polling (those without a Claude-Code-style lifecycle hook). Codex has a
-# session transcript to key on; the rest have no local usage/session artifact, so — exactly like
-# the KVM's SSH probe — they fall back to "a matching process is busy". Add a provider by adding a
-# spec here; `sessions` is optional. Claude is intentionally absent: its hook is a better signal.
+# Providers detected by polling. Codex has a session transcript to key on; the rest (including
+# Claude) fall back to "a matching process is busy" — exactly like the KVM's SSH probe. Add a
+# provider by adding a spec here; `sessions` is optional.
+#
+# Claude is polled process-only so the working animation works even when the opt-in Claude Code
+# lifecycle hooks are NOT installed (the default). When the hooks ARE installed they push the same
+# active/stop events with tighter timing; the redundant poll pushes agree and are harmless. Using
+# the process signal (rather than transcript recency) keeps the tile from lingering after a turn.
 POLL_PROVIDERS = {
+    "claude": {
+        "process": re.compile(r"(?:^|/)claude(?:\s|$)", re.I),
+        "process_exclude": (" mcp", " --help", " --version"),
+    },
     "codex": {
         "process": re.compile(r"(?:^|/)codex(?:\s|$)", re.I),
         "process_exclude": (" app-server", " --help", " --version"),
@@ -931,6 +939,113 @@ def cmd_poll_activity(_args):
     _save_poll_state(next_state)
 
 
+# --- claude code lifecycle hooks (opt-in) --------------------------------------------------
+# Hooks give the tightest "Claude is working" timing but require editing the user's
+# ~/.claude/settings.json. They are OFF by default: the poller above already covers Claude, so
+# usage and a live working animation work without them. These subcommands let the menu-bar app's
+# Settings toggle enable/disable hooks without shipping the repo. Only entries whose command points
+# at our installed hook script are touched; everything else in settings.json is preserved.
+CLAUDE_SETTINGS_PATH = pathlib.Path.home() / ".claude" / "settings.json"
+HOOK_SCRIPT_PATH = pathlib.Path(__file__).resolve().with_name("kvm-ai-claude-hook.sh")
+HOOK_EVENTS = {
+    "SessionStart": "start", "UserPromptSubmit": "active", "PostToolUse": "active",
+    "Stop": "stop", "SessionEnd": "stop",
+}
+HOOK_QUOTE = '"' if sys.platform == "win32" else "'"
+
+
+def _hook_command(event):
+    return f"{HOOK_QUOTE}{HOOK_SCRIPT_PATH}{HOOK_QUOTE} {HOOK_EVENTS[event]}"
+
+
+def _hook_is_ours(command):
+    return isinstance(command, str) and "kvm-ai-claude-hook" in command
+
+
+def _load_claude_settings():
+    if CLAUDE_SETTINGS_PATH.exists():
+        try:
+            return json.loads(CLAUDE_SETTINGS_PATH.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def _save_claude_settings(settings):
+    CLAUDE_SETTINGS_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if CLAUDE_SETTINGS_PATH.exists():
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        CLAUDE_SETTINGS_PATH.with_name(f"settings.json.backup-{stamp}").write_text(CLAUDE_SETTINGS_PATH.read_text())
+    with CLAUDE_SETTINGS_PATH.open("w") as stream:
+        json.dump(settings, stream, indent=2)
+        stream.write("\n")
+
+
+def hooks_installed():
+    hooks = _load_claude_settings().get("hooks")
+    if not isinstance(hooks, dict):
+        return False
+    return any(
+        isinstance(entry, dict) and any(
+            isinstance(item, dict) and _hook_is_ours(item.get("command"))
+            for item in entry.get("hooks", [])
+        )
+        for entries in hooks.values() if isinstance(entries, list)
+        for entry in entries
+    )
+
+
+def cmd_install_hooks(args):
+    settings = _load_claude_settings()
+    hooks = settings.setdefault("hooks", {})
+    changed = False
+    for event in HOOK_EVENTS:
+        entries = hooks.setdefault(event, [])
+        command = _hook_command(event)
+        if any(isinstance(e, dict) and any(isinstance(i, dict) and i.get("command") == command
+                                           for i in e.get("hooks", [])) for e in entries):
+            continue
+        entries.append({"hooks": [{"type": "command", "command": command}]})
+        changed = True
+    if changed:
+        _save_claude_settings(settings)
+    print("on")
+
+
+def cmd_uninstall_hooks(args):
+    settings = _load_claude_settings()
+    hooks = settings.get("hooks")
+    if isinstance(hooks, dict):
+        changed = False
+        for event in list(hooks.keys()):
+            entries = hooks[event]
+            if not isinstance(entries, list):
+                continue
+            kept_entries = []
+            for entry in entries:
+                if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+                    kept_entries.append(entry)
+                    continue
+                kept = [i for i in entry["hooks"] if not (isinstance(i, dict) and _hook_is_ours(i.get("command")))]
+                if len(kept) != len(entry["hooks"]):
+                    changed = True
+                if kept:
+                    kept_entries.append({**entry, "hooks": kept})
+            if kept_entries:
+                hooks[event] = kept_entries
+            else:
+                del hooks[event]
+        if not hooks:
+            settings.pop("hooks", None)
+        if changed:
+            _save_claude_settings(settings)
+    print("off")
+
+
+def cmd_hooks_status(args):
+    print("on" if hooks_installed() else "off")
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="kvm_ai_push.py")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -960,6 +1075,10 @@ def build_parser():
     store_parser = sub.add_parser("store-secret", help="store the device push secret (read from stdin)")
     store_parser.add_argument("--kvm", required=True)
     store_parser.set_defaults(func=cmd_store_secret)
+
+    sub.add_parser("install-hooks", help="enable opt-in Claude Code working-state hooks").set_defaults(func=cmd_install_hooks)
+    sub.add_parser("uninstall-hooks", help="disable Claude Code working-state hooks").set_defaults(func=cmd_uninstall_hooks)
+    sub.add_parser("hooks-status", help="print 'on' or 'off' for Claude hooks").set_defaults(func=cmd_hooks_status)
     return parser
 
 
