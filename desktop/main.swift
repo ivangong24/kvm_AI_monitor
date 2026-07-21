@@ -5,6 +5,7 @@
 // credentials of its own. Wording favours plain language over the internal "helper/push" terms.
 
 import AppKit
+import Combine
 import ServiceManagement
 import SwiftUI
 
@@ -75,6 +76,7 @@ final class MonitorModel: ObservableObject {
     @Published var usageProvider = "claude"
     @Published var usageLoading = false
     @Published var usageError: String?
+    private var usageLoadedAt: Date?
 
     private var configDir: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".kvm-ai-monitor")
@@ -286,7 +288,10 @@ final class MonitorModel: ObservableObject {
             if !helperInstalled { usageError = "Add this Mac first to see its AI usage." }
             return
         }
-        if appUsage != nil && !force { return }
+        // Reload when forced, when never loaded, or when the cached snapshot is stale (>15s), so the
+        // live view and charts stay current on reopen / refresh instead of showing the first fetch.
+        let fresh = usageLoadedAt.map { Date().timeIntervalSince($0) < 15 } ?? false
+        if appUsage != nil && !force && fresh { return }
         let script = helperScript.path
         usageLoading = true
         usageError = nil
@@ -295,6 +300,7 @@ final class MonitorModel: ObservableObject {
                 Self.run("/usr/bin/env", ["python3", script, "app-usage"])
             }.value
             usageLoading = false
+            usageLoadedAt = Date()
             // stdout may carry stderr "# provider: error" notes; the payload is the JSON line.
             let jsonLine = result.output
                 .split(separator: "\n")
@@ -514,7 +520,11 @@ struct CompanionPanel: View {
         }
         .frame(width: 382, height: 560)
         .background(.regularMaterial)
-        .onAppear { model.refresh(); model.loadUsage() }
+        .onAppear { model.refresh(); model.loadUsage(force: true) }
+        .onReceive(Timer.publish(every: 20, on: .main, in: .common).autoconnect()) { _ in
+            model.refresh()
+            model.loadUsage()
+        }
     }
 
     // MARK: Header
@@ -786,7 +796,7 @@ struct CompanionPanel: View {
             navButton(.usage, "Usage", "chart.bar")
             navButton(.settings, "Settings", "gearshape")
             Spacer()
-            Button { model.refresh(); if model.panel == .usage { model.loadUsage(force: true) } } label: { Image(systemName: "arrow.clockwise") }
+            Button { model.refresh(); model.loadUsage(force: true) } label: { Image(systemName: "arrow.clockwise") }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
                 .help("Refresh")
