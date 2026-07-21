@@ -14,6 +14,38 @@ struct PushTarget: Identifiable, Hashable {
     let deviceId: String
 }
 
+enum Panel { case home, usage, settings }
+
+// Shapes matching `kvm_ai_push.py app-usage` — this Mac's local usage snapshot.
+struct AppUsage: Decodable {
+    let providers: [ProviderPayload]
+    let working: [String: Bool]
+}
+
+struct ProviderPayload: Decodable {
+    let provider: String
+    let plan: String?
+    let loggedIn: Bool?
+    let limits: [LimitPayload]?
+    let daily: [DailyPayload]?
+}
+
+struct LimitPayload: Decodable {
+    let label: String?
+    let usedPercent: Double?
+    let windowMinutes: Int?
+    let resetsAt: String?
+}
+
+struct DailyPayload: Decodable {
+    let date: String
+    let totalTokens: Double?
+    let inputTokens: Double?
+    let outputTokens: Double?
+    let cacheReadTokens: Double?
+    let cacheCreationTokens: Double?
+}
+
 @MainActor
 final class MonitorModel: ObservableObject {
     @Published var kvms: [String] = []
@@ -24,8 +56,13 @@ final class MonitorModel: ObservableObject {
     @Published var launchAtLogin = false
     @Published var hooksEnabled = false
     @Published var isTogglingHooks = false
-    @Published var showSettings = false
+    @Published var panel: Panel = .home
     @Published var notice: String?
+
+    @Published var appUsage: AppUsage?
+    @Published var usageProvider = "claude"
+    @Published var usageLoading = false
+    @Published var usageError: String?
 
     private var configDir: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".kvm-ai-monitor")
@@ -207,6 +244,43 @@ final class MonitorModel: ObservableObject {
             if result.status != 0 { notice = "Could not change the Claude activity setting." }
             refresh()
         }
+    }
+
+    func loadUsage(force: Bool = false) {
+        guard helperInstalled, !usageLoading else {
+            if !helperInstalled { usageError = "Add this Mac first to see its AI usage." }
+            return
+        }
+        if appUsage != nil && !force { return }
+        let script = helperScript.path
+        usageLoading = true
+        usageError = nil
+        Task {
+            let result = await Task.detached {
+                Self.run("/usr/bin/env", ["python3", script, "app-usage"])
+            }.value
+            usageLoading = false
+            // stdout may carry stderr "# provider: error" notes; the payload is the JSON line.
+            let jsonLine = result.output
+                .split(separator: "\n")
+                .last { $0.trimmingCharacters(in: .whitespaces).hasPrefix("{") }
+            if let line = jsonLine, let data = String(line).data(using: .utf8),
+               let parsed = try? JSONDecoder().decode(AppUsage.self, from: data) {
+                appUsage = parsed
+                if !parsed.providers.contains(where: { $0.provider == usageProvider }),
+                   let first = parsed.providers.first {
+                    usageProvider = first.provider
+                }
+                usageError = parsed.providers.isEmpty ? "No usage yet — sign in to Claude or Codex on this Mac." : nil
+            } else {
+                usageError = "Couldn’t read usage from this Mac."
+            }
+        }
+    }
+
+    static func providerName(_ id: String) -> String {
+        ["claude": "Claude Code", "codex": "Codex", "copilot": "GitHub Copilot",
+         "gemini": "Gemini CLI", "grok": "Grok Build"][id] ?? id.capitalized
     }
 }
 
@@ -395,10 +469,10 @@ struct CompanionPanel: View {
         VStack(spacing: 0) {
             header
             ScrollView {
-                if model.showSettings {
-                    settingsBody
-                } else {
-                    homeBody
+                switch model.panel {
+                case .home: homeBody
+                case .usage: UsagePanel(model: model)
+                case .settings: settingsBody
                 }
             }
             footer
@@ -417,34 +491,21 @@ struct CompanionPanel: View {
                 Text("KVM AI Monitor")
                     .font(.system(size: 16, weight: .bold, design: .rounded))
                     .foregroundStyle(.white)
-                Text(model.showSettings ? "Settings" : "AI usage on your Comet Pro")
+                Text(headerSubtitle)
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.white.opacity(0.67))
             }
             Spacer()
-            if model.showSettings {
-                Button { model.showSettings = false } label: {
-                    Label("Done", systemImage: "chevron.left")
-                        .labelStyle(.titleOnly)
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 11)
-                        .padding(.vertical, 6)
-                        .background(.white.opacity(0.14), in: Capsule())
-                }
-                .buttonStyle(.plain)
-            } else {
-                HStack(spacing: 6) {
-                    StatusOrb(healthy: model.isHealthy)
-                    Text(model.isHealthy ? "LIVE" : "CHECK")
-                        .font(.system(size: 9, weight: .bold))
-                        .tracking(0.8)
-                }
-                .foregroundStyle(.white.opacity(0.9))
-                .padding(.horizontal, 9)
-                .padding(.vertical, 6)
-                .background(.white.opacity(0.11), in: Capsule())
+            HStack(spacing: 6) {
+                StatusOrb(healthy: model.isHealthy)
+                Text(model.isHealthy ? "LIVE" : "CHECK")
+                    .font(.system(size: 9, weight: .bold))
+                    .tracking(0.8)
             }
+            .foregroundStyle(.white.opacity(0.9))
+            .padding(.horizontal, 9)
+            .padding(.vertical, 6)
+            .background(.white.opacity(0.11), in: Capsule())
         }
         .padding(16)
         .background(
@@ -648,20 +709,39 @@ struct CompanionPanel: View {
 
     // MARK: Footer
 
+    private var headerSubtitle: String {
+        switch model.panel {
+        case .home: return "AI usage on your Comet Pro"
+        case .usage: return "This Mac’s AI usage"
+        case .settings: return "Settings"
+        }
+    }
+
+    private func navButton(_ target: Panel, _ title: String, _ icon: String) -> some View {
+        Button {
+            model.panel = target
+            if target == .usage { model.loadUsage() }
+        } label: {
+            Label(title, systemImage: icon)
+                .labelStyle(.titleAndIcon)
+                .foregroundStyle(model.panel == target ? accent : Color.secondary)
+        }
+        .buttonStyle(.plain)
+    }
+
     private var footer: some View {
         HStack(spacing: 14) {
-            Button { model.showSettings.toggle() } label: {
-                Label(model.showSettings ? "Home" : "Settings",
-                      systemImage: model.showSettings ? "house" : "gearshape")
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
+            navButton(.home, "Home", "house")
+            navButton(.usage, "Usage", "chart.bar")
+            navButton(.settings, "Settings", "gearshape")
             Spacer()
-            Button { model.refresh() } label: { Image(systemName: "arrow.clockwise") }
+            Button { model.refresh(); if model.panel == .usage { model.loadUsage(force: true) } } label: { Image(systemName: "arrow.clockwise") }
                 .buttonStyle(.plain)
-                .help("Refresh status")
+                .foregroundStyle(.secondary)
+                .help("Refresh")
             Button { NSApplication.shared.terminate(nil) } label: { Image(systemName: "power") }
                 .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
                 .help("Quit KVM AI Monitor")
         }
         .font(.system(size: 11, weight: .medium))
@@ -669,6 +749,271 @@ struct CompanionPanel: View {
         .padding(.vertical, 12)
         .background(Color.primary.opacity(0.035))
         .overlay(alignment: .top) { Divider() }
+    }
+}
+
+// MARK: - Usage pane
+
+func tokenShort(_ value: Double) -> String {
+    if value >= 1e9 { return String(format: value >= 1e10 ? "%.0fB" : "%.1fB", value / 1e9) }
+    if value >= 1e6 { return String(format: value >= 1e7 ? "%.0fM" : "%.1fM", value / 1e6) }
+    if value >= 1e3 { return "\(Int((value / 1e3).rounded()))K" }
+    return "\(Int(value.rounded()))"
+}
+
+func resetRelative(_ iso: String?) -> String? {
+    guard let iso else { return nil }
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    var date = formatter.date(from: iso)
+    if date == nil { formatter.formatOptions = [.withInternetDateTime]; date = formatter.date(from: iso) }
+    guard let date else { return nil }
+    let seconds = date.timeIntervalSinceNow
+    if seconds <= 0 { return "resets now" }
+    let minutes = Int(seconds / 60)
+    if minutes >= 2880 { return "resets in \(Int((Double(minutes) / 1440).rounded()))d" }
+    if minutes >= 120 { return "resets in \(Int((Double(minutes) / 60).rounded()))h" }
+    return "resets in \(minutes)m"
+}
+
+private struct UsageLimitBar: View {
+    let title: String
+    let limit: LimitPayload
+    let tint: Color
+
+    var body: some View {
+        let percent = limit.usedPercent ?? 0
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Text(title.uppercased()).font(.system(size: 10, weight: .semibold)).tracking(0.4).foregroundStyle(.secondary)
+                Spacer()
+                Text(limit.usedPercent == nil ? "--" : "\(Int(percent))%").font(.system(size: 12, weight: .semibold))
+            }
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.primary.opacity(0.09)).frame(height: 8)
+                    Capsule().fill(tint).frame(width: max(8, geo.size.width * CGFloat(min(100, percent)) / 100), height: 8)
+                }
+            }
+            .frame(height: 8)
+            if let reset = resetRelative(limit.resetsAt) {
+                Text(reset).font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+private struct DailyBars: View {
+    let values: [Double]
+    let tint: Color
+
+    var body: some View {
+        let maxValue = max(values.max() ?? 1, 1)
+        VStack(alignment: .leading, spacing: 6) {
+            GeometryReader { geo in
+                HStack(alignment: .bottom, spacing: 3) {
+                    ForEach(Array(values.enumerated()), id: \.offset) { _, value in
+                        RoundedRectangle(cornerRadius: 2)
+                            .fill(tint.opacity(0.85))
+                            .frame(maxWidth: .infinity)
+                            .frame(height: max(2, geo.size.height * CGFloat(value / maxValue)))
+                    }
+                }
+            }
+            .frame(height: 70)
+            HStack {
+                Text("peak \(tokenShort(maxValue))").font(.system(size: 10)).foregroundStyle(.secondary)
+                Spacer()
+                Text("today \(tokenShort(values.last ?? 0))").font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+private struct DonutSlice: Identifiable {
+    let id = UUID()
+    let label: String
+    let value: Double
+    let color: Color
+}
+
+private struct DonutChart: View {
+    let slices: [DonutSlice]
+
+    private var total: Double { max(slices.reduce(0) { $0 + $1.value }, 1) }
+
+    private struct Arc: Identifiable { let id = UUID(); let start: CGFloat; let end: CGFloat; let color: Color }
+
+    private var arcs: [Arc] {
+        var accumulated: CGFloat = 0
+        var result: [Arc] = []
+        for slice in slices {
+            let fraction = CGFloat(slice.value / total)
+            result.append(Arc(start: accumulated, end: accumulated + fraction, color: slice.color))
+            accumulated += fraction
+        }
+        return result
+    }
+
+    var body: some View {
+        HStack(spacing: 16) {
+            ZStack {
+                ForEach(arcs) { arc in
+                    Circle()
+                        .trim(from: arc.start, to: arc.end)
+                        .stroke(arc.color, style: StrokeStyle(lineWidth: 13, lineCap: .butt))
+                        .rotationEffect(.degrees(-90))
+                }
+            }
+            .frame(width: 78, height: 78)
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(slices) { slice in
+                    HStack(spacing: 7) {
+                        Circle().fill(slice.color).frame(width: 8, height: 8)
+                        Text(slice.label).font(.system(size: 11)).foregroundStyle(.secondary)
+                        Spacer()
+                        Text("\(Int((slice.value / total * 100).rounded()))%").font(.system(size: 11, weight: .semibold))
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct UsagePanel: View {
+    @ObservedObject var model: MonitorModel
+    private let accent = Color(red: 0.22, green: 0.49, blue: 0.96)
+
+    private var providers: [ProviderPayload] { model.appUsage?.providers ?? [] }
+    private var selected: ProviderPayload? {
+        providers.first { $0.provider == model.usageProvider } ?? providers.first
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            if !model.helperInstalled {
+                infoCard("Set up this Mac", "Enroll this Mac from the Home tab to see its AI usage here.")
+            } else if let provider = selected {
+                if providers.count > 1 { providerPicker }
+                workingCard(provider)
+                limitsCard(provider)
+                dailyCard(provider)
+                compositionCard(provider)
+            } else if model.usageLoading {
+                loadingView
+            } else {
+                infoCard("No usage yet", model.usageError ?? "Sign in to Claude or Codex on this Mac.")
+            }
+        }
+        .padding(16)
+        .onAppear { model.loadUsage() }
+    }
+
+    private var providerPicker: some View {
+        Picker("", selection: $model.usageProvider) {
+            ForEach(providers, id: \.provider) { provider in
+                Text(MonitorModel.providerName(provider.provider)).tag(provider.provider)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+    }
+
+    private func workingCard(_ provider: ProviderPayload) -> some View {
+        let working = model.appUsage?.working[provider.provider] ?? false
+        let color = working ? Color.green : Color.secondary
+        return HStack {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(MonitorModel.providerName(provider.provider)).font(.system(size: 14, weight: .semibold))
+                Text(provider.plan.map { $0.uppercased() } ?? "—")
+                    .font(.system(size: 11, weight: .semibold)).foregroundStyle(accent)
+            }
+            Spacer()
+            HStack(spacing: 6) {
+                Circle().fill(color).frame(width: 7, height: 7)
+                Text(working ? "WORKING" : "READY").font(.system(size: 10, weight: .bold)).tracking(0.6)
+            }
+            .foregroundStyle(color)
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            .background(color.opacity(0.14), in: Capsule())
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 13))
+        .overlay(RoundedRectangle(cornerRadius: 13).stroke(Color.primary.opacity(0.07)))
+    }
+
+    private func limitsCard(_ provider: ProviderPayload) -> some View {
+        card("Limits") {
+            if let limits = provider.limits, !limits.isEmpty {
+                VStack(spacing: 12) {
+                    ForEach(Array(limits.prefix(3).enumerated()), id: \.offset) { _, limit in
+                        UsageLimitBar(title: limit.label ?? "Limit", limit: limit, tint: accent)
+                    }
+                }
+            } else {
+                Text("No limit data available.").font(.system(size: 12)).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func dailyCard(_ provider: ProviderPayload) -> some View {
+        let values = Array((provider.daily ?? []).suffix(14)).map { $0.totalTokens ?? 0 }
+        return card("Daily tokens · last \(values.count) days") {
+            if values.isEmpty {
+                Text("No daily history yet.").font(.system(size: 12)).foregroundStyle(.secondary)
+            } else {
+                DailyBars(values: values, tint: accent)
+            }
+        }
+    }
+
+    private func compositionCard(_ provider: ProviderPayload) -> some View {
+        let daily = provider.daily ?? []
+        func total(_ path: (DailyPayload) -> Double?) -> Double { daily.reduce(0) { $0 + (path($1) ?? 0) } }
+        let slices = [
+            DonutSlice(label: "Output", value: total { $0.outputTokens }, color: accent),
+            DonutSlice(label: "Input", value: total { $0.inputTokens }, color: Color(red: 0.28, green: 0.7, blue: 0.55)),
+            DonutSlice(label: "Cache read", value: total { $0.cacheReadTokens }, color: Color(red: 0.85, green: 0.6, blue: 0.25)),
+            DonutSlice(label: "Cache write", value: total { $0.cacheCreationTokens }, color: Color(red: 0.6, green: 0.45, blue: 0.85)),
+        ].filter { $0.value > 0 }
+        return card("Token composition · 30 days") {
+            if slices.isEmpty {
+                Text("Per-type breakdown isn’t available for \(MonitorModel.providerName(provider.provider)).")
+                    .font(.system(size: 12)).foregroundStyle(.secondary)
+            } else {
+                DonutChart(slices: slices)
+            }
+        }
+    }
+
+    private func card<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title.uppercased()).font(.system(size: 9, weight: .bold)).tracking(0.9).foregroundStyle(.secondary)
+            content()
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 13))
+        .overlay(RoundedRectangle(cornerRadius: 13).stroke(Color.primary.opacity(0.07)))
+    }
+
+    private func infoCard(_ title: String, _ detail: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title).font(.system(size: 13, weight: .semibold))
+            Text(detail).font(.system(size: 11)).foregroundStyle(.secondary)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(accent.opacity(0.06), in: RoundedRectangle(cornerRadius: 13))
+    }
+
+    private var loadingView: some View {
+        HStack(spacing: 8) {
+            ProgressView().controlSize(.small)
+            Text("Reading usage from this Mac…").font(.system(size: 12)).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity).padding(24)
     }
 }
 

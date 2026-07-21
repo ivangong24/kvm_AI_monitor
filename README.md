@@ -36,8 +36,20 @@ animated working indicator whenever an agent is actively processing on any enrol
 
 ## Install
 
-Choose either installation method on a macOS, Linux, or Windows computer on the same network
-as the Comet.
+Run the guided setup on any macOS, Linux, or Windows computer on the same network as the Comet.
+
+### Recommended: one command with npx
+
+With Node.js 22+ installed, no clone or install is needed — run the setup wizard straight from
+GitHub:
+
+```bash
+npx github:ivangong24/kvm_AI_monitor
+```
+
+It discovers the Comet, signs in (keeping only a revocable session token), installs the on-device
+agent, switches the touchscreen to Wallpaper Only, and enrolls this machine — the same flow as
+`npm run setup` below.
 
 ### Homebrew
 

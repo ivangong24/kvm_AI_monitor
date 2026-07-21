@@ -696,6 +696,26 @@ def cmd_print_payload(_args):
             print(json.dumps(payload, indent=2, sort_keys=True))
 
 
+def cmd_app_usage(_args):
+    """Emit one JSON object for the menu-bar companion: each provider's usage payload (plan,
+    limits, daily token history) plus the current local working state. Read-only — never pushes.
+    Errors go to stderr so stdout stays a single parseable JSON line."""
+    providers = []
+    for provider_id, collect in USAGE_COLLECTORS.items():
+        try:
+            payload = collect()
+        except Exception as error:
+            print(f"# {provider_id}: {error}", file=sys.stderr)
+            continue
+        if payload:
+            providers.append(payload)
+    try:
+        working = {key: bool(value) for key, value in detect_working().items()}
+    except Exception:
+        working = {}
+    print(json.dumps({"providers": providers, "working": working, "generatedAt": now_iso()}))
+
+
 def cmd_store_secret(args):
     # Read bytes, not text: PowerShell prefixes a UTF-8 BOM when it pipes into a native
     # process, and the locale-dependent text decoding of stdin turns that into mojibake or
@@ -1071,6 +1091,7 @@ def build_parser():
                    ).set_defaults(func=cmd_poll_activity)
 
     sub.add_parser("print-payload", help="print the usage payload without sending it").set_defaults(func=cmd_print_payload)
+    sub.add_parser("app-usage", help="print usage + working state as one JSON blob for the menu-bar app").set_defaults(func=cmd_app_usage)
 
     store_parser = sub.add_parser("store-secret", help="store the device push secret (read from stdin)")
     store_parser.add_argument("--kvm", required=True)
