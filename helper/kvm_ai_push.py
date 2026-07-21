@@ -689,9 +689,22 @@ MODEL_PRICES = {
     "fable":  {"input": 3.0,  "output": 15.0, "cacheRead": 0.30, "cacheWrite": 3.75},
 }
 DEFAULT_CLAUDE_PRICE = MODEL_PRICES["sonnet"]
-# Codex exposes only a daily total (no input/output split), so a single blended gpt-5-class rate is
-# applied — a rough estimate flagged as such in the payload.
-CODEX_BLENDED_PRICE_PER_MTOK = 2.0
+
+# Codex per-model rates in USD/million tokens (input, output, cacheRead), mirroring codexbar's
+# bundled CostUsagePricing (OpenAI list prices). Codex's `input_tokens` INCLUDES the cached portion,
+# so cost = (input - cachedInput)*input + cachedInput*cacheRead + output*output.
+CODEX_MODEL_PRICES = {
+    "gpt-5.6-sol":   {"input": 5.0,  "output": 30.0, "cacheRead": 0.50},
+    "gpt-5.6-terra": {"input": 2.5,  "output": 15.0, "cacheRead": 0.25},
+    "gpt-5.6-luna":  {"input": 1.0,  "output": 6.0,  "cacheRead": 0.10},
+    "gpt-5.5":       {"input": 5.0,  "output": 30.0, "cacheRead": 0.50},
+    "gpt-5.4":       {"input": 2.5,  "output": 15.0, "cacheRead": 0.25},
+    "gpt-5.2":       {"input": 1.75, "output": 14.0, "cacheRead": 0.175},
+    "gpt-5.1":       {"input": 1.25, "output": 10.0, "cacheRead": 0.125},
+    "gpt-5":         {"input": 1.25, "output": 10.0, "cacheRead": 0.125},
+}
+# OpenAI routes the unsuffixed gpt-5.6 alias to Sol; use it as the default when a model is unknown.
+CODEX_DEFAULT_PRICE = CODEX_MODEL_PRICES["gpt-5.6-sol"]
 
 
 def _price_for_model(model):
@@ -700,6 +713,28 @@ def _price_for_model(model):
         if key in lowered:
             return price
     return DEFAULT_CLAUDE_PRICE
+
+
+def normalize_codex_model(raw):
+    """Map a raw codex model id to a pricing key: strip openai/ prefix and dated suffix, resolve the
+    bare gpt-5.6 alias to Sol (as OpenAI does)."""
+    model = (raw or "").strip()
+    if model.startswith("openai/"):
+        model = model[len("openai/"):]
+    model = re.sub(r"-\d{4}-\d{2}-\d{2}$", "", model)
+    if model == "gpt-5.6":
+        return "gpt-5.6-sol"
+    return model
+
+
+def _codex_price(model):
+    key = normalize_codex_model(model)
+    if key in CODEX_MODEL_PRICES:
+        return CODEX_MODEL_PRICES[key]
+    for name, price in CODEX_MODEL_PRICES.items():
+        if key.startswith(name):
+            return price
+    return CODEX_DEFAULT_PRICE
 
 
 def _cost_from_detail(detail):
@@ -721,15 +756,110 @@ def claude_cost(detail):
             "month": _cost_from_detail(detail.get("month"))}
 
 
-def codex_cost(daily):
-    if not daily:
+def _codex_cost_from_detail(models):
+    total = 0.0
+    for model, tokens in (models or {}).items():
+        price = _codex_price(model)
+        fresh_input = max(0, tokens.get("input", 0) - tokens.get("cached", 0))
+        total += (fresh_input * price["input"]
+                  + tokens.get("cached", 0) * price["cacheRead"]
+                  + tokens.get("output", 0) * price["output"]) / 1_000_000
+    return round(total, 2)
+
+
+def codex_cost(detail):
+    """Codex USD estimate from the per-model token breakdown produced by codex_scan()."""
+    if not detail or (not detail.get("month") and not detail.get("today")):
         return None
-    today_iso = datetime.date.today().isoformat()
-    today_tokens = sum(number(item.get("totalTokens")) or 0 for item in daily if item.get("date") == today_iso)
-    month_tokens = sum(number(item.get("totalTokens")) or 0 for item in daily)
-    usd = lambda tokens: round(tokens / 1_000_000 * CODEX_BLENDED_PRICE_PER_MTOK, 2)
-    return {"currency": "USD", "estimated": True, "rough": True,
-            "today": usd(today_tokens), "month": usd(month_tokens)}
+    return {"currency": "USD", "estimated": True,
+            "today": _codex_cost_from_detail(detail.get("today")),
+            "month": _codex_cost_from_detail(detail.get("month"))}
+
+
+def _event_local_date(timestamp):
+    if not isinstance(timestamp, str):
+        return None
+    try:
+        return datetime.datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone().date()
+    except ValueError:
+        return None
+
+
+def codex_scan():
+    """Scan local codex rollout sessions (~/.codex/sessions, last 30 days) for the per-model and
+    per-platform token breakdown the app-server usage endpoint doesn't expose. Per session use the
+    PEAK cumulative total_token_usage (summing per-turn deltas overcounts forked context — see
+    codexbar issue #2037), the last turn_context model (authoritative), and the session_meta
+    originator as the platform. Returns (models, platforms, cost_detail) with today vs 30-day split by
+    the peak event's local date. `input_tokens` INCLUDES `cached_input_tokens`. Never raises."""
+    root = pathlib.Path.home() / ".codex" / "sessions"
+    empty = ([], [], {"month": {}, "today": {}})
+    if not root.is_dir():
+        return empty
+    today = datetime.date.today()
+    cutoff = today - datetime.timedelta(days=29)
+    by_model = {}
+    by_platform = {}
+    detail = {"month": {}, "today": {}}
+    try:
+        paths = list(root.rglob("rollout-*.jsonl"))
+    except OSError:
+        return empty
+    for path in paths:
+        match = re.search(r"rollout-(\d{4})-(\d{2})-(\d{2})", path.name)
+        if not match:
+            continue
+        try:
+            file_date = datetime.date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        except ValueError:
+            continue
+        if file_date < cutoff:
+            continue
+        model = platform = peak = None
+        peak_total = -1
+        peak_day = file_date
+        try:
+            with path.open(errors="replace") as stream:
+                for line in stream:
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+                    etype = event.get("type")
+                    if etype == "session_meta":
+                        platform = platform or payload.get("originator") or payload.get("source")
+                    elif etype == "turn_context" and payload.get("model"):
+                        model = payload["model"]
+                    elif payload.get("type") == "thread_settings_applied" and not model:
+                        model = (payload.get("thread_settings") or {}).get("model")
+                    elif payload.get("type") == "token_count":
+                        info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+                        usage = info.get("total_token_usage") if isinstance(info.get("total_token_usage"), dict) else {}
+                        total = number(usage.get("total_tokens")) or 0
+                        if total > peak_total:
+                            peak_total, peak = total, usage
+                            peak_day = _event_local_date(event.get("timestamp")) or file_date
+        except OSError:
+            continue
+        if not peak or not model:
+            continue
+        inp = number(peak.get("input_tokens")) or 0
+        cached = number(peak.get("cached_input_tokens")) or 0
+        out = number(peak.get("output_tokens")) or 0
+        model_key = normalize_codex_model(model)
+        by_model[model_key] = by_model.get(model_key, 0) + inp + out
+        by_platform[platform or "unknown"] = by_platform.get(platform or "unknown", 0) + inp + out
+        for window in ["month"] + (["today"] if peak_day == today else []):
+            bucket = detail[window].setdefault(model_key, {"input": 0, "cached": 0, "output": 0})
+            bucket["input"] += inp
+            bucket["cached"] += cached
+            bucket["output"] += out
+    models = [{"model": name, "tokens": by_model[name]}
+              for name in sorted(by_model, key=lambda n: -by_model[n]) if by_model[name] > 0]
+    platforms = [{"platform": name, "tokens": by_platform[name]}
+                 for name in sorted(by_platform, key=lambda n: -by_platform[n]) if by_platform[name] > 0]
+    return models, platforms, detail
 
 
 # --- payload assembly (whitelisted fields only, docs/PUSH_PROTOCOL.md "POST /push/v1/usage") ---
@@ -1053,7 +1183,14 @@ def enrich_app_payload(provider_id, payload):
             payload["credits"] = extras["credits"]
         if "freeResets" in extras:
             payload["freeResets"] = extras["freeResets"]
-        cost = codex_cost(payload.get("daily") or [])
+        # Model / platform / cost come from the local rollout sessions (the app-server usage endpoint
+        # exposes only account-wide daily totals). This matches how codexbar estimates spend.
+        models, platforms, cost_detail = codex_scan()
+        if models:
+            payload["models"] = models
+        if platforms:
+            payload["platforms"] = platforms
+        cost = codex_cost(cost_detail)
         if cost:
             payload["cost"] = cost
 

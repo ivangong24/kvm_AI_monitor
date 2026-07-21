@@ -1234,10 +1234,20 @@ func tokenShort(_ value: Double) -> String {
 
 // "claude-opus-4-8" -> "Opus 4.8", "claude-3-5-haiku-20241022" -> "Haiku 3.5", "gpt-5.6" -> "GPT 5.6".
 func prettyModel(_ raw: String) -> String {
-    let lower = raw.lowercased()
+    let lower = raw.lowercased().replacingOccurrences(of: "openai/", with: "")
+    // Codex GPT-5.x models: keep the version and any codename/variant (Sol / Terra / Luna / Codex …).
+    if lower.hasPrefix("gpt-") {
+        let parts = lower.split(separator: "-").map(String.init)
+        guard parts.count >= 2 else { return "GPT" }
+        var name = "GPT-\(parts[1])"
+        let suffixes = ["sol": "Sol", "terra": "Terra", "luna": "Luna", "codex": "Codex",
+                        "mini": "Mini", "nano": "Nano", "pro": "Pro", "max": "Max", "spark": "Spark"]
+        for part in parts.dropFirst(2) where suffixes[part] != nil { name += " \(suffixes[part]!)" }
+        return name
+    }
     let families: [(String, String)] = [
         ("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku"), ("fable", "Fable"),
-        ("gpt", "GPT"), ("gemini", "Gemini"), ("grok", "Grok"),
+        ("gemini", "Gemini"), ("grok", "Grok"),
     ]
     var family: String?
     for (key, name) in families where lower.contains(key) { family = name; break }
@@ -1251,14 +1261,19 @@ func prettyModel(_ raw: String) -> String {
     return parts.isEmpty ? name : "\(name) \(parts.joined(separator: "."))"
 }
 
-// Transcript `entrypoint` → friendly surface name.
+// Transcript `entrypoint` (Claude) or session originator (Codex) → friendly surface name.
 func prettyPlatform(_ raw: String) -> String {
-    switch raw.lowercased() {
-    case "cli": return "CLI"
-    case "claude-desktop": return "Desktop app"
+    let lower = raw.lowercased()
+    switch lower {
+    case "cli", "codex-cli", "codex-tui": return "CLI"
+    case "claude-desktop", "codex-desktop": return "Desktop app"
     case "sdk-cli", "sdk": return "SDK"
-    case "vscode": return "VS Code"
-    default: return raw.replacingOccurrences(of: "-", with: " ").capitalized
+    case "codex-exec": return "Automation"
+    default:
+        if lower.contains("vscode") || lower.contains("vs-code") { return "VS Code" }
+        if lower.contains("ide") || lower.contains("jetbrains") { return "IDE" }
+        if lower.contains("desktop") || lower.contains("app") { return "Desktop app" }
+        return raw.replacingOccurrences(of: "codex-", with: "").replacingOccurrences(of: "-", with: " ").capitalized
     }
 }
 
@@ -1397,7 +1412,6 @@ struct UsagePanel: View {
             } else if let provider = selected {
                 if providers.count > 1 { providerPicker }
                 accountCard(provider)
-                workingCard(provider)
                 if provider.cost != nil { costCard(provider) }
                 limitsCard(provider)
                 if model.showExtras {
@@ -1426,7 +1440,9 @@ struct UsagePanel: View {
         let list = accounts(for: provider.provider)
         let email = provider.account?.email ?? list.first(where: { $0.email != nil })?.email
         let level = provider.account?.level ?? provider.plan
-        return card("Linked account") {
+        let working = model.appUsage?.working[provider.provider] ?? false
+        let statusColor = working ? Color.green : Color.secondary
+        return card(MonitorModel.providerName(provider.provider)) {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 8) {
                     Image(systemName: "person.crop.circle").foregroundStyle(accent)
@@ -1434,6 +1450,14 @@ struct UsagePanel: View {
                         Text(email ?? "Signed in").font(.system(size: 13, weight: .semibold))
                         if let level { Text(level.uppercased()).font(.system(size: 10, weight: .bold)).tracking(0.5).foregroundStyle(accent) }
                     }
+                    Spacer()
+                    HStack(spacing: 6) {
+                        Circle().fill(statusColor).frame(width: 7, height: 7)
+                        Text(working ? "WORKING" : "READY").font(.system(size: 10, weight: .bold)).tracking(0.6)
+                    }
+                    .foregroundStyle(statusColor)
+                    .padding(.horizontal, 10).padding(.vertical, 6)
+                    .background(statusColor.opacity(0.14), in: Capsule())
                 }
                 if list.count > 1 {
                     Divider()
@@ -1528,30 +1552,6 @@ struct UsagePanel: View {
         }
         .pickerStyle(.segmented)
         .labelsHidden()
-    }
-
-    private func workingCard(_ provider: ProviderPayload) -> some View {
-        let working = model.appUsage?.working[provider.provider] ?? false
-        let color = working ? Color.green : Color.secondary
-        return HStack {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(MonitorModel.providerName(provider.provider)).font(.system(size: 14, weight: .semibold))
-                Text(provider.plan.map { $0.uppercased() } ?? "—")
-                    .font(.system(size: 11, weight: .semibold)).foregroundStyle(accent)
-            }
-            Spacer()
-            HStack(spacing: 6) {
-                Circle().fill(color).frame(width: 7, height: 7)
-                Text(working ? "WORKING" : "READY").font(.system(size: 10, weight: .bold)).tracking(0.6)
-            }
-            .foregroundStyle(color)
-            .padding(.horizontal, 10).padding(.vertical, 6)
-            .background(color.opacity(0.14), in: Capsule())
-        }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 13))
-        .overlay(RoundedRectangle(cornerRadius: 13).stroke(Color.primary.opacity(0.07)))
     }
 
     private func limitsCard(_ provider: ProviderPayload) -> some View {

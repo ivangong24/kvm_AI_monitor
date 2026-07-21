@@ -524,13 +524,6 @@ class CostEstimateTests(unittest.TestCase):
         self.assertEqual(cost, {"currency": "USD", "estimated": True, "today": 0.0, "month": 3.0})
         self.assertIsNone(helper.claude_cost({"month": {}, "today": {}}))
 
-    def test_codex_cost_is_blended_and_flagged_rough(self):
-        daily = [{"date": DAY0, "totalTokens": 1_000_000}, {"date": DAY1, "totalTokens": 1_000_000}]
-        cost = helper.codex_cost(daily)
-        self.assertTrue(cost["rough"])
-        self.assertEqual(cost["today"], round(helper.CODEX_BLENDED_PRICE_PER_MTOK, 2))
-        self.assertEqual(cost["month"], round(2 * helper.CODEX_BLENDED_PRICE_PER_MTOK, 2))
-
 
 class AppUsageEnrichmentTests(unittest.TestCase):
     """The app-only enrichment must attach account/extra fields, while the pushed collector payload
@@ -546,6 +539,34 @@ class AppUsageEnrichmentTests(unittest.TestCase):
         self.assertEqual(payload["account"], {"email": "a@b.com", "level": "Max"})
         self.assertEqual(payload["extraUsage"], {"enabled": True})
         self.assertNotIn("email", json.dumps(account["id"]))  # sanity: id carries no PII
+
+
+class CodexCostTests(unittest.TestCase):
+    def test_normalize_resolves_alias_prefix_and_dated_suffix(self):
+        self.assertEqual(helper.normalize_codex_model("gpt-5.6"), "gpt-5.6-sol")
+        self.assertEqual(helper.normalize_codex_model("openai/gpt-5.6-sol"), "gpt-5.6-sol")
+        self.assertEqual(helper.normalize_codex_model("gpt-5.5-2026-01-01"), "gpt-5.5")
+
+    def test_cost_subtracts_cached_from_input_and_prices_per_model(self):
+        # gpt-5.6-sol: input $5, cacheRead $0.50, output $30 per Mtok.
+        # fresh input 200k*$5 + cached 800k*$0.50 + output 100k*$30 = 1.00 + 0.40 + 3.00 = $4.40
+        detail = {"month": {"gpt-5.6-sol": {"input": 1_000_000, "cached": 800_000, "output": 100_000}},
+                  "today": {}}
+        cost = helper.codex_cost(detail)
+        self.assertEqual(cost, {"currency": "USD", "estimated": True, "today": 0.0, "month": 4.40})
+
+    def test_cached_heavy_usage_is_far_cheaper_than_a_flat_blend(self):
+        # 10M tokens, 9.5M cached — the flat-total blend badly overcounts; cached rate dominates.
+        detail = {"month": {"gpt-5.6-sol": {"input": 9_500_000, "cached": 9_500_000, "output": 500_000}},
+                  "today": {}}
+        # fresh 0*$5 + cached 9.5M*$0.50 + output 0.5M*$30 = 4.75 + 15.00 = $19.75
+        self.assertEqual(helper.codex_cost(detail)["month"], 19.75)
+
+    def test_unknown_model_falls_back_to_sol_default(self):
+        self.assertEqual(helper._codex_price("mystery"), helper.CODEX_DEFAULT_PRICE)
+
+    def test_none_when_empty(self):
+        self.assertIsNone(helper.codex_cost({"month": {}, "today": {}}))
 
 
 class CometHealthCacheTests(HomeIsolatedTestCase):
