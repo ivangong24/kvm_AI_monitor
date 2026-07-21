@@ -30,7 +30,7 @@ def mock_status(working=True):
         "selectedProvider": "claude", "enabled": True, "animateWorking": True, "intervalSeconds": 60,
         "providers": [provider],
         "kvmIdentity": {"model": "GL.iNet Comet Pro", "modelCode": "RM10", "hostname": "glkvm",
-                        "firmwareVersion": "1.0.0", "platformVersion": "Buildroot"},
+                        "firmwareVersion": "V1.9.1 release1", "platformVersion": "Buildroot 2024.02"},
         "deviceUser": "you", "deviceHost": "auto", "activityHosts": "", "sshPublicKey": "ssh-ed25519 AAAA…preview",
         "deviceOnline": True, "resolvedDeviceHost": "mac.local", "running": True,
         "activityDeviceCount": 1, "activityDeviceConfiguredCount": 1,

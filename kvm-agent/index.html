@@ -149,10 +149,17 @@
       @media (prefers-reduced-motion: reduce) { .g-anim *, .g-idle * { animation: none !important; } }
 
       /* Comet Pro hardware health gauges */
-      .gauges { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 4px; }
-      .gauge svg { display: block; width: 100%; max-width: 112px; height: auto; margin: 0 auto; }
-      .gauge svg circle.gauge-value { transition: stroke-dashoffset .55s cubic-bezier(.2, .7, .2, 1); }
+      .gauges { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 4px; justify-items: center; }
+      .gauges svg { display: block; width: 100%; max-width: 108px; height: auto; margin: 0 auto; }
+      .gauges svg circle.gauge-value { transition: stroke-dashoffset .55s cubic-bezier(.2, .7, .2, 1); }
       .health-extra { margin-top: 12px; text-align: center; color: var(--muted); font-size: 12px; }
+      .os-row { display: flex; align-items: center; gap: 12px; padding: 4px 0 16px; margin-bottom: 4px; border-bottom: 1px solid var(--line); }
+      .os-icon { width: 42px; height: 42px; flex: none; display: flex; align-items: center; justify-content: center; background: #eef2f6; border: 1px solid var(--line); border-radius: 11px; }
+      .os-icon svg { width: 28px; height: 28px; display: block; }
+      .os-text { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+      .os-eyebrow { font-size: 10px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); }
+      .os-text strong { font-size: 13.5px; font-weight: 600; }
+      .os-sub { font-size: 11.5px; color: var(--muted); overflow-wrap: anywhere; }
 
       .switch { position: relative; display: inline-block; width: 40px; height: 22px; flex: none; }
       .switch input { opacity: 0; width: 0; height: 0; position: absolute; }
@@ -315,7 +322,27 @@
 
           <section class="card" id="health-card" aria-label="Comet Pro hardware health" hidden>
             <h2>Comet Pro health</h2>
-            <p class="sub">Live hardware usage on the KVM itself.</p>
+            <p class="sub">Operating system and live hardware usage on the KVM itself.</p>
+            <div class="os-row">
+              <span class="os-icon" aria-hidden="true">
+                <svg viewBox="0 0 32 32" role="img" aria-label="Linux operating system">
+                  <ellipse cx="11.5" cy="29" rx="4" ry="2.1" fill="#f7a41d"/>
+                  <ellipse cx="20.5" cy="29" rx="4" ry="2.1" fill="#f7a41d"/>
+                  <path d="M16 3 C10.5 3 8.5 7.8 8.5 12.8 C8.5 17.5 6.4 20.6 6.4 24 C6.4 28 11 30 16 30 C21 30 25.6 28 25.6 24 C25.6 20.6 23.5 17.5 23.5 12.8 C23.5 7.8 21.5 3 16 3 Z" fill="#17181a" stroke="#9aa1ab" stroke-width=".4"/>
+                  <path d="M16 11 C12.2 11 11 15 11 20 C11 25 13.2 28.4 16 28.4 C18.8 28.4 21 25 21 20 C21 15 19.8 11 16 11 Z" fill="#fdfdfd"/>
+                  <ellipse cx="13.2" cy="10.2" rx="2" ry="2.7" fill="#fff"/>
+                  <ellipse cx="18.8" cy="10.2" rx="2" ry="2.7" fill="#fff"/>
+                  <circle cx="13.7" cy="10.8" r="1" fill="#17181a"/>
+                  <circle cx="18.3" cy="10.8" r="1" fill="#17181a"/>
+                  <path d="M13.8 12.2 L18.2 12.2 L16 15.4 Z" fill="#f7a41d"/>
+                </svg>
+              </span>
+              <div class="os-text">
+                <span class="os-eyebrow">Operating system</span>
+                <strong id="os-name">—</strong>
+                <span class="os-sub" id="os-version"></span>
+              </div>
+            </div>
             <div class="gauges" id="gauges"></div>
             <p class="health-extra" id="health-extra"></p>
           </section>
@@ -661,16 +688,19 @@
         return "var(--good)";
       }
 
-      function renderHealth(system) {
+      function renderHealth(state) {
+        const system = state.system || {};
+        const identity = state.kvmIdentity || {};
         const card = document.getElementById("health-card");
         const target = document.getElementById("gauges");
         if (!card || !target) return;
-        system = system || {};
         if (system.cpuPercent == null && system.memPercent == null && system.tempC == null) {
           card.hidden = true;
           return;
         }
         card.hidden = false;
+        setScreenText("os-name", identity.platformVersion || identity.model || "Linux");
+        setScreenText("os-version", identity.firmwareVersion ? `Firmware ${identity.firmwareVersion}` : "");
         const tempPercent = system.tempC != null ? Math.min(100, Math.max(0, system.tempC / 90 * 100)) : null;
         target.innerHTML = [
           gaugeSVG("CPU", system.cpuPercent, system.cpuPercent == null ? "—" : `${system.cpuPercent}%`, bandColor(system.cpuPercent, 60, 85)),
@@ -791,7 +821,7 @@
         renderOptions(state);
         renderDiagnostic(state);
         renderScreen(state);
-        renderHealth(state.system);
+        renderHealth(state);
       }
 
       async function checkForUpdates() {
