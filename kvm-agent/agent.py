@@ -26,7 +26,7 @@ from push_receiver import DeviceStore, PushReceiver
 from ssh_collector import SshCollector, build_usage_snapshot
 
 
-AGENT_VERSION = "0.7.0"  # Keep in step with package.json; surfaced on /api/status for updates.
+AGENT_VERSION = "0.8.0"  # Keep in step with package.json; surfaced on /api/status for updates.
 
 ROOT = Path(os.environ.get("KVM_AI_USAGE_ROOT", "/etc/kvmd/user/ai-usage"))
 CONFIG_PATH = Path(os.environ.get("KVM_AI_USAGE_CONFIG", ROOT / "config.json"))
@@ -947,9 +947,9 @@ def save_png_atomic(image: Image.Image, output_path: Path, compress_level: int |
 
 
 def read_system_stats() -> dict[str, object]:
-    """Best-effort Comet Pro (Linux) health — CPU %, memory, temperature, load, uptime. Returns
-    only the fields it can read; on a non-Linux host (e.g. a dev Mac) it returns an empty dict, so
-    the web console simply hides the panel there."""
+    """Best-effort Comet Pro (Linux) health — CPU %, memory, disk, temperature, load, uptime.
+    Returns only the fields it can read; on a non-Linux host (e.g. a dev Mac) it returns an empty
+    dict, so the web console simply hides the panel there."""
     stats: dict[str, object] = {}
     try:
         meminfo: dict[str, int] = {}
@@ -1003,6 +1003,14 @@ def read_system_stats() -> dict[str, object]:
         with open("/proc/uptime") as stream:
             stats["uptimeSec"] = int(float(stream.read().split()[0]))
     except (OSError, ValueError):
+        pass
+    try:
+        disk = shutil.disk_usage("/")
+        used = disk.total - disk.free
+        stats["diskTotalGb"] = round(disk.total / 1e9, 1)
+        stats["diskUsedGb"] = round(used / 1e9, 1)
+        stats["diskPercent"] = round(100 * used / disk.total) if disk.total else 0
+    except OSError:
         pass
     return stats
 
@@ -1797,7 +1805,14 @@ class Handler(BaseHTTPRequestHandler):
         if not handler(device, value):
             self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid body"})
             return
-        self.send_json(HTTPStatus.OK, {"ok": True})
+        # Return Comet Pro health on the usage push so the enrolled companion app can show it without
+        # a separate (session-authenticated) console request — the device is already HMAC-verified.
+        if path.endswith("/usage"):
+            self.send_json(HTTPStatus.OK, {"ok": True, "agentVersion": AGENT_VERSION,
+                                           "kvmIdentity": self.agent.kvm_identity,
+                                           "system": read_system_stats()})
+        else:
+            self.send_json(HTTPStatus.OK, {"ok": True})
 
 
 class ControlServer(ThreadingHTTPServer):

@@ -998,7 +998,12 @@ def post(kvm_host, backend_path, payload, secret, device_id, timeout):
         },
     )
     with urllib.request.urlopen(request, timeout=timeout, context=unverified_ssl_context()) as response:
-        response.read()
+        raw = response.read()
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else None
+    except (ValueError, TypeError):
+        return None
 
 
 # --- CLI -----------------------------------------------------------------------------------
@@ -1080,8 +1085,12 @@ def cmd_app_usage(_args):
     except Exception as error:
         print(f"# accounts: {error}", file=sys.stderr)
         accounts = []
-    print(json.dumps({"providers": providers, "working": working,
-                      "accounts": accounts, "generatedAt": now_iso()}))
+    output = {"providers": providers, "working": working,
+              "accounts": accounts, "generatedAt": now_iso()}
+    comet = read_comet_health()
+    if comet:
+        output["comet"] = comet
+    print(json.dumps(output))
 
 
 def cmd_store_secret(args):
@@ -1101,17 +1110,59 @@ def cmd_store_secret(args):
 
 
 def push_to_targets(backend_path, payload, timeout):
-    """Push one payload to every configured KVM. Returns (target_count, error_lines);
-    error text never contains payload or credential data."""
+    """Push one payload to every configured KVM. Returns (target_count, error_lines); error text
+    never contains payload or credential data. On the usage path, caches the Comet Pro health the
+    KVM returns in its push response so the companion app can show it without a console request."""
     targets = load_targets()
     errors = []
     for target in targets:
         try:
             secret = load_secret(target["kvmHost"])
-            post(target["kvmHost"], backend_path, payload, secret, target["deviceId"], timeout=timeout)
+            response = post(target["kvmHost"], backend_path, payload, secret, target["deviceId"], timeout=timeout)
+            if backend_path.endswith("/usage") and isinstance(response, dict) and response.get("system"):
+                write_comet_health(target["kvmHost"], response)
         except Exception as error:
             errors.append(f"{target['kvmHost']}: {error}")
     return len(targets), errors
+
+
+def comet_health_cache_path():
+    return config_dir() / "comet-health.json"
+
+
+def write_comet_health(kvm_host, response):
+    """Cache the Comet Pro health block from a push response (system stats + agent version). Local
+    display only; contains no credentials."""
+    system = response.get("system") if isinstance(response.get("system"), dict) else {}
+    entry = {"kvmHost": kvm_host, "system": system, "fetchedAt": now_iso()}
+    for key in ("agentVersion", "kvmIdentity"):
+        if isinstance(response.get(key), str):
+            entry[key] = response[key]
+    try:
+        config_dir().mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = comet_health_cache_path()
+        path.write_text(json.dumps(entry))
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+
+
+def read_comet_health():
+    """The last cached Comet Pro health, or None when never fetched or older than a day."""
+    try:
+        cache = json.loads(comet_health_cache_path().read_text())
+    except Exception:
+        return None
+    if not isinstance(cache, dict) or not isinstance(cache.get("system"), dict):
+        return None
+    try:
+        age = datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromisoformat(
+            str(cache.get("fetchedAt", "")).replace("Z", "+00:00"))
+        if age.total_seconds() > 24 * 3600:
+            return None
+    except (ValueError, TypeError):
+        pass
+    return cache
 
 
 def cmd_send_usage(_args):

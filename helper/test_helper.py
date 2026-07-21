@@ -548,5 +548,35 @@ class AppUsageEnrichmentTests(unittest.TestCase):
         self.assertNotIn("email", json.dumps(account["id"]))  # sanity: id carries no PII
 
 
+class CometHealthCacheTests(HomeIsolatedTestCase):
+    RESPONSE = {"ok": True, "agentVersion": "0.8.0", "kvmIdentity": "comet-1",
+                "system": {"cpuPercent": 12, "diskPercent": 63, "diskUsedGb": 18.4}}
+
+    def test_write_then_read_round_trips_system_and_meta(self):
+        helper.write_comet_health("192.168.0.178", self.RESPONSE)
+        cached = helper.read_comet_health()
+        self.assertEqual(cached["system"], self.RESPONSE["system"])
+        self.assertEqual(cached["agentVersion"], "0.8.0")
+        self.assertEqual(cached["kvmHost"], "192.168.0.178")
+
+    def test_cache_file_is_owner_only(self):
+        helper.write_comet_health("host", self.RESPONSE)
+        mode = helper.comet_health_cache_path().stat().st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+
+    def test_stale_health_is_not_served(self):
+        path = helper.comet_health_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"kvmHost": "h", "system": {"cpuPercent": 1},
+                                    "fetchedAt": "2000-01-01T00:00:00Z"}))
+        self.assertIsNone(helper.read_comet_health())
+
+    def test_missing_or_malformed_cache_returns_none(self):
+        self.assertIsNone(helper.read_comet_health())
+        helper.comet_health_cache_path().parent.mkdir(parents=True, exist_ok=True)
+        helper.comet_health_cache_path().write_text("{not json")
+        self.assertIsNone(helper.read_comet_health())
+
+
 if __name__ == "__main__":
     unittest.main()

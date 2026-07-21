@@ -67,6 +67,28 @@ struct AppUsage: Decodable {
     let providers: [ProviderPayload]
     let working: [String: Bool]
     let accounts: [AccountInfo]?
+    let comet: CometHealth?
+}
+
+// Comet Pro health, returned by the KVM on the usage push and cached locally by the helper.
+struct CometHealth: Decodable {
+    let kvmHost: String?
+    let agentVersion: String?
+    let fetchedAt: String?
+    let system: CometSystem?
+}
+
+struct CometSystem: Decodable {
+    let cpuPercent: Double?
+    let memPercent: Double?
+    let memUsedMb: Double?
+    let memTotalMb: Double?
+    let diskPercent: Double?
+    let diskUsedGb: Double?
+    let diskTotalGb: Double?
+    let tempC: Double?
+    let load1: Double?
+    let uptimeSec: Double?
 }
 
 struct ProviderPayload: Decodable {
@@ -725,6 +747,34 @@ private struct PrimaryActionStyle: ButtonStyle {
     }
 }
 
+private struct HealthBar: View {
+    let label: String
+    let percent: Double
+    let detail: String
+    private var clamped: Double { max(0, min(100, percent)) }
+    private var tint: Color {
+        clamped >= 90 ? Color(red: 0.9, green: 0.35, blue: 0.35)
+            : clamped >= 75 ? Color(red: 0.9, green: 0.6, blue: 0.25)
+            : Color(red: 0.28, green: 0.7, blue: 0.55)
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(label).font(.system(size: 11, weight: .semibold))
+                Spacer()
+                Text(detail).font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.primary.opacity(0.08))
+                    Capsule().fill(tint).frame(width: max(3, geo.size.width * clamped / 100))
+                }
+            }
+            .frame(height: 6)
+        }
+    }
+}
+
 private struct SettingRow<Control: View>: View {
     let title: String
     let detail: String
@@ -813,6 +863,7 @@ struct CompanionPanel: View {
             statusIntro
             if model.kvms.isEmpty { emptyState } else { kvmList }
             touchscreenSection
+            cometHealthSection
             metrics
             actions
             if let notice = model.notice {
@@ -837,6 +888,69 @@ struct CompanionPanel: View {
                     .font(.system(size: 9, weight: .bold)).tracking(0.9).foregroundStyle(.secondary)
                 TouchscreenCard(provider: provider, working: usage.working[provider.provider] ?? false)
             }
+        }
+    }
+
+    @ViewBuilder
+    private var cometHealthSection: some View {
+        if let system = model.appUsage?.comet?.system {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("COMET PRO HEALTH")
+                        .font(.system(size: 9, weight: .bold)).tracking(0.9).foregroundStyle(.secondary)
+                    Spacer()
+                    if let version = model.appUsage?.comet?.agentVersion {
+                        Text("agent \(version)").font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
+                    }
+                }
+                VStack(spacing: 10) {
+                    if let cpu = system.cpuPercent {
+                        HealthBar(label: "CPU", percent: cpu, detail: "\(Int(cpu))%")
+                    }
+                    if let mem = system.memPercent {
+                        HealthBar(label: "Memory", percent: mem,
+                                  detail: memDetail(system) ?? "\(Int(mem))%")
+                    }
+                    if let disk = system.diskPercent {
+                        HealthBar(label: "Disk", percent: disk,
+                                  detail: diskDetail(system) ?? "\(Int(disk))%")
+                    }
+                    HStack(spacing: 18) {
+                        if let temp = system.tempC { healthStat("Temp", String(format: "%.0f°C", temp)) }
+                        if let load = system.load1 { healthStat("Load", String(format: "%.2f", load)) }
+                        if let uptime = system.uptimeSec { healthStat("Uptime", uptimeText(uptime)) }
+                        Spacer()
+                    }
+                }
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 13))
+                .overlay(RoundedRectangle(cornerRadius: 13).stroke(Color.primary.opacity(0.07)))
+            }
+        }
+    }
+
+    private func memDetail(_ s: CometSystem) -> String? {
+        guard let used = s.memUsedMb, let total = s.memTotalMb, total > 0 else { return nil }
+        return String(format: "%.1f / %.1f GB", used / 1024, total / 1024)
+    }
+
+    private func diskDetail(_ s: CometSystem) -> String? {
+        guard let used = s.diskUsedGb, let total = s.diskTotalGb, total > 0 else { return nil }
+        return String(format: "%.0f / %.0f GB", used, total)
+    }
+
+    private func uptimeText(_ seconds: Double) -> String {
+        let days = Int(seconds) / 86400, hours = (Int(seconds) % 86400) / 3600
+        if days > 0 { return "\(days)d \(hours)h" }
+        let minutes = (Int(seconds) % 3600) / 60
+        return hours > 0 ? "\(hours)h \(minutes)m" : "\(minutes)m"
+    }
+
+    private func healthStat(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label.uppercased()).font(.system(size: 8.5, weight: .bold)).tracking(0.5).foregroundStyle(.secondary)
+            Text(value).font(.system(size: 13, weight: .semibold))
         }
     }
 
