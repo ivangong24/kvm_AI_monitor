@@ -28,6 +28,12 @@ struct ProviderPayload: Decodable {
     let loggedIn: Bool?
     let limits: [LimitPayload]?
     let daily: [DailyPayload]?
+    let models: [ModelPayload]?
+}
+
+struct ModelPayload: Decodable {
+    let model: String
+    let tokens: Double
 }
 
 struct LimitPayload: Decodable {
@@ -149,9 +155,20 @@ final class MonitorModel: ObservableObject {
         Self.run("/bin/launchctl", ["print", "gui/\(getuid())/com.kvm-ai-monitor.helper"]).status == 0
     }
 
+    private var pushMarker: URL { configDir.appendingPathComponent("last-usage-push") }
+
     private func readLastPush() -> Date? {
-        let log = URL(fileURLWithPath: "/tmp/kvm-ai-helper.log")
-        let attributes = try? FileManager.default.attributesOfItem(atPath: log.path)
+        // The helper writes an ISO timestamp here on each successful push. Prefer its contents;
+        // fall back to the file's mtime. (The old /tmp log only changed on errors, so it read stale.)
+        if let text = try? String(contentsOf: pushMarker, encoding: .utf8) {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            if let date = formatter.date(from: trimmed) { return date }
+            formatter.formatOptions = [.withInternetDateTime]
+            if let date = formatter.date(from: trimmed) { return date }
+        }
+        let attributes = try? FileManager.default.attributesOfItem(atPath: pushMarker.path)
         return attributes?[.modificationDate] as? Date
     }
 
@@ -190,15 +207,27 @@ final class MonitorModel: ObservableObject {
 
     func sendUsageNow() {
         guard !targets.isEmpty, !isSending else { return }
-        let script = helperScript.path
         isSending = true
         notice = nil
+        // Trigger the installed helper's own LaunchAgent rather than spawning our own push: the
+        // agent runs in the context that already has Keychain/network access (a GUI-spawned
+        // subprocess may be denied the device secret), so this succeeds where a direct call fails.
+        let before = readLastPush()
+        let label = "gui/\(getuid())/com.kvm-ai-monitor.helper"
         Task {
-            let result = await Task.detached {
-                Self.run("/usr/bin/env", ["python3", script, "send-usage"])
+            _ = await Task.detached {
+                Self.run("/bin/launchctl", ["kickstart", "-k", label])
             }.value
+            // The push runs asynchronously; watch the success marker to confirm it landed.
+            var updated = false
+            for _ in 0..<24 {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                if let now = readLastPush(), before == nil || now > before! { updated = true; break }
+            }
             isSending = false
-            notice = result.status == 0 ? "Usage updated on your Comet Pro." : "Update failed — open the dashboard for details."
+            notice = updated
+                ? "Usage updated on your Comet Pro."
+                : "Still updating — this can take a moment. Open the dashboard if it persists."
             refresh()
         }
     }
@@ -761,6 +790,25 @@ func tokenShort(_ value: Double) -> String {
     return "\(Int(value.rounded()))"
 }
 
+// "claude-opus-4-8" -> "Opus 4.8", "claude-3-5-haiku-20241022" -> "Haiku 3.5", "gpt-5.6" -> "GPT 5.6".
+func prettyModel(_ raw: String) -> String {
+    let lower = raw.lowercased()
+    let families: [(String, String)] = [
+        ("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku"), ("fable", "Fable"),
+        ("gpt", "GPT"), ("gemini", "Gemini"), ("grok", "Grok"),
+    ]
+    var family: String?
+    for (key, name) in families where lower.contains(key) { family = name; break }
+    guard let name = family else { return raw.count > 18 ? String(raw.prefix(18)) : raw }
+    let groups = raw.components(separatedBy: CharacterSet(charactersIn: "-.")).filter { !$0.isEmpty && $0.allSatisfy(\.isNumber) }
+    var parts: [String] = []
+    for group in groups {
+        if group.count <= 2 { parts.append(group) } else { break }
+        if parts.count == 2 { break }
+    }
+    return parts.isEmpty ? name : "\(name) \(parts.joined(separator: "."))"
+}
+
 func resetRelative(_ iso: String?) -> String? {
     guard let iso else { return nil }
     let formatter = ISO8601DateFormatter()
@@ -969,17 +1017,19 @@ struct UsagePanel: View {
     }
 
     private func compositionCard(_ provider: ProviderPayload) -> some View {
-        let daily = provider.daily ?? []
-        func total(_ path: (DailyPayload) -> Double?) -> Double { daily.reduce(0) { $0 + (path($1) ?? 0) } }
-        let slices = [
-            DonutSlice(label: "Output", value: total { $0.outputTokens }, color: accent),
-            DonutSlice(label: "Input", value: total { $0.inputTokens }, color: Color(red: 0.28, green: 0.7, blue: 0.55)),
-            DonutSlice(label: "Cache read", value: total { $0.cacheReadTokens }, color: Color(red: 0.85, green: 0.6, blue: 0.25)),
-            DonutSlice(label: "Cache write", value: total { $0.cacheCreationTokens }, color: Color(red: 0.6, green: 0.45, blue: 0.85)),
-        ].filter { $0.value > 0 }
-        return card("Token composition · 30 days") {
+        let palette: [Color] = [
+            accent, Color(red: 0.28, green: 0.7, blue: 0.55), Color(red: 0.85, green: 0.6, blue: 0.25),
+            Color(red: 0.6, green: 0.45, blue: 0.85), Color(red: 0.9, green: 0.42, blue: 0.42), Color.gray,
+        ]
+        let models = (provider.models ?? []).filter { $0.tokens > 0 }
+        var slices: [DonutSlice] = models.prefix(5).enumerated().map { index, model in
+            DonutSlice(label: prettyModel(model.model), value: model.tokens, color: palette[index % palette.count])
+        }
+        let remainder = models.dropFirst(5).reduce(0) { $0 + $1.tokens }
+        if remainder > 0 { slices.append(DonutSlice(label: "Other", value: remainder, color: palette[5])) }
+        return card("Models · 30 days") {
             if slices.isEmpty {
-                Text("Per-type breakdown isn’t available for \(MonitorModel.providerName(provider.provider)).")
+                Text("Per-model usage isn’t reported by \(MonitorModel.providerName(provider.provider)).")
                     .font(.system(size: 12)).foregroundStyle(.secondary)
             } else {
                 DonutChart(slices: slices)

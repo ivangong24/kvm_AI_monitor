@@ -458,12 +458,14 @@ def account_limits():
 
 # --- adapter d: local daily token totals (faithful port of ssh_collector.claude_daily) ---
 
-def claude_daily():
+def claude_scan():
+    """One pass over Claude transcripts → (per-day token totals, per-model token totals) for the
+    last 30 days. Shared by claude_daily() and the usage payload so the files are read only once."""
     root = pathlib.Path.home() / ".claude/projects"
     cutoff = datetime.date.today() - datetime.timedelta(days=29)
     messages = {}
     if not root.is_dir():
-        return []
+        return [], []
     for path in root.rglob("*.jsonl"):
         try:
             with path.open(errors="replace") as stream:
@@ -479,6 +481,7 @@ def claude_daily():
                         message_id = message.get("id") or event.get("uuid") or (path.name + ":" + str(index))
                         values = {
                             "date": day.isoformat(),
+                            "model": str(message.get("model") or ""),
                             "inputTokens": number(usage.get("input_tokens")) or 0,
                             "outputTokens": number(usage.get("output_tokens")) or 0,
                             "cacheReadTokens": number(usage.get("cache_read_input_tokens")) or 0,
@@ -488,18 +491,32 @@ def claude_daily():
                         if previous:
                             for key in ("inputTokens", "outputTokens", "cacheReadTokens", "cacheCreationTokens"):
                                 values[key] = max(values[key], previous[key])
+                            values["model"] = values["model"] or previous.get("model", "")
                         messages[message_id] = values
                     except Exception:
                         continue
         except OSError:
             continue
     by_day = {}
+    by_model = {}
     for value in messages.values():
         day = by_day.setdefault(value["date"], {"date": value["date"], "inputTokens": 0, "outputTokens": 0, "cacheReadTokens": 0, "cacheCreationTokens": 0, "totalTokens": 0})
+        subtotal = 0
         for key in ("inputTokens", "outputTokens", "cacheReadTokens", "cacheCreationTokens"):
             day[key] += value[key]
             day["totalTokens"] += value[key]
-    return [by_day[key] for key in sorted(by_day)]
+            subtotal += value[key]
+        model = value.get("model") or ""
+        if model and not model.startswith("<"):
+            by_model[model] = by_model.get(model, 0) + subtotal
+    daily = [by_day[key] for key in sorted(by_day)]
+    models = [{"model": name, "tokens": by_model[name]}
+              for name in sorted(by_model, key=lambda name: -by_model[name]) if by_model[name] > 0]
+    return daily, models
+
+
+def claude_daily():
+    return claude_scan()[0]
 
 
 # --- payload assembly (whitelisted fields only, docs/PUSH_PROTOCOL.md "POST /push/v1/usage") ---
@@ -634,9 +651,11 @@ def claude_usage_payload():
         payload["plan"] = plan
     if limits:
         payload["limits"] = limits[:8]
-    daily = claude_daily()
+    daily, models = claude_scan()
     if daily:
         payload["daily"] = daily[-31:]
+    if models:
+        payload["models"] = models
     return payload
 
 
@@ -770,6 +789,15 @@ def cmd_send_usage(_args):
             print(f"kvm-ai-monitor: {provider_id} usage push failed: {line}", file=sys.stderr)
         if not (errors and len(errors) == total):
             pushed += 1
+    # Record the last successful push so the menu-bar app can show an accurate "last update" time
+    # (the launchd log only changes on output, so its mtime is not a reliable signal).
+    if pushed:
+        try:
+            marker = pathlib.Path.home() / ".kvm-ai-monitor" / "last-usage-push"
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(now_iso() + "\n")
+        except OSError:
+            pass
     # Fail (for launchd) only when we had data but none of it reached any KVM.
     if considered and not pushed:
         sys.exit(1)
