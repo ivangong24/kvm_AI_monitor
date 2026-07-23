@@ -4,17 +4,22 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
+import hmac
 import json
 import math
 import os
 import re
+import secrets
 import shutil
 import socket
+import ssl
 import subprocess
 import tempfile
 import threading
 import time
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from http import HTTPStatus
@@ -47,6 +52,112 @@ COMET_IMAGE_PATH = Path(os.environ.get("KVM_AI_USAGE_COMET_IMAGE", ROOT / "comet
 SSH_KEY_PATH = Path(os.environ.get("KVM_AI_USAGE_SSH_KEY", ROOT / "device-key"))
 PORT = int(os.environ.get("KVM_AI_USAGE_PORT", "8199"))
 PUBLISH_ENABLED = os.environ.get("KVM_AI_USAGE_NO_PUBLISH") != "1"
+
+# --- console authentication -------------------------------------------------------------------
+# The ai-usage console can be served without the main KVM web-login gate (nginx `auth_request off`)
+# so it is reachable at a direct, bookmarkable URL. To keep it protected we do our own auth here:
+# a login form takes the Comet admin password (+ optional 2FA) and we VERIFY it by relaying to the
+# Comet's own login API — we never store the password or reimplement its hashing. On success we set
+# a signed, expiring, HttpOnly session cookie; every /api/* route (except login and the HMAC push
+# endpoints) requires a valid cookie. When the console is left behind the KVM gate instead, these
+# checks are simply never exercised because nginx blocks unauthenticated requests upstream.
+AUTH_SECRET_PATH = Path(os.environ.get("KVM_AI_USAGE_AUTH_SECRET", ROOT / "auth-secret"))
+COMET_LOGIN_URL = os.environ.get("KVM_AI_USAGE_COMET_LOGIN_URL", "https://127.0.0.1/api/auth/login")
+SESSION_COOKIE = "ai_usage_session"
+SESSION_TTL_SECONDS = int(os.environ.get("KVM_AI_USAGE_SESSION_TTL", str(12 * 3600)))
+# When set to "0" the console runs behind the main KVM login (nginx gate) and the agent skips its
+# own auth entirely — a valid escape hatch for anyone who prefers the original behavior.
+AUTH_ENABLED = os.environ.get("KVM_AI_USAGE_AUTH", "1") != "0"
+
+_auth_secret_cache: bytes | None = None
+
+
+def auth_secret() -> bytes:
+    """A persistent random key for signing session cookies. Persisted (0600) so a restart does not
+    invalidate every open console; regenerated only if the file is missing/unreadable."""
+    global _auth_secret_cache
+    if _auth_secret_cache is not None:
+        return _auth_secret_cache
+    try:
+        data = AUTH_SECRET_PATH.read_bytes()
+        if len(data) >= 16:
+            _auth_secret_cache = data
+            return data
+    except OSError:
+        pass
+    secret = secrets.token_bytes(32)
+    try:
+        AUTH_SECRET_PATH.write_bytes(secret)
+        os.chmod(AUTH_SECRET_PATH, 0o600)
+    except OSError:
+        pass
+    _auth_secret_cache = secret
+    return secret
+
+
+def issue_session_cookie() -> str:
+    """A `<payload>.<sig>` token where payload carries the expiry; the HMAC binds it to our secret."""
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"exp": int(time.time()) + SESSION_TTL_SECONDS}).encode()
+    ).decode().rstrip("=")
+    signature = hmac.new(auth_secret(), payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}.{signature}"
+
+
+def session_cookie_valid(token: str) -> bool:
+    if not isinstance(token, str) or token.count(".") != 1:
+        return False
+    payload, signature = token.split(".", 1)
+    expected = hmac.new(auth_secret(), payload.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        return False
+    try:
+        padded = payload + "=" * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(padded))
+    except Exception:
+        return False
+    return isinstance(data, dict) and time.time() < (data.get("exp") or 0)
+
+
+def verify_admin_credentials(password: str, totp: str = "") -> bool:
+    """Validate the admin password (+ optional 2FA) by relaying to the Comet's own login API, exactly
+    as the setup CLI does (multipart `user`/`passwd`, passwd = password concatenated with the 2FA
+    code). A returned token means the credentials are valid. We never persist the password."""
+    if not password:
+        return False
+    boundary = "----kvm-ai-" + secrets.token_hex(8)
+    parts = []
+    for name, value in (("user", "admin"), ("passwd", f"{password}{totp}")):
+        parts.append(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+        )
+    body = ("".join(parts) + f"--{boundary}--\r\n").encode("utf-8")
+    request = urllib.request.Request(
+        COMET_LOGIN_URL, data=body, method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}", "Accept": "application/json"},
+    )
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    try:
+        with urllib.request.urlopen(request, timeout=15, context=context) as response:
+            data = json.loads(response.read() or b"{}")
+    except Exception:
+        return False
+    if not isinstance(data, dict) or data.get("ok") is False:
+        return False
+    result = data.get("result") if isinstance(data.get("result"), dict) else data
+    return bool(isinstance(result, dict) and result.get("token"))
+
+
+def request_session_token(handler: BaseHTTPRequestHandler) -> str:
+    """The session cookie value from the request's Cookie header, or ''."""
+    raw = handler.headers.get("Cookie", "")
+    for part in raw.split(";"):
+        name, _, value = part.strip().partition("=")
+        if name == SESSION_COOKIE:
+            return value
+    return ""
 
 DEFAULT_CONFIG = {
     "enabled": True,
@@ -838,12 +949,32 @@ def summarize_usage(provider: dict[str, object]) -> dict[str, object]:
         })
     activity = provider.get("activity") if isinstance(provider.get("activity"), dict) else {}
     today = activity.get("today") if isinstance(activity.get("today"), dict) else {}
+    # Compact daily series (date + per-type token counts) for the console's usage chart. Kept to the
+    # last 30 entries and only the fields the chart needs so the status payload stays small.
+    daily_source = activity.get("last30Days") if isinstance(activity.get("last30Days"), list) else []
+    daily = [
+        {
+            "date": day.get("date"),
+            "totalTokens": day.get("totalTokens", 0),
+            "inputTokens": day.get("inputTokens", 0),
+            "outputTokens": day.get("outputTokens", 0),
+            "cacheReadTokens": day.get("cacheReadTokens", 0),
+            "cacheCreationTokens": day.get("cacheCreationTokens", 0),
+        }
+        for day in daily_source[-30:]
+        if isinstance(day, dict) and day.get("date")
+    ]
     return {
         "trackedTokenTotalsAvailable": provider.get("trackedTokenTotalsAvailable") is True,
         "creditsRemaining": provider.get("creditsRemaining"),
         "limits": limits,
         "todayTokens": today.get("tokens"),
+        "todayInputTokens": today.get("inputTokens"),
+        "todayOutputTokens": today.get("outputTokens"),
+        "todayCacheReadTokens": today.get("cacheReadTokens"),
+        "todayCacheWriteTokens": today.get("cacheWriteTokens"),
         "last30DaysTokens": activity.get("last30DaysTokens"),
+        "daily": daily,
         "lastUsedAt": activity.get("lastUsedAt"),
         "generatedAt": now.isoformat(),
     }
@@ -1141,6 +1272,16 @@ def render_animation_frames(snapshot: dict[str, object], provider_id: str,
 def build_preview_snapshot(provider_id: str) -> dict[str, object]:
     """Representative sample data for theme previews when no live snapshot exists yet."""
     now = datetime.now(timezone.utc)
+    series = []
+    for offset in range(29, -1, -1):
+        total = int(1_500_000 + 3_600_000 * (0.5 + 0.5 * math.sin(offset * 0.7)) * (0.55 + (offset % 4) * 0.15))
+        series.append({
+            "date": (now - timedelta(days=offset)).date().isoformat(),
+            "totalTokens": total,
+            "inputTokens": int(total * 0.08), "outputTokens": int(total * 0.11),
+            "cacheReadTokens": int(total * 0.74), "cacheCreationTokens": int(total * 0.07),
+        })
+    latest = series[-1]
     return {"generatedAt": utc_now(), "providers": [{
         "id": provider_id, "name": provider_id, "plan": "Pro", "connectionState": "ready",
         "usageAvailable": True, "working": True, "trackedTokenTotalsAvailable": True,
@@ -1150,8 +1291,13 @@ def build_preview_snapshot(provider_id: str) -> dict[str, object]:
             {"label": "Weekly limit", "usedPercent": 63, "windowMinutes": 10080,
              "resetsAt": (now + timedelta(days=2, hours=15)).isoformat()},
         ],
-        "activity": {"today": {"tokens": 5_400_000}, "last30DaysTokens": 128_000_000,
-                     "lastUsedAt": utc_now()},
+        "activity": {
+            "today": {"tokens": latest["totalTokens"], "inputTokens": latest["inputTokens"],
+                      "outputTokens": latest["outputTokens"], "cacheReadTokens": latest["cacheReadTokens"],
+                      "cacheWriteTokens": latest["cacheCreationTokens"]},
+            "last7Days": series[-7:], "last30Days": series,
+            "last30DaysTokens": sum(day["totalTokens"] for day in series), "lastUsedAt": utc_now(),
+        },
     }]}
 
 
@@ -1662,8 +1808,22 @@ class Handler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:
         self.do_GET()
 
+    def authed(self) -> bool:
+        """True when console auth is disabled (nginx gate handles it) or a valid session cookie is
+        present. Static shell assets are public so the login screen can render; everything else and
+        every /api/* route goes through here."""
+        return not AUTH_ENABLED or session_cookie_valid(request_session_token(self))
+
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0]
+        # The HTML shell, icon and provider logos are public so the login screen can render; the
+        # live wallpaper and all /api data require a session.
+        public = path in ("/", "/index.html", "/icon.svg", "/comet-pro.jpg") or (
+            path.startswith("/providers/") and path.endswith(".png")
+        )
+        if not public and not self.authed():
+            self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+            return
         if path in ("/", "/index.html"):
             self.serve_file(INDEX_PATH, "text/html; charset=utf-8")
         elif path == "/icon.svg":
@@ -1676,6 +1836,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.serve_file(PROVIDERS_PATH / name, "image/png", "public, max-age=3600")
             else:
                 self.send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+        elif path == "/api/session":
+            self.send_json(HTTPStatus.OK, {"authenticated": True, "authRequired": AUTH_ENABLED})
         elif path == "/wallpaper.png":
             self.serve_file(WALLPAPER_PATH, "image/png")
         elif path == "/api/status":
@@ -1707,10 +1869,52 @@ class Handler(BaseHTTPRequestHandler):
             raise RuntimeError("JSON body must be an object")
         return value
 
+    def send_json_cookie(self, status: int, value: object, cookie: str) -> None:
+        body = json.dumps(value).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Set-Cookie", cookie)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def handle_login(self) -> None:
+        try:
+            body = self.read_json()
+        except RuntimeError:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid body"})
+            return
+        password = str(body.get("password") or "")
+        totp = re.sub(r"\s+", "", str(body.get("totp") or ""))
+        if not password:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "password required"})
+            return
+        if not verify_admin_credentials(password, totp):
+            self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "invalid credentials"})
+            return
+        cookie = (
+            f"{SESSION_COOKIE}={issue_session_cookie()}; Path=/; HttpOnly; "
+            f"SameSite=Strict; Secure; Max-Age={SESSION_TTL_SECONDS}"
+        )
+        self.send_json_cookie(HTTPStatus.OK, {"ok": True}, cookie)
+
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
         if path in ("/push/v1/usage", "/push/v1/activity"):
             self.handle_push(path)
+            return
+        if path == "/api/login":
+            self.handle_login()
+            return
+        if path == "/api/logout":
+            expired = f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=0"
+            self.send_json_cookie(HTTPStatus.OK, {"ok": True}, expired)
+            return
+        if not self.authed():
+            self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
             return
         try:
             if path == "/api/config":

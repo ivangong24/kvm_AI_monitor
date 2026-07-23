@@ -42,19 +42,26 @@ def mock_status(working=True):
     }
 
 
+LOGGED_IN = {"ok": False}
+
+
 class Handler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(HERE), **kwargs)
 
-    def _json(self, payload):
+    def _json(self, payload, status=200):
         body = json.dumps(payload).encode()
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self):
+        # Set PREVIEW_REQUIRE_LOGIN=1 to preview the agent-hosted login screen (any password works).
+        if os.environ.get("PREVIEW_REQUIRE_LOGIN") == "1" and not LOGGED_IN["ok"] \
+                and self.path.split("?", 1)[0] in ("/api/status", "/api/devices", "/api/theme"):
+            return self._json({"error": "unauthorized"}, status=401)
         if self.path.startswith("/api/status"):
             return self._json(mock_status())
         if self.path.startswith("/api/theme"):
@@ -66,6 +73,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         return super().do_GET()
 
     def do_POST(self):
+        if self.path.startswith("/api/login"):
+            LOGGED_IN["ok"] = True
+            return self._json({"ok": True})
         if self.path.startswith("/api/refresh"):
             return self._json(mock_status())
         return self._json({})
