@@ -11,6 +11,10 @@
         --bg: #f4f5f7; --surface: #ffffff; --line: #e4e7ec;
         --text: #212327; --muted: #7d8590;
         --good: #2f9e63; --warn: #cf8b12; --bad: #dd4f4f;
+        --track-soft: #e9ecf1;
+        --shadow-sm: 0 1px 2px rgba(16, 24, 40, .05), 0 1px 3px rgba(16, 24, 40, .04);
+        --shadow-md: 0 4px 14px rgba(16, 24, 40, .07), 0 1px 3px rgba(16, 24, 40, .05);
+        --radius: 14px;
       }
       * { box-sizing: border-box; }
       [hidden] { display: none !important; }
@@ -25,10 +29,11 @@
       .side-brand { display: flex; align-items: center; gap: 10px; padding: 4px 8px; font-weight: 600; font-size: 15px; }
       .side-brand img { width: 26px; height: 26px; }
       .sidebar nav { display: flex; flex-direction: column; gap: 2px; }
-      .nav-item { display: flex; align-items: center; gap: 10px; padding: 9px 10px; border-radius: 8px; color: var(--muted); text-decoration: none; font-weight: 500; font-size: 13.5px; }
+      .nav-item { position: relative; display: flex; align-items: center; gap: 10px; padding: 9px 10px; border-radius: 8px; color: var(--muted); text-decoration: none; font-weight: 500; font-size: 13.5px; transition: background .14s ease, color .14s ease; }
       .nav-item svg { width: 18px; height: 18px; flex: none; }
       .nav-item:hover { background: var(--bg); color: var(--text); }
-      .nav-item.active { background: var(--accent-soft); color: var(--accent); }
+      .nav-item.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+      .nav-item.active::before { content: ""; position: absolute; left: 2px; top: 50%; transform: translateY(-50%); width: 3px; height: 17px; border-radius: 3px; background: var(--accent); }
       .side-foot { margin-top: auto; font-size: 11.5px; color: var(--muted); padding: 0 8px; line-height: 1.5; overflow-wrap: anywhere; }
 
       .main { flex: 1; min-width: 0; padding: 0 28px 48px; max-width: 1080px; }
@@ -39,8 +44,8 @@
       .chip strong { font-weight: 600; color: var(--text); }
       #error { min-height: 16px; margin: 0 0 10px; color: var(--bad); font-size: 12.5px; }
 
-      .card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; margin-bottom: 14px; box-shadow: 0 1px 2px rgba(16, 24, 40, .04); }
-      .card > h2 { font-size: 15px; font-weight: 600; }
+      .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px 20px; margin-bottom: 14px; box-shadow: var(--shadow-sm); }
+      .card > h2 { font-size: 15px; font-weight: 600; letter-spacing: -.01em; }
       .card > .sub { margin: 2px 0 6px; color: var(--muted); font-size: 12.5px; }
       .row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 13px 0; }
       .row:last-child { padding-bottom: 2px; }
@@ -62,10 +67,11 @@
       code { display: inline-block; padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
 
       .tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 14px; }
-      .tile { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; box-shadow: 0 1px 2px rgba(16, 24, 40, .04); }
+      .tile { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; box-shadow: var(--shadow-sm); transition: border-color .14s ease, box-shadow .14s ease, transform .14s ease; }
+      .tile:hover { border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); box-shadow: var(--shadow-md); transform: translateY(-1px); }
       .tile > span { font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); display: flex; justify-content: space-between; align-items: baseline; gap: 6px; }
       .tile > span .linklike { text-transform: none; letter-spacing: 0; font-size: 11px; }
-      .tile strong { display: block; margin-top: 7px; font-size: 15.5px; font-weight: 600; overflow-wrap: anywhere; }
+      .tile strong { display: block; margin-top: 7px; font-size: 16px; font-weight: 650; letter-spacing: -.01em; overflow-wrap: anywhere; }
       .online { color: var(--good); } .offline { color: var(--bad); }
       .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; flex: none; }
       .dot.ready { background: var(--good); }
@@ -149,12 +155,14 @@
       @media (prefers-reduced-motion: reduce) { .g-anim *, .g-idle * { animation: none !important; } }
 
       /* Comet Pro hardware health gauges */
-      .gauges { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 4px; justify-items: center; }
-      .gauges svg { display: block; width: 100%; max-width: 108px; height: auto; margin: 0 auto; }
-      .gauges svg circle.gauge-value { transition: stroke-dashoffset .55s cubic-bezier(.2, .7, .2, 1); }
+      .gauges { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; margin-top: 6px; }
+      .gauge-tile { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 15px 8px 12px; border: 1px solid var(--line); border-radius: 13px; background: linear-gradient(180deg, var(--surface), var(--bg)); }
+      .gauge-tile svg { display: block; width: 100%; max-width: 96px; height: auto; margin: 0 auto; }
+      .gauge-tile svg circle.gauge-value { transition: stroke-dashoffset .55s cubic-bezier(.2, .7, .2, 1); }
+      .gauge-detail { font-size: 11px; font-weight: 500; color: var(--muted); min-height: 14px; text-align: center; overflow-wrap: anywhere; }
       .health-extra { margin-top: 12px; text-align: center; color: var(--muted); font-size: 12px; }
       .os-row { display: flex; align-items: center; gap: 12px; padding: 4px 0 16px; margin-bottom: 4px; border-bottom: 1px solid var(--line); }
-      .os-icon { width: 42px; height: 42px; flex: none; display: flex; align-items: center; justify-content: center; background: #eef2f6; border: 1px solid var(--line); border-radius: 11px; }
+      .os-icon { width: 42px; height: 42px; flex: none; display: flex; align-items: center; justify-content: center; background: var(--bg); border: 1px solid var(--line); border-radius: 11px; }
       .os-icon svg { width: 28px; height: 28px; display: block; }
       .os-text { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
       .os-eyebrow { font-size: 10px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); }
@@ -207,9 +215,13 @@
       }
       @media (prefers-color-scheme: dark) {
         :root { --accent: #3d8bff; --accent-soft: rgba(61, 139, 255, .14); --accent-strong: #5d9dff;
-                --bg: #16181c; --surface: #21242a; --line: #32363d; --text: #f1f2f4; --muted: #9aa1ab; }
+                --bg: #16181c; --surface: #21242a; --line: #32363d; --text: #f1f2f4; --muted: #9aa1ab;
+                --track-soft: #2b2f36;
+                --shadow-sm: 0 1px 2px rgba(0, 0, 0, .30);
+                --shadow-md: 0 6px 20px rgba(0, 0, 0, .38), 0 1px 3px rgba(0, 0, 0, .3); }
         .switch span::after { background: #e8eaee; }
         .drawer-backdrop { background: rgba(0, 0, 0, .58); }
+        .gauge-tile { background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 92%, #fff), var(--surface)); }
       }
       @media (max-width: 520px) {
         .kvm-device-row { grid-template-columns: 82px minmax(0, 1fr) 16px; gap: 12px; padding: 12px; }
@@ -665,13 +677,19 @@
         const pct = percent == null ? 0 : Math.max(0, Math.min(100, percent));
         const offset = circumference * (1 - pct / 100);
         return `<svg viewBox="0 0 88 88" role="img" aria-label="${label} ${display}">
-          <circle cx="44" cy="44" r="${radius}" fill="none" stroke="var(--line)" stroke-width="8"/>
-          <circle class="gauge-value" cx="44" cy="44" r="${radius}" fill="none" stroke="${color}" stroke-width="8"
+          <circle cx="44" cy="44" r="${radius}" fill="none" stroke="var(--track-soft)" stroke-width="7.5"/>
+          <circle class="gauge-value" cx="44" cy="44" r="${radius}" fill="none" stroke="${color}" stroke-width="7.5"
             stroke-linecap="round" stroke-dasharray="${circumference.toFixed(1)}" stroke-dashoffset="${offset.toFixed(1)}"
             transform="rotate(-90 44 44)"/>
-          <text x="44" y="42" text-anchor="middle" font-size="17" font-weight="700" fill="var(--text)">${display}</text>
-          <text x="44" y="57" text-anchor="middle" font-size="9" letter-spacing=".06em" fill="var(--muted)">${label}</text>
+          <text x="44" y="41" text-anchor="middle" font-size="18" font-weight="700" fill="var(--text)">${display}</text>
+          <text x="44" y="56" text-anchor="middle" font-size="8.5" letter-spacing=".08em" font-weight="600" fill="var(--muted)">${label}</text>
         </svg>`;
+      }
+
+      // A gauge wrapped in a small tile with a caption line (e.g. GB used, load, uptime) so each
+      // metric reads at a glance without a separate summary row.
+      function gaugeTile(label, percent, display, detail, color) {
+        return `<div class="gauge-tile">${gaugeSVG(label, percent, display, color)}<span class="gauge-detail">${detail || ""}</span></div>`;
       }
 
       function formatUptime(seconds) {
@@ -694,7 +712,7 @@
         const card = document.getElementById("health-card");
         const target = document.getElementById("gauges");
         if (!card || !target) return;
-        if (system.cpuPercent == null && system.memPercent == null && system.tempC == null) {
+        if (system.cpuPercent == null && system.memPercent == null && system.tempC == null && system.diskPercent == null) {
           card.hidden = true;
           return;
         }
@@ -702,16 +720,18 @@
         setScreenText("os-name", identity.platformVersion || identity.model || "Linux");
         setScreenText("os-version", identity.firmwareVersion ? `Firmware ${identity.firmwareVersion}` : "");
         const tempPercent = system.tempC != null ? Math.min(100, Math.max(0, system.tempC / 90 * 100)) : null;
+        const pct = value => value == null ? "—" : `${Math.round(value)}%`;
+        const memDetail = (system.memUsedMb != null && system.memTotalMb != null)
+          ? `${(system.memUsedMb / 1024).toFixed(1)} / ${(system.memTotalMb / 1024).toFixed(1)} GB` : "";
+        const diskDetail = (system.diskUsedGb != null && system.diskTotalGb != null)
+          ? `${system.diskUsedGb} / ${system.diskTotalGb} GB` : "";
         target.innerHTML = [
-          gaugeSVG("CPU", system.cpuPercent, system.cpuPercent == null ? "—" : `${system.cpuPercent}%`, bandColor(system.cpuPercent, 60, 85)),
-          gaugeSVG("MEMORY", system.memPercent, system.memPercent == null ? "—" : `${system.memPercent}%`, bandColor(system.memPercent, 70, 88)),
-          gaugeSVG("TEMP", tempPercent, system.tempC == null ? "—" : `${system.tempC}°`, bandColor(system.tempC, 60, 75)),
+          gaugeTile("CPU", system.cpuPercent, pct(system.cpuPercent), system.load1 != null ? `load ${system.load1}` : "", bandColor(system.cpuPercent, 60, 85)),
+          gaugeTile("MEMORY", system.memPercent, pct(system.memPercent), memDetail, bandColor(system.memPercent, 70, 88)),
+          gaugeTile("DISK", system.diskPercent, pct(system.diskPercent), diskDetail, bandColor(system.diskPercent, 75, 90)),
+          gaugeTile("TEMP", tempPercent, system.tempC == null ? "—" : `${system.tempC}°`, system.uptimeSec != null ? `up ${formatUptime(system.uptimeSec)}` : "", bandColor(system.tempC, 60, 75)),
         ].join("");
-        const extra = [];
-        if (system.memUsedMb != null && system.memTotalMb != null) extra.push(`${(system.memUsedMb / 1024).toFixed(1)} / ${(system.memTotalMb / 1024).toFixed(1)} GB`);
-        if (system.load1 != null) extra.push(`load ${system.load1}`);
-        if (system.uptimeSec != null) extra.push(`up ${formatUptime(system.uptimeSec)}`);
-        document.getElementById("health-extra").textContent = extra.join("  ·  ");
+        document.getElementById("health-extra").textContent = "";
       }
 
       function openKvmDrawer() {

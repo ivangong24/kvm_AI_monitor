@@ -37,7 +37,8 @@ def mock_status(working=True):
         "lastSuccessAt": agent.utc_now(), "agentVersion": "preview", "wallpaperReady": False,
         "pushDevices": [], "lastError": None,
         "system": {"cpuPercent": 37, "memPercent": 54, "memUsedMb": 545, "memTotalMb": 1010,
-                   "tempC": 52.4, "load1": 0.42, "uptimeSec": 189342},
+                   "tempC": 52.4, "load1": 0.42, "uptimeSec": 189342,
+                   "diskPercent": 63, "diskUsedGb": 4.7, "diskTotalGb": 7.4},
     }
 
 
