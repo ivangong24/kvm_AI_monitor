@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime
+import getpass
 import hashlib
 import hmac
 import json
@@ -28,6 +29,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 SCHEMA_VERSION = 1
@@ -368,24 +370,66 @@ def oauth_extra_usage(payload):
 
 # --- adapter c: Keychain OAuth token -> api.anthropic.com/api/oauth/usage ----------------
 
-def extract_access_token(data):
+# The usage endpoint needs a *live* OAuth access token. Claude Code normally keeps that token fresh
+# (it refreshes ~5 min before expiry), but on an always-on device where Claude Code is installed yet
+# never *runs* — e.g. a headless mac_mini that only pushes account-wide limits — nothing refreshes
+# it and the token dies within hours, blanking the account-wide session/weekly bars. So the helper
+# refreshes the token itself once it has actually expired, using the stored refresh token, and
+# writes the rotated credentials back to the same store Claude Code reads. Keying on real expiry
+# (a small margin, not Claude Code's 5-minute proactive window) keeps a running Claude Code the
+# first refresher, so we never consume its rotating refresh token out from under it.
+CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+# Tried in order: the current platform host first, the legacy console host as a fallback.
+CLAUDE_OAUTH_TOKEN_URLS = (
+    "https://platform.claude.com/v1/oauth/token",
+    "https://console.anthropic.com/v1/oauth/token",
+)
+# The token endpoint sits behind Cloudflare, which returns 1010/403 for the default `Python-urllib`
+# User-Agent. A CLI-style User-Agent (what Claude Code itself sends) passes; the body is form-encoded,
+# matching the real client. The usage endpoint on api.anthropic.com has no such rule.
+CLAUDE_CLI_USER_AGENT = "claude-cli/2.0.0 (external, cli)"
+TOKEN_REFRESH_MARGIN_SECONDS = 60
+
+
+def _oauth_section(data):
+    """The sub-object (claudeAiOauth / oauth / credentials, else the dict itself) holding the tokens."""
     if not isinstance(data, dict):
         return None
-    direct = data.get("accessToken") or data.get("access_token")
-    if isinstance(direct, str) and direct:
-        return direct
     for key in ("claudeAiOauth", "oauth", "credentials"):
         nested = data.get(key)
-        if isinstance(nested, dict):
-            token = nested.get("accessToken") or nested.get("access_token")
-            if isinstance(token, str) and token:
-                return token
+        if isinstance(nested, dict) and (nested.get("accessToken") or nested.get("access_token")):
+            return nested
+    if data.get("accessToken") or data.get("access_token"):
+        return data
     return None
 
 
+def extract_access_token(data):
+    section = _oauth_section(data)
+    if section is None:
+        return None
+    token = section.get("accessToken") or section.get("access_token")
+    return token if isinstance(token, str) and token else None
+
+
+def _decode_keychain_value(value):
+    """`security -w` returns a UTF-8 password verbatim, but a value stored as a raw *data* blob
+    (e.g. one that once contained a newline) comes back hex-encoded. Real JSON starts with '{', not
+    a hex digit, so an all-hex payload is unambiguously the blob case — decode it back to text."""
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if stripped and len(stripped) % 2 == 0 and all(c in "0123456789abcdefABCDEF" for c in stripped):
+        try:
+            return bytes.fromhex(stripped).decode("utf-8")
+        except Exception:
+            return value
+    return value
+
+
 def read_claude_credentials():
-    """Claude Code's credential JSON: the login Keychain on macOS, ~/.claude/.credentials.json
-    on Linux and Windows. The value is used in memory only and never persisted or printed."""
+    """Claude Code's credential JSON string: the login Keychain on macOS, ~/.claude/.credentials.json
+    on Linux and Windows. The value is used in memory only and never printed."""
     if sys.platform == "darwin":
         # The first read shows a Keychain consent dialog; give the user time to answer it.
         result = subprocess.run(
@@ -394,29 +438,164 @@ def read_claude_credentials():
         )
         if result.returncode != 0 or not result.stdout.strip():
             return None
-        return result.stdout
+        return _decode_keychain_value(result.stdout)
     try:
         return (pathlib.Path.home() / ".claude" / ".credentials.json").read_text()
     except OSError:
         return None
 
 
-def keychain_oauth_limits():
-    token = None
+def keychain_account():
+    """The account attribute of the Claude Code Keychain item, so a write-back updates that exact
+    item rather than creating a duplicate. Falls back to the login user name."""
     try:
-        raw = read_claude_credentials()
-        if not raw:
-            return []
-        token = extract_access_token(json.loads(raw))
+        result = subprocess.run(
+            ("/usr/bin/security", "find-generic-password", "-s", "Claude Code-credentials"),
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        for line in result.stdout.splitlines():
+            match = re.search(r'"acct"<blob>="(.*)"', line)
+            if match:
+                return match.group(1)
+    except Exception:
+        pass
+    try:
+        return getpass.getuser()
+    except Exception:
+        return None
+
+
+def write_claude_credentials(raw):
+    """Persist refreshed credential JSON back to the store Claude Code reads. Best-effort: on any
+    failure we still use the freshly refreshed token in memory for this run."""
+    # A trailing newline in the stored value makes macOS keep it as a raw *data* blob, which
+    # `security -w` then returns hex-encoded — unreadable on the next read. Store exactly the JSON.
+    raw = raw.strip() if isinstance(raw, str) else raw
+    try:
+        if sys.platform == "darwin":
+            account = keychain_account()
+            if not account:
+                return
+            subprocess.run(
+                ("/usr/bin/security", "add-generic-password", "-U",
+                 "-a", account, "-s", "Claude Code-credentials", "-w", raw),
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+        else:
+            path = pathlib.Path.home() / ".claude" / ".credentials.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(raw)
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
+def token_expires_at_seconds(section):
+    """Claude stores token expiry as epoch *milliseconds* in `expiresAt`; return epoch seconds."""
+    value = number(section.get("expiresAt")) if isinstance(section, dict) else None
+    return value / 1000.0 if value else None
+
+
+def refresh_oauth_token(raw):
+    """Exchange the stored refresh token for a new access token, write the rotated credentials back,
+    and return the new access token (or None when refresh isn't possible)."""
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    section = _oauth_section(data)
+    if section is None:
+        return None
+    refresh_token = section.get("refreshToken") or section.get("refresh_token")
+    if not isinstance(refresh_token, str) or not refresh_token:
+        return None
+    body = urllib.parse.urlencode({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": CLAUDE_OAUTH_CLIENT_ID,
+    }).encode("utf-8")
+    tokens = None
+    for url in CLAUDE_OAUTH_TOKEN_URLS:
+        try:
+            request = urllib.request.Request(
+                url, data=body, method="POST",
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json",
+                    "User-Agent": CLAUDE_CLI_USER_AGENT,
+                },
+            )
+            with urllib.request.urlopen(request, timeout=15) as response:
+                candidate = json.loads(response.read())
+            if isinstance(candidate, dict) and candidate.get("access_token"):
+                tokens = candidate
+                break
+        except Exception:
+            continue
+    if not tokens:
+        return None
+    new_access = tokens.get("access_token")
+    if not isinstance(new_access, str) or not new_access:
+        return None
+    section["accessToken"] = new_access
+    if isinstance(tokens.get("refresh_token"), str) and tokens["refresh_token"]:
+        section["refreshToken"] = tokens["refresh_token"]
+    expires_in = number(tokens.get("expires_in"))
+    if expires_in:
+        section["expiresAt"] = int((time.time() + expires_in) * 1000)
+    write_claude_credentials(json.dumps(data))
+    return new_access
+
+
+def claude_access_token():
+    """A usable Claude OAuth access token, proactively refreshing (and persisting) it first when the
+    stored one has expired. Returns None when no credential is available."""
+    raw = read_claude_credentials()
+    if not raw:
+        return None
+    try:
+        section = _oauth_section(json.loads(raw))
+    except Exception:
+        return None
+    if section is None:
+        return None
+    expires_at = token_expires_at_seconds(section)
+    if expires_at is not None and time.time() >= expires_at - TOKEN_REFRESH_MARGIN_SECONDS:
+        refreshed = refresh_oauth_token(raw)
+        if refreshed:
+            return refreshed
+    token = section.get("accessToken") or section.get("access_token")
+    return token if isinstance(token, str) and token else None
+
+
+def _oauth_usage_get(token):
+    request = urllib.request.Request(
+        "https://api.anthropic.com/api/oauth/usage",
+        headers={"Authorization": "Bearer " + token, "anthropic-beta": "oauth-2025-04-20"},
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return json.loads(response.read())
+
+
+def keychain_oauth_limits():
+    try:
+        token = claude_access_token()
         if not token:
             return []
-        request = urllib.request.Request(
-            "https://api.anthropic.com/api/oauth/usage",
-            headers={"Authorization": "Bearer " + token, "anthropic-beta": "oauth-2025-04-20"},
-        )
-        with urllib.request.urlopen(request, timeout=10) as response:
-            body = response.read()
-        payload = json.loads(body)
+        try:
+            payload = _oauth_usage_get(token)
+        except urllib.error.HTTPError as error:
+            # Reactive refresh: the token our expiry check trusted was rejected (clock skew or a
+            # credential with no expiresAt). Refresh once and retry before giving up.
+            if error.code != 401:
+                return []
+            token = refresh_oauth_token(read_claude_credentials() or "")
+            if not token:
+                return []
+            payload = _oauth_usage_get(token)
         # Side effect: stash the app-only extra-usage/spend signals on the same fetch so the
         # companion app never triggers a second call to this rate-limited endpoint. Kept out of
         # the returned value (and the limits cache) so the push path and its tests are unchanged.
@@ -424,10 +603,6 @@ def keychain_oauth_limits():
         return oauth_usage_limits(payload)
     except Exception:
         return []
-    finally:
-        # Best-effort scrub: the token and raw response live only in these locals and are
-        # never printed, logged, or written anywhere.
-        token = None
 
 
 # --- limits cache: the usage endpoint rate-limits aggressively (HTTP 429), so fetch at

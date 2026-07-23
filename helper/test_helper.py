@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.parse
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -286,6 +287,69 @@ class OAuthUsageMappingTests(unittest.TestCase):
         self.assertEqual(helper.extract_access_token({"claudeAiOauth": {"accessToken": "tok-b"}}), "tok-b")
         self.assertIsNone(helper.extract_access_token({"nothing": "here"}))
         self.assertIsNone(helper.extract_access_token("not-a-dict"))
+
+
+class TokenRefreshTests(unittest.TestCase):
+    """The always-on-device path: a stored OAuth token that Claude Code isn't around to refresh."""
+
+    def _creds(self, access, expires_ms, refresh="refresh-1"):
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": access, "refreshToken": refresh, "expiresAt": expires_ms,
+            "scopes": ["user:inference"], "subscriptionType": "pro",
+        }})
+
+    def test_valid_token_is_used_without_refreshing(self):
+        raw = self._creds("live", int((time.time() + 3600) * 1000))
+        with mock.patch("kvm_ai_push.read_claude_credentials", return_value=raw), \
+             mock.patch("kvm_ai_push.refresh_oauth_token") as refresh:
+            self.assertEqual(helper.claude_access_token(), "live")
+        refresh.assert_not_called()
+
+    def test_expired_token_triggers_refresh(self):
+        raw = self._creds("stale", int((time.time() - 10) * 1000))
+        with mock.patch("kvm_ai_push.read_claude_credentials", return_value=raw), \
+             mock.patch("kvm_ai_push.refresh_oauth_token", return_value="fresh") as refresh:
+            self.assertEqual(helper.claude_access_token(), "fresh")
+        refresh.assert_called_once()
+
+    def test_refresh_posts_grant_and_persists_rotated_tokens(self):
+        raw = self._creds("stale", int((time.time() - 10) * 1000), refresh="old-refresh")
+        response = mock.MagicMock()
+        response.read.return_value = json.dumps({
+            "access_token": "new-access", "refresh_token": "new-refresh", "expires_in": 28800,
+        }).encode()
+        response.__enter__.return_value = response
+        saved = {}
+        with mock.patch("kvm_ai_push.urllib.request.urlopen", return_value=response) as urlopen, \
+             mock.patch("kvm_ai_push.write_claude_credentials", side_effect=lambda r: saved.update(json.loads(r))):
+            token = helper.refresh_oauth_token(raw)
+        self.assertEqual(token, "new-access")
+        request = urlopen.call_args.args[0]
+        body = {k: v[0] for k, v in urllib.parse.parse_qs(request.data.decode()).items()}
+        self.assertEqual(body["grant_type"], "refresh_token")
+        self.assertEqual(body["refresh_token"], "old-refresh")
+        self.assertEqual(body["client_id"], helper.CLAUDE_OAUTH_CLIENT_ID)
+        self.assertEqual(request.headers["User-agent"], helper.CLAUDE_CLI_USER_AGENT)
+        section = saved["claudeAiOauth"]
+        self.assertEqual(section["accessToken"], "new-access")
+        self.assertEqual(section["refreshToken"], "new-refresh")
+        self.assertGreater(section["expiresAt"], time.time() * 1000)
+        # Untouched fields survive the round-trip.
+        self.assertEqual(section["subscriptionType"], "pro")
+
+    def test_refresh_without_refresh_token_is_noop(self):
+        raw = json.dumps({"claudeAiOauth": {"accessToken": "x", "expiresAt": 0}})
+        with mock.patch("kvm_ai_push.urllib.request.urlopen") as urlopen:
+            self.assertIsNone(helper.refresh_oauth_token(raw))
+        urlopen.assert_not_called()
+
+    def test_read_decodes_hex_stored_blob(self):
+        # A value stored as a raw data blob comes back hex-encoded from `security -w`.
+        payload = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+        hexed = payload.encode().hex() + "\n"
+        self.assertEqual(json.loads(helper._decode_keychain_value(hexed)), json.loads(payload))
+        # Real JSON (starts with '{', not a hex digit) is returned verbatim.
+        self.assertEqual(helper._decode_keychain_value(payload + "\n").strip(), payload)
 
 
 class MultiTargetTests(HomeIsolatedTestCase):
