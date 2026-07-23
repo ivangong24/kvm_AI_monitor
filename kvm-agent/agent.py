@@ -1077,6 +1077,66 @@ def save_png_atomic(image: Image.Image, output_path: Path, compress_level: int |
             os.unlink(temporary)
 
 
+# Filesystem types that are not real persistent storage (RAM, pseudo, or the read-only firmware
+# image) and so must not be reported as the device's disk.
+NON_STORAGE_FSTYPES = frozenset({
+    "tmpfs", "devtmpfs", "ramfs", "overlay", "squashfs", "proc", "sysfs", "cgroup", "cgroup2",
+    "devpts", "mqueue", "debugfs", "tracefs", "securityfs", "pstore", "autofs", "configfs",
+    "fuse.gvfsd-fuse", "nsfs", "bpf", "efivarfs",
+})
+
+
+def primary_storage_stats() -> dict[str, object]:
+    """The device's real storage, not the tiny writable overlay that backs `/`. On the Comet Pro `/`
+    is `overlay:/overlay` (~1 GB) while the actual eMMC storage is a separate, much larger partition
+    (e.g. /userdata/media ≈ 27 GB). Pick the largest real, writable, block-backed filesystem so the
+    disk gauge reflects the ~30 GB the device actually has; fall back to `/` if none is found."""
+    best = None  # (total_bytes, target, statvfs)
+    try:
+        with open("/proc/mounts") as stream:
+            for line in stream:
+                fields = line.split()
+                if len(fields) < 4:
+                    continue
+                source, target, fstype, options = fields[0], fields[1], fields[2], fields[3]
+                if not source.startswith("/dev/") or fstype in NON_STORAGE_FSTYPES:
+                    continue
+                if "ro" in options.split(","):  # read-only (e.g. the squashfs firmware) is not health
+                    continue
+                try:
+                    info = os.statvfs(target)
+                except OSError:
+                    continue
+                total = info.f_blocks * info.f_frsize
+                if total <= 0:
+                    continue
+                if best is None or total > best[0]:
+                    best = (total, target, info)
+    except OSError:
+        pass
+    if best is None:
+        try:
+            usage = shutil.disk_usage("/")
+            return {
+                "diskTotalGb": round(usage.total / 1e9, 1),
+                "diskUsedGb": round((usage.total - usage.free) / 1e9, 1),
+                "diskPercent": round(100 * (usage.total - usage.free) / usage.total) if usage.total else 0,
+                "diskMount": "/",
+            }
+        except OSError:
+            return {}
+    total, target, info = best
+    total_bytes = info.f_blocks * info.f_frsize
+    free_bytes = info.f_bavail * info.f_frsize
+    used_bytes = max(0, total_bytes - free_bytes)
+    return {
+        "diskTotalGb": round(total_bytes / 1e9, 1),
+        "diskUsedGb": round(used_bytes / 1e9, 1),
+        "diskPercent": round(100 * used_bytes / total_bytes) if total_bytes else 0,
+        "diskMount": target,
+    }
+
+
 def read_system_stats() -> dict[str, object]:
     """Best-effort Comet Pro (Linux) health — CPU %, memory, disk, temperature, load, uptime.
     Returns only the fields it can read; on a non-Linux host (e.g. a dev Mac) it returns an empty
@@ -1135,14 +1195,7 @@ def read_system_stats() -> dict[str, object]:
             stats["uptimeSec"] = int(float(stream.read().split()[0]))
     except (OSError, ValueError):
         pass
-    try:
-        disk = shutil.disk_usage("/")
-        used = disk.total - disk.free
-        stats["diskTotalGb"] = round(disk.total / 1e9, 1)
-        stats["diskUsedGb"] = round(used / 1e9, 1)
-        stats["diskPercent"] = round(100 * used / disk.total) if disk.total else 0
-    except OSError:
-        pass
+    stats.update(primary_storage_stats())
     return stats
 
 
