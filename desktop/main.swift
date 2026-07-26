@@ -80,16 +80,24 @@ struct TerminalOption: Identifiable, Hashable {
 }
 
 // The latest GitHub release, used by the "check for updates" flow.
+struct GitHubReleaseAsset: Decodable {
+    let name: String
+    let browser_download_url: String
+}
+
 struct GitHubRelease: Decodable {
     let tag_name: String
     let html_url: String
+    let assets: [GitHubReleaseAsset]
 }
 
 enum UpdateStatus: Equatable {
     case idle
     case checking
     case upToDate
-    case available(version: String, page: URL)
+    // asset is the app .zip to self-install; nil falls back to opening the release page.
+    case available(version: String, page: URL, asset: URL?)
+    case downloading(version: String)
     case failed(String)
 }
 
@@ -288,7 +296,8 @@ final class MonitorModel: ObservableObject {
         case .idle: return "Check GitHub for the newest companion release."
         case .checking: return "Checking…"
         case .upToDate: return "You’re on the latest release."
-        case .available(let version, _): return "Version \(version) is available."
+        case .available(let version, _, _): return "Version \(version) is available."
+        case .downloading(let version): return "Downloading \(version)…"
         case .failed(let message): return message
         }
     }
@@ -609,11 +618,106 @@ final class MonitorModel: ObservableObject {
         openInTerminal(command, clipboardNotice: "Setup command copied — paste it into \(selectedTerminal.name) and press Return.")
     }
 
-    // Upgrade the companion app in place via the Homebrew cask instead of just opening the download
-    // page. Falls back to the release page when the app was not installed through Homebrew.
-    func runUpdateInTerminal(page: URL) {
-        let command = "if brew list --cask kvm-ai-monitor >/dev/null 2>&1; then brew upgrade --cask kvm-ai-monitor; else open \"\(page.absoluteString)\"; fi"
-        openInTerminal(command, clipboardNotice: "Update command copied — paste it into \(selectedTerminal.name) and press Return.")
+    // Self-install the update: download the release .app archive, hand a small detached helper the
+    // job of swapping this bundle once we quit, then relaunch. No Homebrew — works for any install
+    // location. Falls back to the release page when the release has no downloadable archive.
+    func installUpdate(version: String, asset: URL?, page: URL) {
+        guard let asset else {
+            NSWorkspace.shared.open(page)
+            return
+        }
+        if case .downloading = updateStatus { return }
+        updateStatus = .downloading(version: version)
+        notice = nil
+        let destPath = Bundle.main.bundlePath
+        Task {
+            // nil means the swap helper is staged and running; any string is a failure reason.
+            if let failure = await Self.performSelfUpdate(asset: asset, destPath: destPath) {
+                updateStatus = .available(version: version, page: page, asset: asset)
+                notice = "Update failed: \(failure). Try again, or download it from the release page."
+            } else {
+                // The helper waits for us to exit, then swaps the bundle and reopens the new app.
+                notice = "Installing update — the app will relaunch."
+                NSApp.terminate(nil)
+            }
+        }
+    }
+
+    // Runs off the main actor: download, unpack, and stage the swap helper. Returns nil once the
+    // helper is launched (the bundle replacement happens after the app terminates), else a reason.
+    nonisolated private static func performSelfUpdate(asset: URL, destPath: String) async -> String? {
+        var request = URLRequest(url: asset)
+        request.setValue("KVM-AI-Monitor", forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 120
+        let downloadedZip: URL
+        do {
+            let (temp, response) = try await URLSession.shared.download(for: request)
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            guard code == 200 else { return "download failed (HTTP \(code))" }
+            downloadedZip = temp
+        } catch {
+            return error.localizedDescription
+        }
+
+        let work = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kvm-ai-update-\(UUID().uuidString)")
+        let extractDir = work.appendingPathComponent("extract")
+        do {
+            try FileManager.default.createDirectory(at: extractDir, withIntermediateDirectories: true)
+        } catch {
+            return "could not prepare the update"
+        }
+        // ditto reads Apple's zip layout (what the release workflow produces) correctly.
+        guard Self.run("/usr/bin/ditto", ["-x", "-k", downloadedZip.path, extractDir.path]).status == 0 else {
+            return "could not unpack the update"
+        }
+        guard let appName = (try? FileManager.default.contentsOfDirectory(atPath: extractDir.path))?
+            .first(where: { $0.hasSuffix(".app") }) else {
+            return "the update archive contained no app"
+        }
+        let newApp = extractDir.appendingPathComponent(appName).path
+
+        let script = work.appendingPathComponent("swap.sh")
+        let scriptBody = """
+        #!/bin/sh
+        # Args: <pid> <dest-bundle> <new-app> <work-dir>. Wait for the app to quit, replace its
+        # bundle (rolling back on failure), relaunch, then clean up.
+        PID="$1"; DEST="$2"; NEW="$3"; WORK="$4"
+        i=0
+        while kill -0 "$PID" 2>/dev/null && [ "$i" -lt 300 ]; do sleep 0.2; i=$((i + 1)); done
+        sleep 0.3
+        xattr -dr com.apple.quarantine "$NEW" 2>/dev/null
+        rm -rf "$DEST.kvm-old"
+        if [ -d "$DEST" ]; then mv "$DEST" "$DEST.kvm-old" 2>/dev/null; fi
+        if ditto "$NEW" "$DEST"; then
+            rm -rf "$DEST.kvm-old"
+        else
+            rm -rf "$DEST"
+            [ -d "$DEST.kvm-old" ] && mv "$DEST.kvm-old" "$DEST"
+        fi
+        open "$DEST"
+        rm -rf "$WORK"
+        """
+        do {
+            try scriptBody.write(to: script, atomically: true, encoding: .utf8)
+        } catch {
+            return "could not stage the updater"
+        }
+        let pid = String(ProcessInfo.processInfo.processIdentifier)
+        guard Self.spawnDetached("/bin/sh", [script.path, pid, destPath, newApp, work.path]) else {
+            return "could not start the updater"
+        }
+        return nil
+    }
+
+    // Launch a process without waiting; it outlives us so it can swap the bundle after we quit.
+    nonisolated private static func spawnDetached(_ tool: String, _ arguments: [String]) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: tool)
+        process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do { try process.run(); return true } catch { return false }
     }
 
     // Run a shell command in the user's chosen terminal, reused by the setup and update flows.
@@ -669,7 +773,7 @@ final class MonitorModel: ObservableObject {
     // and never clobber a pending manual check or an already-surfaced available update.
     func checkForUpdatesIfDue() {
         switch updateStatus {
-        case .checking, .available: return
+        case .checking, .available, .downloading: return
         default: break
         }
         if let last = lastUpdateCheck, Date().timeIntervalSince(last) < 6 * 3600 { return }
@@ -688,7 +792,11 @@ final class MonitorModel: ObservableObject {
                 let latest = release.tag_name.hasPrefix("v")
                     ? String(release.tag_name.dropFirst()) : release.tag_name
                 if Self.isVersion(latest, newerThan: current), let page = URL(string: release.html_url) {
-                    updateStatus = .available(version: latest, page: page)
+                    // Prefer the .app archive so "Get update" can self-install; nil -> open the page.
+                    let asset = release.assets
+                        .first { $0.name.hasSuffix(".zip") }
+                        .flatMap { URL(string: $0.browser_download_url) }
+                    updateStatus = .available(version: latest, page: page, asset: asset)
                 } else {
                     updateStatus = .upToDate
                 }
@@ -1403,10 +1511,10 @@ struct CompanionPanel: View {
             settingsGroup(title: "About") {
                 SettingRow(title: "Version \(model.currentVersion)", detail: model.updateDetail) {
                     switch model.updateStatus {
-                    case .checking:
+                    case .checking, .downloading:
                         ProgressView().controlSize(.small)
-                    case .available(_, let page):
-                        Button { model.runUpdateInTerminal(page: page) } label: {
+                    case .available(let version, let page, let asset):
+                        Button { model.installUpdate(version: version, asset: asset, page: page) } label: {
                             Label("Get update", systemImage: "arrow.down.circle.fill")
                         }
                         .buttonStyle(.borderedProminent)
