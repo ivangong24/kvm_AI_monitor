@@ -11,11 +11,11 @@ jobs:
   package:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build universal app archive
         run: ./desktop/package-release.sh
       - name: Attach app to the GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: desktop/dist/KVM-AI-Monitor-v*.zip
     # The Homebrew tap keeps itself in sync: a scheduled workflow in
