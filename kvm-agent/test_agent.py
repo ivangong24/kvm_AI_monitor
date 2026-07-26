@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 os.environ.setdefault("KVM_AI_USAGE_AUTH_SECRET", "/tmp/kvm-ai-usage-test-secret")
+os.environ.setdefault("KVM_AI_USAGE_PROVISION_TOKEN", "/tmp/kvm-ai-usage-test-provision")
 
 import agent  # noqa: E402
 
@@ -43,6 +44,20 @@ class SessionCookieTests(unittest.TestCase):
         self.assertEqual(agent.request_session_token(handler), "abc.def")
         handler.headers = {}
         self.assertEqual(agent.request_session_token(handler), "")
+
+
+class ProvisionTokenTests(unittest.TestCase):
+    def test_token_persists_and_authorizes(self):
+        token = agent.provision_token()
+        self.assertGreaterEqual(len(token), 16)
+        self.assertEqual(token, agent.provision_token())  # cached and stable across calls
+        handler = SimpleNamespace(headers={"X-KVM-Provision": token})
+        self.assertTrue(agent.Handler.provision_authorized(handler))
+
+    def test_rejects_wrong_or_missing_token(self):
+        for headers in ({"X-KVM-Provision": "not-the-token"}, {"X-KVM-Provision": ""}, {}):
+            handler = SimpleNamespace(headers=headers)
+            self.assertFalse(agent.Handler.provision_authorized(handler))
 
 
 class AdminRelayTests(unittest.TestCase):

@@ -31,7 +31,7 @@ from push_receiver import DeviceStore, PushReceiver
 from ssh_collector import SshCollector, build_usage_snapshot
 
 
-AGENT_VERSION = "0.8.1"  # Keep in step with package.json; surfaced on /api/status for updates.
+AGENT_VERSION = "0.8.2"  # Keep in step with package.json; surfaced on /api/status for updates.
 
 ROOT = Path(os.environ.get("KVM_AI_USAGE_ROOT", "/etc/kvmd/user/ai-usage"))
 CONFIG_PATH = Path(os.environ.get("KVM_AI_USAGE_CONFIG", ROOT / "config.json"))
@@ -69,7 +69,14 @@ SESSION_TTL_SECONDS = int(os.environ.get("KVM_AI_USAGE_SESSION_TTL", str(12 * 36
 # own auth entirely — a valid escape hatch for anyone who prefers the original behavior.
 AUTH_ENABLED = os.environ.get("KVM_AI_USAGE_AUTH", "1") != "0"
 
+# A 0600 token for on-device provisioning. The setup wizard runs as root over the KVM web terminal,
+# reads this file, and presents it (X-KVM-Provision header) to create this computer's push device
+# without a browser console session. Console/nginx clients cannot read the file, so it never leaves
+# the device — and going through the running agent avoids a cross-process race on devices.json.
+PROVISION_TOKEN_PATH = Path(os.environ.get("KVM_AI_USAGE_PROVISION_TOKEN", ROOT / "provision-token"))
+
 _auth_secret_cache: bytes | None = None
+_provision_token_cache: str | None = None
 
 
 def auth_secret() -> bytes:
@@ -93,6 +100,29 @@ def auth_secret() -> bytes:
         pass
     _auth_secret_cache = secret
     return secret
+
+
+def provision_token() -> str:
+    """The persistent on-device provisioning token (see PROVISION_TOKEN_PATH). Created 0600 on first
+    use and cached; main() touches it at startup so setup can read it right after the agent comes up."""
+    global _provision_token_cache
+    if _provision_token_cache is not None:
+        return _provision_token_cache
+    try:
+        text = PROVISION_TOKEN_PATH.read_text(encoding="ascii").strip()
+        if len(text) >= 16:
+            _provision_token_cache = text
+            return text
+    except OSError:
+        pass
+    token = secrets.token_hex(24)
+    try:
+        PROVISION_TOKEN_PATH.write_text(token, encoding="ascii")
+        os.chmod(PROVISION_TOKEN_PATH, 0o600)
+    except OSError:
+        pass
+    _provision_token_cache = token
+    return token
 
 
 def issue_session_cookie() -> str:
@@ -1871,6 +1901,12 @@ class Handler(BaseHTTPRequestHandler):
         every /api/* route goes through here."""
         return not AUTH_ENABLED or session_cookie_valid(request_session_token(self))
 
+    def provision_authorized(self) -> bool:
+        """True when the caller presents the on-device provisioning token. Only used to allow
+        creating a push device during setup without a console session; see PROVISION_TOKEN_PATH."""
+        supplied = self.headers.get("X-KVM-Provision", "")
+        return bool(supplied) and hmac.compare_digest(supplied, provision_token())
+
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0]
         # The HTML shell, icon and provider logos are public so the login screen can render; the
@@ -1975,8 +2011,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json_cookie(HTTPStatus.OK, {"ok": True}, expired)
             return
         if not self.authed():
-            self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
-            return
+            # Setup provisions this computer's push device with the on-device token instead of a
+            # browser session; every other write still needs a console login.
+            if not (path == "/api/devices" and self.provision_authorized()):
+                self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+                return
         try:
             if path == "/api/config":
                 self.send_json(HTTPStatus.OK, self.agent.update_config(self.read_json()))
@@ -2100,6 +2139,7 @@ def main() -> None:
         print(json.dumps(status, indent=2))
         raise SystemExit(0 if status["lastError"] is None else 1)
 
+    provision_token()  # ensure the 0600 token file exists so setup can read it right after startup
     worker = threading.Thread(target=agent.run, name="wallpaper-worker", daemon=True)
     worker.start()
     server = ControlServer(("127.0.0.1", PORT), agent)

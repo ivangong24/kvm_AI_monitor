@@ -354,10 +354,17 @@ async function enrollThisDevice(host) {
       return;
     }
   }
-  const name = hostname().replace(/\.local$/i, "").slice(0, 48) || label;
+  const suggested = hostname().replace(/\.local$/i, "").slice(0, 48) || label;
+  const name = (await ask(`Name this ${label} on the KVM [${suggested}]: `, { fallback: suggested }))
+    .slice(0, 48) || suggested;
+  // Device creation needs a console session; setup has none, so it reads the agent's on-device
+  // provisioning token (a 0600 file only on-device root can see) and presents it as a header.
+  const body = JSON.stringify({ name }).replaceAll("'", "'\\''");
   const create = webterm(
     host,
-    `curl -s -X POST http://127.0.0.1:8199/api/devices -H 'Content-Type: application/json' -d '${JSON.stringify({ name }).replaceAll("'", "'\\''")}'`,
+    `curl -s -X POST http://127.0.0.1:8199/api/devices ` +
+    `-H "X-KVM-Provision: $(cat /etc/kvmd/user/ai-usage/provision-token 2>/dev/null)" ` +
+    `-H 'Content-Type: application/json' -d '${body}'`,
   );
   const match = create.output.match(/\{"id":\s*"(d-[0-9a-f]{8})",\s*"name":.*?"secret":\s*"([0-9a-f]{48})"\}/);
   if (!match) {
