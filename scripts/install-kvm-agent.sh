@@ -21,5 +21,6 @@ PAYLOAD=$(base64 < "$ARCHIVE" | tr -d '\n')
 } | node "$PROJECT_DIR/scripts/kvm-webterm-command.mjs" --stdin
 
 sleep 7
+# Public liveness probe — /api/status now requires a console session, so a plain curl there 401s.
 node "$PROJECT_DIR/scripts/kvm-webterm-command.mjs" \
-    "curl -fsS http://127.0.0.1:8199/api/status"
+    "curl -fsS http://127.0.0.1:8199/api/health"

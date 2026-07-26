@@ -234,7 +234,11 @@ async function authorize(host) {
 function installAgent(host) {
   const result = runScript(posixShell(), { args: [join(PROJECT_DIR, "scripts", "install-kvm-agent.sh")], env: { KVM_IP: host } });
   if (result.status !== 0) {
-    throw new Error(`Agent install failed: ${result.stderr.split("\n").filter(Boolean).at(-1) ?? "unknown error"}`);
+    // The on-device command runs over the web terminal, which relays its output (including any
+    // error) on stdout, not stderr — so fall back to stdout before giving up with "unknown error".
+    const lastLine = (text) => text.split("\n").map((line) => line.trim()).filter(Boolean).at(-1);
+    const detail = lastLine(result.stderr) ?? lastLine(result.stdout) ?? "unknown error";
+    throw new Error(`Agent install failed: ${detail}`);
   }
   ok("AI usage agent installed on the KVM");
 }

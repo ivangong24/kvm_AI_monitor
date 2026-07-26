@@ -1875,7 +1875,9 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         # The HTML shell, icon and provider logos are public so the login screen can render; the
         # live wallpaper and all /api data require a session.
-        public = path in ("/", "/index.html", "/icon.svg", "/comet-pro.jpg") or (
+        # /api/health is a public liveness probe (no session): the setup wizard curls it right after
+        # install to confirm the agent came up, and it must work whether or not console auth is on.
+        public = path in ("/", "/index.html", "/icon.svg", "/comet-pro.jpg", "/api/health") or (
             path.startswith("/providers/") and path.endswith(".png")
         )
         if not public and not self.authed():
@@ -1893,6 +1895,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.serve_file(PROVIDERS_PATH / name, "image/png", "public, max-age=3600")
             else:
                 self.send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+        elif path == "/api/health":
+            self.send_json(HTTPStatus.OK, {"ok": True, "version": AGENT_VERSION})
         elif path == "/api/session":
             self.send_json(HTTPStatus.OK, {"authenticated": True, "authRequired": AUTH_ENABLED})
         elif path == "/wallpaper.png":
