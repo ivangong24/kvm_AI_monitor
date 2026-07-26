@@ -18,3 +18,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: desktop/dist/KVM-AI-Monitor-v*.zip
+    # The Homebrew tap keeps itself in sync: a scheduled workflow in
+    # ivangong24/homebrew-kvm-ai-monitor polls this repo's latest release and bumps its own formula
+    # and cask, so no cross-repo push (and no PAT) is needed here.

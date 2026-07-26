@@ -330,6 +330,7 @@ final class MonitorModel: ObservableObject {
         // the model (which outlives any panel view), not off a view's onAppear.
         applyRefreshInterval()
         loadUsage(force: true)
+        checkForUpdatesIfDue()
     }
 
     // MARK: Menu-bar summary
@@ -601,7 +602,22 @@ final class MonitorModel: ObservableObject {
     }
 
     func runSetupInTerminal() {
-        let command = "command -v kvm-ai-monitor >/dev/null 2>&1 || brew install ivangong24/kvm-ai-monitor/kvm-ai-monitor; kvm-ai-monitor"
+        // Always land on the latest published formula. `reinstall` (not `upgrade`) is deliberate: the
+        // CLI was renumbered from a 1.x line down to 0.x, so Homebrew treats a stale 1.6.0 as "newer"
+        // and would refuse to upgrade — reinstall pulls the current tag regardless of version order.
+        let command = "if command -v brew >/dev/null 2>&1; then if brew list kvm-ai-monitor >/dev/null 2>&1; then brew reinstall ivangong24/kvm-ai-monitor/kvm-ai-monitor; else brew install ivangong24/kvm-ai-monitor/kvm-ai-monitor; fi; fi; kvm-ai-monitor"
+        openInTerminal(command, clipboardNotice: "Setup command copied — paste it into \(selectedTerminal.name) and press Return.")
+    }
+
+    // Upgrade the companion app in place via the Homebrew cask instead of just opening the download
+    // page. Falls back to the release page when the app was not installed through Homebrew.
+    func runUpdateInTerminal(page: URL) {
+        let command = "if brew list --cask kvm-ai-monitor >/dev/null 2>&1; then brew upgrade --cask kvm-ai-monitor; else open \"\(page.absoluteString)\"; fi"
+        openInTerminal(command, clipboardNotice: "Update command copied — paste it into \(selectedTerminal.name) and press Return.")
+    }
+
+    // Run a shell command in the user's chosen terminal, reused by the setup and update flows.
+    private func openInTerminal(_ command: String, clipboardNotice: String) {
         let terminal = selectedTerminal
         notice = nil
         switch terminal.launch {
@@ -628,7 +644,7 @@ final class MonitorModel: ObservableObject {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(command, forType: .string)
             _ = Self.run("/usr/bin/open", ["-a", terminal.name])
-            notice = "Setup command copied — paste it into \(terminal.name) and press Return."
+            notice = clipboardNotice
         }
     }
 
@@ -646,9 +662,24 @@ final class MonitorModel: ObservableObject {
             .replacingOccurrences(of: "\"", with: "\\\"")
     }
 
+    // Last time an automatic check ran, so launch + panel-open triggers don't hammer the GitHub API.
+    private var lastUpdateCheck: Date?
+
+    // Automatic detection: check on launch and when the panel opens, but at most once every few hours,
+    // and never clobber a pending manual check or an already-surfaced available update.
+    func checkForUpdatesIfDue() {
+        switch updateStatus {
+        case .checking, .available: return
+        default: break
+        }
+        if let last = lastUpdateCheck, Date().timeIntervalSince(last) < 6 * 3600 { return }
+        checkForUpdates()
+    }
+
     func checkForUpdates() {
         if case .checking = updateStatus { return }
         updateStatus = .checking
+        lastUpdateCheck = Date()
         let current = currentVersion
         Task {
             let result = await Self.fetchLatestRelease()
@@ -1040,7 +1071,7 @@ struct CompanionPanel: View {
         }
         .frame(width: 382, height: 560)
         .background(.regularMaterial)
-        .onAppear { model.refresh(); model.loadUsage(force: true) }
+        .onAppear { model.refresh(); model.loadUsage(force: true); model.checkForUpdatesIfDue() }
         .onReceive(Timer.publish(every: 20, on: .main, in: .common).autoconnect()) { _ in
             model.refresh()
             model.loadUsage()
@@ -1375,7 +1406,7 @@ struct CompanionPanel: View {
                     case .checking:
                         ProgressView().controlSize(.small)
                     case .available(_, let page):
-                        Button { NSWorkspace.shared.open(page) } label: {
+                        Button { model.runUpdateInTerminal(page: page) } label: {
                             Label("Get update", systemImage: "arrow.down.circle.fill")
                         }
                         .buttonStyle(.borderedProminent)
