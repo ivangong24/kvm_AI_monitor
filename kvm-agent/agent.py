@@ -31,7 +31,7 @@ from push_receiver import DeviceStore, PushReceiver
 from ssh_collector import SshCollector, build_usage_snapshot
 
 
-AGENT_VERSION = "0.8.0"  # Keep in step with package.json; surfaced on /api/status for updates.
+AGENT_VERSION = "0.8.1"  # Keep in step with package.json; surfaced on /api/status for updates.
 
 ROOT = Path(os.environ.get("KVM_AI_USAGE_ROOT", "/etc/kvmd/user/ai-usage"))
 CONFIG_PATH = Path(os.environ.get("KVM_AI_USAGE_CONFIG", ROOT / "config.json"))
@@ -940,10 +940,12 @@ def summarize_usage(provider: dict[str, object]) -> dict[str, object]:
             continue
         percent, has_percent = limit_percent(item)
         window = window_label(item, "")
+        window_minutes = item.get("windowMinutes")
         limits.append({
             "label": item.get("label"),
             "usedPercent": round(percent) if has_percent else None,
             "windowLabel": window or None,
+            "windowMinutes": int(window_minutes) if isinstance(window_minutes, (int, float)) else None,
             "resetsAt": item.get("resetsAt"),
             "resetLabel": short_reset(item.get("resetsAt")) if item.get("resetsAt") else None,
         })
@@ -974,6 +976,7 @@ def summarize_usage(provider: dict[str, object]) -> dict[str, object]:
         "todayCacheReadTokens": today.get("cacheReadTokens"),
         "todayCacheWriteTokens": today.get("cacheWriteTokens"),
         "last30DaysTokens": activity.get("last30DaysTokens"),
+        "last30DaysCostUSD": activity.get("last30DaysCostUSD"),
         "daily": daily,
         "lastUsedAt": activity.get("lastUsedAt"),
         "generatedAt": now.isoformat(),
@@ -1349,7 +1352,8 @@ def build_preview_snapshot(provider_id: str) -> dict[str, object]:
                       "outputTokens": latest["outputTokens"], "cacheReadTokens": latest["cacheReadTokens"],
                       "cacheWriteTokens": latest["cacheCreationTokens"]},
             "last7Days": series[-7:], "last30Days": series,
-            "last30DaysTokens": sum(day["totalTokens"] for day in series), "lastUsedAt": utc_now(),
+            "last30DaysTokens": sum(day["totalTokens"] for day in series),
+            "last30DaysCostUSD": 84.20, "lastUsedAt": utc_now(),
         },
     }]}
 

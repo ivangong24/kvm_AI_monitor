@@ -8,6 +8,7 @@ import AppKit
 import Combine
 import ServiceManagement
 import SwiftUI
+import UserNotifications
 
 struct PushTarget: Identifiable, Hashable {
     var id: String { host + deviceId }
@@ -16,6 +17,37 @@ struct PushTarget: Identifiable, Hashable {
 }
 
 enum Panel { case home, usage, settings }
+
+// What the macOS menu bar shows at a glance — mirrors CodexBar/ClaudeBar's live metric.
+enum MenuBarMode: String, CaseIterable, Identifiable {
+    case icon, limitPercent, costToday, dual
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .icon: return "Icon only"
+        case .limitPercent: return "Limit %"
+        case .costToday: return "Cost today"
+        case .dual: return "Session + weekly"
+        }
+    }
+}
+
+// Shared usage color bands so the menu bar, limit bars, and health gauges all agree.
+// <75 calm green · 75–90 amber · ≥90 red.
+func usageTint(_ percent: Double) -> Color {
+    percent >= 90 ? Color(red: 0.9, green: 0.35, blue: 0.35)
+        : percent >= 75 ? Color(red: 0.9, green: 0.6, blue: 0.25)
+        : Color(red: 0.28, green: 0.7, blue: 0.55)
+}
+
+// A live menu-bar summary derived from the most-constrained limit of the active provider.
+struct MenuBarSummary {
+    var text: String
+    var secondary: String?
+    var tint: Color
+    var provider: String
+    var working: Bool
+}
 
 // A terminal the companion can open for the guided setup / device management. Terminal and iTerm are
 // driven by their AppleScript dictionaries (a command lands in a new window, ready to run). Terminals
@@ -197,6 +229,35 @@ final class MonitorModel: ObservableObject {
         }
     }
 
+    // What the menu bar renders. Default to the primary-limit percentage (the CodexBar/ClaudeBar
+    // signature); the user can switch to cost, a dual session/weekly readout, or the plain icon.
+    @Published var menuBarMode: MenuBarMode =
+        MenuBarMode(rawValue: UserDefaults.standard.string(forKey: "menuBarMode") ?? "") ?? .limitPercent {
+        didSet { UserDefaults.standard.set(menuBarMode.rawValue, forKey: "menuBarMode") }
+    }
+
+    // Native macOS alerts when the primary limit crosses a chosen percentage.
+    @Published var notificationsEnabled: Bool =
+        UserDefaults.standard.object(forKey: "notificationsEnabled") as? Bool ?? false {
+        didSet {
+            UserDefaults.standard.set(notificationsEnabled, forKey: "notificationsEnabled")
+            if notificationsEnabled { requestNotificationAuth() }
+        }
+    }
+    @Published var notificationThresholds: Set<Int> =
+        MonitorModel.loadThresholds() {
+        didSet {
+            UserDefaults.standard.set(Array(notificationThresholds).sorted(), forKey: "notificationThresholds")
+        }
+    }
+
+    private static func loadThresholds() -> Set<Int> {
+        if let stored = UserDefaults.standard.array(forKey: "notificationThresholds") as? [Int] {
+            return Set(stored)
+        }
+        return [75, 90]
+    }
+
     @Published var updateStatus: UpdateStatus = .idle
     @Published var preferredTerminalID: String =
         UserDefaults.standard.string(forKey: "preferredTerminalID") ?? TerminalOption.all[0].id {
@@ -262,6 +323,151 @@ final class MonitorModel: ObservableObject {
     }
 
     var isHealthy: Bool { !kvms.isEmpty && !targets.isEmpty && helperLoaded }
+
+    init() {
+        refresh()
+        // Keep the menu-bar metric live even while the popover is closed: the usage timer runs off
+        // the model (which outlives any panel view), not off a view's onAppear.
+        applyRefreshInterval()
+        loadUsage(force: true)
+    }
+
+    // MARK: Menu-bar summary
+
+    // The provider whose number the menu bar should show: the one actively working, else the one the
+    // user is viewing, else the first available.
+    private var menuBarProvider: ProviderPayload? {
+        guard let usage = appUsage else { return nil }
+        let workingId = usage.working.first(where: { $0.value })?.key
+        return usage.providers.first { $0.provider == workingId }
+            ?? usage.providers.first { $0.provider == usageProvider }
+            ?? usage.providers.first
+    }
+
+    // The most-constrained limit (highest used %) for a provider — what "am I about to hit a wall?"
+    // really means. Ties break toward the shorter window (session before weekly).
+    func primaryLimit(_ provider: ProviderPayload) -> LimitPayload? {
+        (provider.limits ?? [])
+            .filter { $0.usedPercent != nil }
+            .max { lhs, rhs in
+                let l = lhs.usedPercent ?? 0, r = rhs.usedPercent ?? 0
+                if l != r { return l < r }
+                return (lhs.windowMinutes ?? Int.max) > (rhs.windowMinutes ?? Int.max)
+            }
+    }
+
+    var menuBarSummary: MenuBarSummary? {
+        guard let provider = menuBarProvider else { return nil }
+        let working = appUsage?.working[provider.provider] ?? false
+        let limits = provider.limits ?? []
+        switch menuBarMode {
+        case .icon:
+            return nil
+        case .costToday:
+            guard let today = provider.cost?.today else {
+                // Fall back to the limit if this provider reports no cost.
+                return limitSummary(provider, working: working)
+            }
+            return MenuBarSummary(text: String(format: "$%.2f", today), secondary: nil,
+                                  tint: .primary, provider: provider.provider, working: working)
+        case .dual:
+            let session = limits.first?.usedPercent
+            let weekly = limits.count > 1 ? limits[1].usedPercent : nil
+            let worst = max(session ?? 0, weekly ?? 0)
+            let text = session.map { "\(Int($0))%" } ?? "--"
+            let secondary = weekly.map { "\(Int($0))%" }
+            return MenuBarSummary(text: text, secondary: secondary, tint: usageTint(worst),
+                                  provider: provider.provider, working: working)
+        case .limitPercent:
+            return limitSummary(provider, working: working)
+        }
+    }
+
+    private func limitSummary(_ provider: ProviderPayload, working: Bool) -> MenuBarSummary? {
+        guard let limit = primaryLimit(provider), let percent = limit.usedPercent else {
+            return MenuBarSummary(text: "--", secondary: nil, tint: .primary,
+                                  provider: provider.provider, working: working)
+        }
+        return MenuBarSummary(text: "\(Int(percent))%", secondary: nil, tint: usageTint(percent),
+                              provider: provider.provider, working: working)
+    }
+
+    // MARK: Burn-rate projection
+
+    // How fast a limit is filling and when, at this pace, it would reach 100%. Uses the window length
+    // and the reset time to recover elapsed time; nil when the window isn't time-boxed or is idle.
+    func projection(_ limit: LimitPayload) -> (perHour: Double, timeToLimit: String?)? {
+        guard let percent = limit.usedPercent, percent > 0,
+              let windowMinutes = limit.windowMinutes, windowMinutes > 0,
+              let remaining = minutesUntilReset(limit.resetsAt) else { return nil }
+        let elapsed = Double(windowMinutes) - remaining
+        guard elapsed >= 5 else { return nil }        // too early to trend meaningfully
+        let perMinute = percent / elapsed
+        guard perMinute > 0 else { return nil }
+        let perHour = perMinute * 60
+        if percent >= 100 { return (perHour, "limit reached") }
+        let minutesToFull = (100 - percent) / perMinute
+        // Only warn when the wall arrives before the window resets; otherwise you're safely within.
+        if minutesToFull >= remaining { return (perHour, nil) }
+        return (perHour, "≈ full in \(shortDuration(minutesToFull))")
+    }
+
+    private func minutesUntilReset(_ iso: String?) -> Double? {
+        guard let iso else { return nil }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        var date = formatter.date(from: iso)
+        if date == nil { formatter.formatOptions = [.withInternetDateTime]; date = formatter.date(from: iso) }
+        guard let date else { return nil }
+        return max(0, date.timeIntervalSinceNow / 60)
+    }
+
+    private func shortDuration(_ minutes: Double) -> String {
+        if minutes >= 2880 { return "\(Int((minutes / 1440).rounded()))d" }
+        if minutes >= 120 { return "\(Int((minutes / 60).rounded()))h" }
+        if minutes >= 1 { return "\(Int(minutes.rounded()))m" }
+        return "<1m"
+    }
+
+    // MARK: Threshold notifications
+
+    private func requestNotificationAuth() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    // Fire once when the active provider's primary limit crosses an enabled threshold. Keyed by
+    // provider|label|resetsAt so a new window (new reset time) naturally re-arms every threshold.
+    private func evaluateNotifications() {
+        guard notificationsEnabled, !notificationThresholds.isEmpty else { return }
+        guard let provider = menuBarProvider, let limit = primaryLimit(provider),
+              let percent = limit.usedPercent else { return }
+        let windowKey = "\(provider.provider)|\(limit.label ?? "limit")|\(limit.resetsAt ?? "")"
+        var fired = (UserDefaults.standard.dictionary(forKey: "firedThresholds") as? [String: [Int]]) ?? [:]
+        // Drop stale windows so the store doesn't grow without bound.
+        if fired[windowKey] == nil { fired = [windowKey: fired[windowKey] ?? []] }
+        var already = Set(fired[windowKey] ?? [])
+        for threshold in notificationThresholds.sorted() where Int(percent) >= threshold && !already.contains(threshold) {
+            already.insert(threshold)
+            postLimitNotification(provider: provider, limit: limit, threshold: threshold, percent: percent)
+        }
+        fired[windowKey] = Array(already).sorted()
+        UserDefaults.standard.set(fired, forKey: "firedThresholds")
+    }
+
+    private func postLimitNotification(provider: ProviderPayload, limit: LimitPayload, threshold: Int, percent: Double) {
+        let content = UNMutableNotificationContent()
+        let name = Self.providerName(provider.provider)
+        let window = (limit.label ?? "limit").lowercased()
+        content.title = "\(name) \(window) at \(Int(percent))%"
+        if let reset = resetRelative(limit.resetsAt) {
+            content.body = "You've passed \(threshold)% — \(reset)."
+        } else {
+            content.body = "You've passed \(threshold)% of your \(window)."
+        }
+        content.sound = threshold >= 90 ? .default : nil
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
+    }
 
     var lastPushText: String {
         guard let date = lastPushDate else { return "Not yet" }
@@ -554,6 +760,7 @@ final class MonitorModel: ObservableObject {
                     usageProvider = first.provider
                 }
                 usageError = parsed.providers.isEmpty ? "No usage yet — sign in to Claude or Codex on this Mac." : nil
+                evaluateNotifications()
             } else {
                 usageError = "Couldn’t read usage from this Mac."
             }
@@ -752,11 +959,7 @@ private struct HealthBar: View {
     let percent: Double
     let detail: String
     private var clamped: Double { max(0, min(100, percent)) }
-    private var tint: Color {
-        clamped >= 90 ? Color(red: 0.9, green: 0.35, blue: 0.35)
-            : clamped >= 75 ? Color(red: 0.9, green: 0.6, blue: 0.25)
-            : Color(red: 0.28, green: 0.7, blue: 0.55)
-    }
+    private var tint: Color { usageTint(clamped) }
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
@@ -793,6 +996,28 @@ private struct SettingRow<Control: View>: View {
             control()
         }
         .padding(.vertical, 10)
+    }
+}
+
+// A compact on/off percentage pill for choosing notification thresholds.
+private struct ThresholdChip: View {
+    let threshold: Int
+    let on: Bool
+    let action: () -> Void
+    private let accent = Color(red: 0.22, green: 0.49, blue: 0.96)
+
+    var body: some View {
+        Button(action: action) {
+            Text("\(threshold)")
+                .font(.system(size: 11, weight: .semibold))
+                .monospacedDigit()
+                .foregroundStyle(on ? .white : Color.secondary)
+                .frame(width: 30, height: 24)
+                .background(on ? accent : Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 7))
+                .overlay(RoundedRectangle(cornerRadius: 7).stroke(on ? .clear : Color.primary.opacity(0.12)))
+        }
+        .buttonStyle(.plain)
+        .help(on ? "Alert at \(threshold)% is on" : "Alert at \(threshold)% is off")
     }
 }
 
@@ -1063,6 +1288,41 @@ struct CompanionPanel: View {
                     }
                     .labelsHidden().pickerStyle(.menu).frame(maxWidth: 110)
                 }
+                Divider()
+                SettingRow(title: "Menu bar shows",
+                           detail: "What appears in the macOS menu bar. Limit % and dual recolor as you approach a limit.") {
+                    Picker("", selection: Binding(get: { model.menuBarMode }, set: { model.menuBarMode = $0 })) {
+                        ForEach(MenuBarMode.allCases) { Text($0.label).tag($0) }
+                    }
+                    .labelsHidden().pickerStyle(.menu).frame(maxWidth: 150)
+                }
+            }
+
+            settingsGroup(title: "Notifications") {
+                SettingRow(title: "Limit alerts",
+                           detail: "Get a macOS notification when your most-constrained limit passes a threshold.") {
+                    Toggle("", isOn: Binding(get: { model.notificationsEnabled }, set: { model.notificationsEnabled = $0 }))
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                }
+                if model.notificationsEnabled {
+                    Divider()
+                    SettingRow(title: "Alert at",
+                               detail: "Pick the percentages that trigger an alert. Each fires once per limit window.") {
+                        HStack(spacing: 6) {
+                            ForEach([25, 50, 75, 90], id: \.self) { threshold in
+                                ThresholdChip(threshold: threshold,
+                                              on: model.notificationThresholds.contains(threshold)) {
+                                    if model.notificationThresholds.contains(threshold) {
+                                        model.notificationThresholds.remove(threshold)
+                                    } else {
+                                        model.notificationThresholds.insert(threshold)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             settingsGroup(title: "Claude activity") {
@@ -1296,9 +1556,13 @@ private struct UsageLimitBar: View {
     let title: String
     let limit: LimitPayload
     let tint: Color
+    var projection: String? = nil
+    // When true, the bar recolors green→amber→red by fill; otherwise it uses the passed tint.
+    var autoTint: Bool = false
 
     var body: some View {
         let percent = limit.usedPercent ?? 0
+        let barTint = autoTint ? usageTint(percent) : tint
         VStack(alignment: .leading, spacing: 5) {
             HStack {
                 Text(title.uppercased()).font(.system(size: 10, weight: .semibold)).tracking(0.4).foregroundStyle(.secondary)
@@ -1308,12 +1572,20 @@ private struct UsageLimitBar: View {
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
                     Capsule().fill(Color.primary.opacity(0.09)).frame(height: 8)
-                    Capsule().fill(tint).frame(width: max(8, geo.size.width * CGFloat(min(100, percent)) / 100), height: 8)
+                    Capsule().fill(barTint).frame(width: max(8, geo.size.width * CGFloat(min(100, percent)) / 100), height: 8)
                 }
             }
             .frame(height: 8)
-            if let reset = resetRelative(limit.resetsAt) {
-                Text(reset).font(.system(size: 10)).foregroundStyle(.secondary)
+            HStack(spacing: 6) {
+                if let reset = resetRelative(limit.resetsAt) {
+                    Text(reset).font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+                if let projection {
+                    if resetRelative(limit.resetsAt) != nil {
+                        Text("·").font(.system(size: 10)).foregroundStyle(.secondary)
+                    }
+                    Text(projection).font(.system(size: 10, weight: .medium)).foregroundStyle(usageTint(percent))
+                }
             }
         }
     }
@@ -1343,6 +1615,29 @@ private struct DailyBars: View {
                 Text("today \(tokenShort(values.last ?? 0))").font(.system(size: 10)).foregroundStyle(.secondary)
             }
         }
+    }
+}
+
+// A circular usage meter for the "at a glance" hero: filled arc + centered percentage.
+private struct HeroRing: View {
+    let percent: Double
+    let caption: String
+    private var clamped: Double { max(0, min(100, percent)) }
+
+    var body: some View {
+        ZStack {
+            Circle().stroke(Color.primary.opacity(0.09), lineWidth: 9)
+            Circle()
+                .trim(from: 0, to: CGFloat(clamped / 100))
+                .stroke(usageTint(clamped), style: StrokeStyle(lineWidth: 9, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+            VStack(spacing: 0) {
+                Text("\(Int(clamped))%").font(.system(size: 20, weight: .bold, design: .rounded))
+                Text(caption.uppercased()).font(.system(size: 7.5, weight: .bold)).tracking(0.4)
+                    .foregroundStyle(.secondary).lineLimit(1)
+            }
+        }
+        .frame(width: 74, height: 74)
     }
 }
 
@@ -1411,6 +1706,7 @@ struct UsagePanel: View {
                 infoCard("Set up this Mac", "Enroll this Mac from the Home tab to see its AI usage here.")
             } else if let provider = selected {
                 if providers.count > 1 { providerPicker }
+                if model.primaryLimit(provider) != nil { atGlanceCard(provider) }
                 accountCard(provider)
                 if provider.cost != nil { costCard(provider) }
                 limitsCard(provider)
@@ -1554,12 +1850,69 @@ struct UsagePanel: View {
         .labelsHidden()
     }
 
+    // Headline "how close am I to a wall" view: the most-constrained limit as a ring with its reset
+    // countdown and burn-rate projection, the next limit as a slim bar, and today's spend.
+    @ViewBuilder
+    private func atGlanceCard(_ provider: ProviderPayload) -> some View {
+        if let primary = model.primaryLimit(provider), let percent = primary.usedPercent {
+            let secondary = (provider.limits ?? []).first { $0.label != primary.label && $0.usedPercent != nil }
+            let projection = model.projection(primary)
+            card("At a glance") {
+                HStack(alignment: .center, spacing: 16) {
+                    HeroRing(percent: percent, caption: primary.label ?? "Limit")
+                    VStack(alignment: .leading, spacing: 7) {
+                        if let reset = resetRelative(primary.resetsAt) {
+                            Label(reset, systemImage: "clock.arrow.circlepath")
+                                .font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
+                        }
+                        if let time = projection?.timeToLimit {
+                            Label(time, systemImage: "chart.line.uptrend.xyaxis")
+                                .font(.system(size: 11, weight: .semibold)).foregroundStyle(usageTint(percent))
+                        } else {
+                            Label("Well within limit", systemImage: "checkmark.seal")
+                                .font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
+                        }
+                        if let secondary, let spct = secondary.usedPercent {
+                            VStack(alignment: .leading, spacing: 3) {
+                                HStack {
+                                    Text((secondary.label ?? "Limit").uppercased())
+                                        .font(.system(size: 8.5, weight: .bold)).tracking(0.4).foregroundStyle(.secondary)
+                                    Spacer()
+                                    Text("\(Int(spct))%").font(.system(size: 10, weight: .semibold))
+                                }
+                                GeometryReader { geo in
+                                    ZStack(alignment: .leading) {
+                                        Capsule().fill(Color.primary.opacity(0.09)).frame(height: 5)
+                                        Capsule().fill(usageTint(spct))
+                                            .frame(width: max(5, geo.size.width * CGFloat(min(100, spct)) / 100), height: 5)
+                                    }
+                                }
+                                .frame(height: 5)
+                            }
+                            .padding(.top, 1)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                if let today = provider.cost?.today {
+                    Divider().padding(.vertical, 2)
+                    HStack {
+                        Text("SPENT TODAY").font(.system(size: 8.5, weight: .bold)).tracking(0.5).foregroundStyle(.secondary)
+                        Spacer()
+                        Text(String(format: "$%.2f", today)).font(.system(size: 13, weight: .semibold))
+                    }
+                }
+            }
+        }
+    }
+
     private func limitsCard(_ provider: ProviderPayload) -> some View {
         card("Limits") {
             if let limits = provider.limits, !limits.isEmpty {
                 VStack(spacing: 12) {
                     ForEach(Array(limits.prefix(3).enumerated()), id: \.offset) { _, limit in
-                        UsageLimitBar(title: limit.label ?? "Limit", limit: limit, tint: accent)
+                        UsageLimitBar(title: limit.label ?? "Limit", limit: limit, tint: accent,
+                                      projection: model.projection(limit)?.timeToLimit, autoTint: true)
                     }
                 }
             } else {
@@ -1795,6 +2148,30 @@ struct KVMAIMonitorPreviewApp: App {
     }
 }
 #else
+// The live menu-bar label. Plain-icon mode keeps the template glyph (auto-tints to the menu bar);
+// the metric modes show a compact status dot + number that recolors as the limit fills.
+private struct MenuBarLabelView: View {
+    @ObservedObject var model: MonitorModel
+
+    var body: some View {
+        if model.menuBarMode == .icon {
+            Image(nsImage: statusBarIcon(healthy: model.isHealthy))
+        } else if let summary = model.menuBarSummary {
+            HStack(spacing: 4) {
+                Circle()
+                    .fill(summary.tint)
+                    .frame(width: 6, height: 6)
+                Text(summary.secondary.map { "\(summary.text) · \($0)" } ?? summary.text)
+                    .font(.system(size: 12, weight: .semibold))
+                    .monospacedDigit()
+                    .foregroundStyle(summary.tint)
+            }
+        } else {
+            Image(nsImage: statusBarIcon(healthy: model.isHealthy))
+        }
+    }
+}
+
 @main
 struct KVMAIMonitorApp: App {
     @StateObject private var model = MonitorModel()
@@ -1803,7 +2180,7 @@ struct KVMAIMonitorApp: App {
         MenuBarExtra {
             CompanionPanel(model: model)
         } label: {
-            Image(nsImage: statusBarIcon(healthy: model.isHealthy))
+            MenuBarLabelView(model: model)
         }
         .menuBarExtraStyle(.window)
     }
