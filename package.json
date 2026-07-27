@@ -1,6 +1,6 @@
 {
   "name": "kvm-ai-monitor",
-  "version": "0.8.4",
+  "version": "0.8.5",
   "private": true,
   "description": "A KVM-native AI subscription usage wallpaper for GL.iNet Comet Pro",
   "type": "module",

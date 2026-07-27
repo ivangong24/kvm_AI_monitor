@@ -1,5 +1,5 @@
 cask "kvm-ai-monitor" do
-  version "0.8.4"
+  version "0.8.5"
   sha256 :no_check
 
   url "https://github.com/ivangong24/kvm_AI_monitor/releases/download/v#{version}/KVM-AI-Monitor-v#{version}.zip"

@@ -74,55 +74,38 @@ enum AppTheme: String, CaseIterable, Identifiable {
         case .graphite: return .clear
         }
     }
+    // Below 1 the glass fades toward direct desktop, so more shows through than the material alone.
+    var glassAlpha: CGFloat { 0.6 }
 }
 
 // A real macOS "glass" backing: blurs the desktop/windows behind the panel (behind-window blending),
-// unlike SwiftUI's in-window Materials. Behind-window vibrancy only shows through when the hosting
-// window is itself non-opaque, which SwiftUI's MenuBarExtra window is not by default — so the view
-// clears its window's background once attached.
+// unlike SwiftUI's in-window Materials. `alpha` below 1 lets extra desktop bleed through for a
+// lighter, more see-through panel.
 struct VisualEffectView: NSViewRepresentable {
     var material: NSVisualEffectView.Material
+    var alpha: CGFloat = 1
 
     func makeNSView(context: Context) -> NSVisualEffectView {
         let view = TranslucentEffectView()
         view.blendingMode = .behindWindow
         view.state = .active
         view.material = material
+        view.alphaValue = alpha
         return view
     }
 
     func updateNSView(_ view: NSVisualEffectView, context: Context) {
         view.material = material
+        view.alphaValue = alpha
     }
 }
 
 final class TranslucentEffectView: NSVisualEffectView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        // Re-apply across a few runloops: SwiftUI attaches its opaque hosting layer after us, and the
-        // MenuBarExtra window is re-created each time the panel opens.
-        for delay in [0.0, 0.1, 0.3, 0.6] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in self?.makeTransparent() }
-        }
-    }
-
-    private func makeTransparent() {
-        guard let window else { return }
-        window.isOpaque = false
-        window.backgroundColor = .clear
-        window.hasShadow = true
-        if let content = window.contentView { clearHostingBackground(content) }
-    }
-
-    // SwiftUI's NSHostingView paints an opaque backing that hides the behind-window blur. Clearing
-    // its layer background lets the desktop show through the panel's translucent areas.
-    private func clearHostingBackground(_ view: NSView) {
-        let name = String(describing: type(of: view))
-        if name.contains("HostingView") {
-            view.wantsLayer = true
-            view.layer?.backgroundColor = NSColor.clear.cgColor
-        }
-        view.subviews.forEach(clearHostingBackground)
+        // Our own NSPanel already sets this; harmless reinforcement.
+        window?.isOpaque = false
+        window?.backgroundColor = .clear
     }
 }
 
@@ -1487,7 +1470,7 @@ struct CompanionPanel: View {
         }
         .frame(width: 382, height: 560)
         .background(
-            VisualEffectView(material: model.appTheme.material)
+            VisualEffectView(material: model.appTheme.material, alpha: model.appTheme.glassAlpha)
                 .overlay(model.appTheme.wash)
                 .ignoresSafeArea()
         )
@@ -2765,17 +2748,109 @@ struct KVMAIMonitorPreviewApp: App {
     }
 }
 #else
+// A borderless panel that can still take key focus, so the companion's buttons and tabs work while
+// clicking outside dismisses it.
+final class TransparentPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+}
+
+// SwiftUI's MenuBarExtra window cannot be made translucent (SwiftUI keeps its backing opaque), so the
+// status item and panel are built in AppKit, where we fully own the window and `isOpaque = false`
+// sticks — the reliable path to a real behind-window "glass" panel.
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+    let model = MonitorModel()
+    private var statusItem: NSStatusItem!
+    private var panel: TransparentPanel!
+    private var cancellables = Set<AnyCancellable>()
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem.button?.target = self
+        statusItem.button?.action = #selector(togglePanel)
+
+        let content = NSHostingView(rootView: CompanionPanel(model: model))
+        content.wantsLayer = true
+        content.layer?.cornerRadius = 12
+        content.layer?.masksToBounds = true
+
+        panel = TransparentPanel(contentRect: NSRect(x: 0, y: 0, width: 382, height: 560),
+                                 styleMask: [.borderless, .nonactivatingPanel],
+                                 backing: .buffered, defer: false)
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.level = .statusBar
+        panel.isMovable = false
+        panel.contentView = content
+        panel.delegate = self
+
+        // Keep the menu-bar glyph current as usage and the chosen mode change.
+        updateStatusItem()
+        model.objectWillChange
+            .receive(on: RunLoop.main)
+            .sink { [weak self] in self?.updateStatusItem() }
+            .store(in: &cancellables)
+    }
+
+    // Draw the status glyph straight into the button (template NSImages tint white/black with the
+    // menu bar automatically); only Cost shows a number.
+    private func updateStatusItem() {
+        guard let button = statusItem.button else { return }
+        let summary = model.menuBarSummary
+        button.title = ""
+        button.imagePosition = .imageOnly
+        switch model.menuBarMode {
+        case .icon:
+            button.image = statusBarIcon(healthy: model.isHealthy)
+        case .gauge:
+            button.image = gaugeMonoIcon(remaining: summary?.fillPercent)
+        case .limitPercent:
+            button.image = ringMonoIcon(remaining: summary?.fillPercent)
+        case .dual:
+            button.image = dualMonoIcon(sessionRemaining: summary?.fillPercent,
+                                        weeklyRemaining: summary?.secondaryFill)
+        case .costToday:
+            let dollar = NSImage(systemSymbolName: "dollarsign.circle.fill", accessibilityDescription: nil)
+            dollar?.isTemplate = true
+            button.image = dollar
+            button.title = " " + (summary?.text ?? "")
+            button.imagePosition = .imageLeading
+        }
+    }
+
+    @objc private func togglePanel() {
+        panel.isVisible ? hidePanel() : showPanel()
+    }
+
+    private func showPanel() {
+        guard let button = statusItem.button, let buttonWindow = button.window else { return }
+        let onScreen = buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
+        let visible = (buttonWindow.screen ?? NSScreen.main)?.visibleFrame ?? .zero
+        var x = onScreen.midX - panel.frame.width / 2
+        x = min(max(x, visible.minX + 8), visible.maxX - panel.frame.width - 8)
+        let y = onScreen.minY - panel.frame.height - 6
+        panel.setFrameOrigin(NSPoint(x: x, y: y))
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+    }
+
+    private func hidePanel() {
+        panel.orderOut(nil)
+    }
+
+    // Dismiss when the user clicks elsewhere.
+    func windowDidResignKey(_ notification: Notification) {
+        hidePanel()
+    }
+}
+
 @main
 struct KVMAIMonitorApp: App {
-    @StateObject private var model = MonitorModel()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
     var body: some Scene {
-        MenuBarExtra {
-            CompanionPanel(model: model)
-        } label: {
-            MenuBarContent(model: model)
-        }
-        .menuBarExtraStyle(.window)
+        Settings { EmptyView() }
     }
 }
 #endif
