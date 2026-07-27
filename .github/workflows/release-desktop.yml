@@ -10,10 +10,48 @@ permissions:
 jobs:
   package:
     runs-on: macos-latest
+    # Signing/notarization secrets. When unset (e.g. before the Apple Developer membership exists),
+    # every gated step is skipped and the build ships ad-hoc signed, exactly as before.
+    env:
+      MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+      MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+      MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+      AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+      AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+      AC_API_KEY_P8: ${{ secrets.AC_API_KEY_P8 }}
     steps:
       - uses: actions/checkout@v7
+      - name: Import Developer ID certificate
+        if: env.MACOS_CERTIFICATE != ''
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PWD=$(uuidgen)
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$MACOS_CERTIFICATE_PWD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PWD" "$KEYCHAIN"
+          # Put our keychain first in the search list so codesign finds the identity.
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          echo "KVM_CODESIGN_IDENTITY=$MACOS_SIGN_IDENTITY" >> "$GITHUB_ENV"
       - name: Build universal app archive
         run: ./desktop/package-release.sh
+      - name: Notarize and staple
+        if: env.AC_API_KEY_P8 != ''
+        run: |
+          VERSION=$(sed -n 's/.*"version": "\([^"]*\)".*/\1/p' package.json | head -n 1)
+          APP="desktop/dist/KVM AI Monitor.app"
+          ZIP="desktop/dist/KVM-AI-Monitor-v$VERSION.zip"
+          echo "$AC_API_KEY_P8" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+          # Submit the archive, wait for the verdict, then staple the ticket into the app and re-zip
+          # so the distributed artifact validates offline.
+          xcrun notarytool submit "$ZIP" --key "$RUNNER_TEMP/AuthKey.p8" \
+            --key-id "$AC_API_KEY_ID" --issuer "$AC_API_ISSUER_ID" --wait
+          xcrun stapler staple "$APP"
+          rm -f "$ZIP"
+          ditto -c -k --keepParent "$APP" "$ZIP"
       - name: Attach app to the GitHub release
         uses: softprops/action-gh-release@v3
         with:

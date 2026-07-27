@@ -42,15 +42,36 @@ brew uninstall --cask kvm-ai-monitor
 
 ## Distributing (signing and notarization)
 
-To ship the app without a Gatekeeper warning, set `KVM_CODESIGN_IDENTITY` to a Developer ID
-Application identity while building, then notarize with an Apple Developer account:
+Signing needs the paid **Apple Developer Program** ($99/yr) for a *Developer ID Application*
+certificate. The build already signs with the hardened runtime, a secure timestamp, and
+`entitlements.plist` (Apple-events, for the terminal-automation setup) whenever
+`KVM_CODESIGN_IDENTITY` is set — everything notarization requires.
+
+Locally:
 
 ```bash
-KVM_CODESIGN_IDENTITY="Developer ID Application: <name>" ./desktop/package-release.sh
+KVM_CODESIGN_IDENTITY="Developer ID Application: <name> (<TEAMID>)" ./desktop/package-release.sh
 xcrun notarytool submit desktop/dist/KVM-AI-Monitor-v*.zip --keychain-profile <profile> --wait
 xcrun stapler staple "desktop/dist/KVM AI Monitor.app"
 ```
 
-The tag release workflow builds and attaches `KVM-AI-Monitor-v<version>.zip`, which is the asset
-the cask installs. For a public release, configure signing/notarization in that workflow before
-publishing the tag.
+### CI (automatic on every tag)
+
+The `Release macOS companion` workflow signs and notarizes automatically **once these repo secrets
+exist** (Settings → Secrets and variables → Actions). Until they do, every signing step is skipped
+and the build ships ad-hoc signed, exactly as before — so adding them is the only step needed to
+turn on notarized releases.
+
+| Secret | What it is |
+| --- | --- |
+| `MACOS_CERTIFICATE` | base64 of the Developer ID Application cert exported as `.p12` (`base64 -i cert.p12`) |
+| `MACOS_CERTIFICATE_PWD` | the password you set when exporting that `.p12` |
+| `MACOS_SIGN_IDENTITY` | the identity name, e.g. `Developer ID Application: Your Name (TEAMID)` |
+| `AC_API_KEY_ID` | App Store Connect API key ID (Users and Access → Integrations → App Store Connect API) |
+| `AC_API_ISSUER_ID` | the issuer ID shown on that same page |
+| `AC_API_KEY_P8` | base64 of the downloaded `AuthKey_<id>.p8` |
+
+The App Store Connect API key needs only the **Developer** role for notarization. The workflow
+imports the cert into a throwaway keychain, builds with `KVM_CODESIGN_IDENTITY`, submits the zip to
+`notarytool --wait`, staples the ticket into the app, and re-zips the stapled bundle as the release
+asset the cask installs.

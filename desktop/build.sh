@@ -54,10 +54,13 @@ xcrun lipo -create "$BUILD_DIR/KVM-AI-Monitor-arm64" "$BUILD_DIR/KVM-AI-Monitor-
     -output "$BINARY"
 
 IDENTITY=${KVM_CODESIGN_IDENTITY:--}
+ENTITLEMENTS="$DIR/entitlements.plist"
 if [ "$IDENTITY" = "-" ]; then
-    codesign --force --sign - "$APP"
+    # Local ad-hoc build: keep the same entitlements so Apple-events behavior matches a signed build.
+    codesign --force --entitlements "$ENTITLEMENTS" --sign - "$APP"
 else
-    codesign --force --options runtime --timestamp --sign "$IDENTITY" "$APP"
+    # Distribution: Developer ID + hardened runtime + secure timestamp so the app can be notarized.
+    codesign --force --options runtime --timestamp --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" "$APP"
 fi
 
 echo "Built: $APP"
