@@ -110,6 +110,8 @@ struct MenuBarSummary {
     var working: Bool
     // The most-constrained limit's used percent (0–100), so the gauge mode can draw a fill level.
     var percent: Double?
+    // The weekly percent for the dual mode's second bar (percent carries the session value there).
+    var secondaryPercent: Double?
 }
 
 // A terminal the companion can open for the guided setup / device management. Terminal and iTerm are
@@ -303,7 +305,7 @@ final class MonitorModel: ObservableObject {
     // What the menu bar renders. Default to the primary-limit percentage (the CodexBar/ClaudeBar
     // signature); the user can switch to cost, a dual session/weekly readout, or the plain icon.
     @Published var menuBarMode: MenuBarMode =
-        MenuBarMode(rawValue: UserDefaults.standard.string(forKey: "menuBarMode") ?? "") ?? .limitPercent {
+        MenuBarMode(rawValue: UserDefaults.standard.string(forKey: "menuBarMode") ?? "") ?? .gauge {
         didSet { UserDefaults.standard.set(menuBarMode.rawValue, forKey: "menuBarMode") }
     }
 
@@ -456,7 +458,8 @@ final class MonitorModel: ObservableObject {
             let text = session.map { "\(Int($0))%" } ?? "--"
             let secondary = weekly.map { "\(Int($0))%" }
             return MenuBarSummary(text: text, secondary: secondary, tint: usageTint(worst),
-                                  provider: provider.provider, working: working, percent: worst)
+                                  provider: provider.provider, working: working,
+                                  percent: session, secondaryPercent: weekly)
         case .limitPercent, .gauge:
             return limitSummary(provider, working: working)
         }
@@ -1078,6 +1081,77 @@ func gaugeFillIcon(percent: Double) -> NSImage {
     return image
 }
 
+// --- Ring gauge (Limit %) ---------------------------------------------------------------------
+private let ringIconSize = NSSize(width: 15, height: 14)
+private let ringCenter = NSPoint(x: 7.5, y: 7)
+private let ringRadius: CGFloat = 5.0
+
+// Faint full-circle track as a template, so it adopts the menu-bar/panel foreground color.
+func ringTrackIcon() -> NSImage {
+    let image = NSImage(size: ringIconSize)
+    image.lockFocus()
+    let ring = NSBezierPath()
+    ring.appendArc(withCenter: ringCenter, radius: ringRadius, startAngle: 0, endAngle: 360)
+    ring.lineWidth = 2.2
+    NSColor(white: 0, alpha: 0.28).setStroke()
+    ring.stroke()
+    image.unlockFocus()
+    image.isTemplate = true
+    return image
+}
+
+// Colored arc from 12 o'clock, clockwise, covering `percent` of the circle.
+func ringArcIcon(percent: Double) -> NSImage {
+    let image = NSImage(size: ringIconSize)
+    image.lockFocus()
+    let clamped = max(0, min(1, percent / 100))
+    if clamped > 0.001 {
+        let arc = NSBezierPath()
+        arc.appendArc(withCenter: ringCenter, radius: ringRadius,
+                      startAngle: 90, endAngle: 90 - clamped * 360, clockwise: true)
+        arc.lineWidth = 2.2
+        arc.lineCapStyle = .round
+        nsUsageTint(percent).setStroke()
+        arc.stroke()
+    }
+    image.unlockFocus()
+    return image
+}
+
+// --- Dual bars (Session + weekly) -------------------------------------------------------------
+private let dualIconSize = NSSize(width: 14, height: 14)
+private let dualBarXs: [CGFloat] = [2.5, 8.0]
+private let dualBarWidth: CGFloat = 3.5
+private let dualBarBottom: CGFloat = 2
+private let dualBarMaxHeight: CGFloat = 10
+
+func dualTrackIcon() -> NSImage {
+    let image = NSImage(size: dualIconSize)
+    image.lockFocus()
+    NSColor(white: 0, alpha: 0.22).setFill()
+    for x in dualBarXs {
+        NSBezierPath(roundedRect: NSRect(x: x, y: dualBarBottom, width: dualBarWidth,
+                                         height: dualBarMaxHeight), xRadius: 1.6, yRadius: 1.6).fill()
+    }
+    image.unlockFocus()
+    image.isTemplate = true
+    return image
+}
+
+func dualFillIcon(session: Double?, weekly: Double?) -> NSImage {
+    let image = NSImage(size: dualIconSize)
+    image.lockFocus()
+    for (x, pct) in zip(dualBarXs, [session, weekly]) {
+        guard let pct else { continue }
+        let height = max(1.6, dualBarMaxHeight * max(0, min(1, pct / 100)))
+        nsUsageTint(pct).setFill()
+        NSBezierPath(roundedRect: NSRect(x: x, y: dualBarBottom, width: dualBarWidth,
+                                         height: height), xRadius: 1.6, yRadius: 1.6).fill()
+    }
+    image.unlockFocus()
+    return image
+}
+
 private struct BrandMark: View {
     var body: some View {
         ZStack {
@@ -1552,9 +1626,12 @@ struct CompanionPanel: View {
                 }
                 Divider()
                 SettingRow(title: "Menu bar shows",
-                           detail: "What appears in the macOS menu bar. Usage gauge fills the icon like a battery; gauge, limit %, and dual recolor as you approach a limit.") {
+                           detail: "What appears in the macOS menu bar. Each metric is drawn live — a battery gauge, a ring, twin bars, or a cost badge — and recolors as you approach a limit.") {
                     HStack(spacing: 8) {
-                        menuBarPreview
+                        MenuBarContent(model: model)
+                            .padding(.horizontal, 7).padding(.vertical, 4)
+                            .background(Color.primary.opacity(0.06), in: Capsule())
+                            .overlay(Capsule().stroke(Color.primary.opacity(0.08)))
                         Picker("", selection: Binding(get: { model.menuBarMode }, set: { model.menuBarMode = $0 })) {
                             ForEach(MenuBarMode.allCases) { Text($0.label).tag($0) }
                         }
@@ -1700,41 +1777,6 @@ struct CompanionPanel: View {
                 .help(theme.label)
             }
         }
-    }
-
-    // A live swatch of exactly what the menu bar renders for the current mode, so the picker choice
-    // is visible before you commit to it. Mirrors MenuBarLabelView using the real usage snapshot.
-    @ViewBuilder private var menuBarPreview: some View {
-        let summary = model.menuBarSummary
-        Group {
-            switch model.menuBarMode {
-            case .icon:
-                Image(nsImage: statusBarIcon(healthy: model.isHealthy))
-                    .foregroundStyle(.primary)
-            case .gauge:
-                HStack(spacing: 4) {
-                    GaugeIconView(percent: summary?.percent)
-                    if let percent = summary?.percent {
-                        Text("\(Int(percent))%").font(.system(size: 11, weight: .semibold))
-                            .monospacedDigit().foregroundStyle(summary?.tint ?? .primary)
-                    }
-                }
-            default:
-                if let summary {
-                    HStack(spacing: 4) {
-                        Circle().fill(summary.tint).frame(width: 6, height: 6)
-                        Text(summary.secondary.map { "\(summary.text) · \($0)" } ?? summary.text)
-                            .font(.system(size: 11, weight: .semibold)).monospacedDigit()
-                            .foregroundStyle(summary.tint)
-                    }
-                } else {
-                    Image(nsImage: statusBarIcon(healthy: model.isHealthy)).foregroundStyle(.primary)
-                }
-            }
-        }
-        .padding(.horizontal, 7).padding(.vertical, 4)
-        .background(Color.primary.opacity(0.06), in: Capsule())
-        .overlay(Capsule().stroke(Color.primary.opacity(0.08)))
     }
 
     private func settingsGroup<Content: View>(title: String, @ViewBuilder content: () -> Content) -> some View {
@@ -2467,18 +2509,85 @@ struct TouchscreenCard: View {
     }
 }
 
-// The menu-bar usage gauge: the KVM-screen silhouette as a battery whose screen fills by usage.
-// Built from two NSImages (a template frame + a colored fill) so it renders in a MenuBarExtra label,
-// where a SwiftUI Canvas silently draws nothing. Shared by the live label and the Settings preview.
+// Each menu-bar metric gets a small glyph built from two NSImages — a template track (adopts the
+// menu-bar/panel color) under a colored fill — because a SwiftUI Canvas draws nothing in a
+// MenuBarExtra label, while Image/Text render reliably.
+
+// Battery: the KVM-screen silhouette whose screen fills by usage. (Usage gauge mode.)
 struct GaugeIconView: View {
     let percent: Double?
-
     var body: some View {
         ZStack {
-            if let percent { Image(nsImage: gaugeFillIcon(percent: percent)) }
             Image(nsImage: gaugeFrameIcon())
+            if let percent { Image(nsImage: gaugeFillIcon(percent: percent)) }
         }
         .frame(width: 20, height: 14)
+    }
+}
+
+// Circular ring that fills clockwise by usage. (Limit % mode.)
+struct RingGaugeView: View {
+    let percent: Double?
+    var body: some View {
+        ZStack {
+            Image(nsImage: ringTrackIcon())
+            if let percent { Image(nsImage: ringArcIcon(percent: percent)) }
+        }
+        .frame(width: 15, height: 14)
+    }
+}
+
+// Two bars, one per window, each colored by its own level. (Session + weekly mode.)
+struct DualBarsView: View {
+    let session: Double?
+    let weekly: Double?
+    var body: some View {
+        ZStack {
+            Image(nsImage: dualTrackIcon())
+            Image(nsImage: dualFillIcon(session: session, weekly: weekly))
+        }
+        .frame(width: 14, height: 14)
+    }
+}
+
+// The full menu-bar representation for the current mode. Shared by the live MenuBarExtra label and
+// the Settings preview so the two never drift.
+struct MenuBarContent: View {
+    @ObservedObject var model: MonitorModel
+
+    private func numeral(_ text: String, _ tint: Color) -> some View {
+        Text(text).font(.system(size: 12, weight: .semibold)).monospacedDigit().foregroundStyle(tint)
+    }
+
+    var body: some View {
+        if model.menuBarMode == .icon {
+            Image(nsImage: statusBarIcon(healthy: model.isHealthy))
+        } else if model.menuBarMode == .gauge {
+            let summary = model.menuBarSummary
+            HStack(spacing: 4) {
+                GaugeIconView(percent: summary?.percent)
+                if let percent = summary?.percent { numeral("\(Int(percent))%", summary?.tint ?? .primary) }
+            }
+        } else if let summary = model.menuBarSummary {
+            switch model.menuBarMode {
+            case .limitPercent:
+                HStack(spacing: 4) { RingGaugeView(percent: summary.percent); numeral(summary.text, summary.tint) }
+            case .dual:
+                HStack(spacing: 4) {
+                    DualBarsView(session: summary.percent, weekly: summary.secondaryPercent)
+                    numeral(summary.secondary.map { "\(summary.text) · \($0)" } ?? summary.text, summary.tint)
+                }
+            case .costToday:
+                HStack(spacing: 3) {
+                    Image(systemName: "dollarsign.circle.fill").font(.system(size: 11)).foregroundStyle(.secondary)
+                    numeral(summary.text, summary.tint)
+                }
+            default:
+                numeral(summary.text, summary.tint)
+            }
+        } else {
+            Image(nsImage: statusBarIcon(healthy: model.isHealthy))
+        }
     }
 }
 
@@ -2495,43 +2604,6 @@ struct KVMAIMonitorPreviewApp: App {
     }
 }
 #else
-// The live menu-bar label. Plain-icon mode keeps the template glyph (auto-tints to the menu bar);
-// the metric modes show a compact status dot + number that recolors as the limit fills.
-private struct MenuBarLabelView: View {
-    @ObservedObject var model: MonitorModel
-
-    var body: some View {
-        if model.menuBarMode == .icon {
-            Image(nsImage: statusBarIcon(healthy: model.isHealthy))
-        } else if model.menuBarMode == .gauge {
-            // The KVM-screen icon as a live battery/progress gauge: the screen fills with the
-            // most-constrained limit and recolors green → amber → red as it approaches the wall.
-            let summary = model.menuBarSummary
-            HStack(spacing: 4) {
-                GaugeIconView(percent: summary?.percent)
-                if let percent = summary?.percent {
-                    Text("\(Int(percent))%")
-                        .font(.system(size: 12, weight: .semibold))
-                        .monospacedDigit()
-                        .foregroundStyle(summary?.tint ?? .primary)
-                }
-            }
-        } else if let summary = model.menuBarSummary {
-            HStack(spacing: 4) {
-                Circle()
-                    .fill(summary.tint)
-                    .frame(width: 6, height: 6)
-                Text(summary.secondary.map { "\(summary.text) · \($0)" } ?? summary.text)
-                    .font(.system(size: 12, weight: .semibold))
-                    .monospacedDigit()
-                    .foregroundStyle(summary.tint)
-            }
-        } else {
-            Image(nsImage: statusBarIcon(healthy: model.isHealthy))
-        }
-    }
-}
-
 @main
 struct KVMAIMonitorApp: App {
     @StateObject private var model = MonitorModel()
@@ -2540,7 +2612,7 @@ struct KVMAIMonitorApp: App {
         MenuBarExtra {
             CompanionPanel(model: model)
         } label: {
-            MenuBarLabelView(model: model)
+            MenuBarContent(model: model)
         }
         .menuBarExtraStyle(.window)
     }
