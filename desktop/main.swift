@@ -20,11 +20,12 @@ enum Panel { case home, usage, settings }
 
 // What the macOS menu bar shows at a glance — mirrors CodexBar/ClaudeBar's live metric.
 enum MenuBarMode: String, CaseIterable, Identifiable {
-    case icon, limitPercent, costToday, dual
+    case icon, gauge, limitPercent, costToday, dual
     var id: String { rawValue }
     var label: String {
         switch self {
         case .icon: return "Icon only"
+        case .gauge: return "Usage gauge"
         case .limitPercent: return "Limit %"
         case .costToday: return "Cost today"
         case .dual: return "Session + weekly"
@@ -47,6 +48,8 @@ struct MenuBarSummary {
     var tint: Color
     var provider: String
     var working: Bool
+    // The most-constrained limit's used percent (0–100), so the gauge mode can draw a fill level.
+    var percent: Double?
 }
 
 // A terminal the companion can open for the guided setup / device management. Terminal and iTerm are
@@ -387,8 +390,8 @@ final class MonitorModel: ObservableObject {
             let text = session.map { "\(Int($0))%" } ?? "--"
             let secondary = weekly.map { "\(Int($0))%" }
             return MenuBarSummary(text: text, secondary: secondary, tint: usageTint(worst),
-                                  provider: provider.provider, working: working)
-        case .limitPercent:
+                                  provider: provider.provider, working: working, percent: worst)
+        case .limitPercent, .gauge:
             return limitSummary(provider, working: working)
         }
     }
@@ -396,10 +399,10 @@ final class MonitorModel: ObservableObject {
     private func limitSummary(_ provider: ProviderPayload, working: Bool) -> MenuBarSummary? {
         guard let limit = primaryLimit(provider), let percent = limit.usedPercent else {
             return MenuBarSummary(text: "--", secondary: nil, tint: .primary,
-                                  provider: provider.provider, working: working)
+                                  provider: provider.provider, working: working, percent: nil)
         }
         return MenuBarSummary(text: "\(Int(percent))%", secondary: nil, tint: usageTint(percent),
-                              provider: provider.provider, working: working)
+                              provider: provider.provider, working: working, percent: percent)
     }
 
     // MARK: Burn-rate projection
@@ -1429,11 +1432,14 @@ struct CompanionPanel: View {
                 }
                 Divider()
                 SettingRow(title: "Menu bar shows",
-                           detail: "What appears in the macOS menu bar. Limit % and dual recolor as you approach a limit.") {
-                    Picker("", selection: Binding(get: { model.menuBarMode }, set: { model.menuBarMode = $0 })) {
-                        ForEach(MenuBarMode.allCases) { Text($0.label).tag($0) }
+                           detail: "What appears in the macOS menu bar. Usage gauge fills the icon like a battery; gauge, limit %, and dual recolor as you approach a limit.") {
+                    HStack(spacing: 8) {
+                        menuBarPreview
+                        Picker("", selection: Binding(get: { model.menuBarMode }, set: { model.menuBarMode = $0 })) {
+                            ForEach(MenuBarMode.allCases) { Text($0.label).tag($0) }
+                        }
+                        .labelsHidden().pickerStyle(.menu).frame(maxWidth: 140)
                     }
-                    .labelsHidden().pickerStyle(.menu).frame(maxWidth: 150)
                 }
             }
 
@@ -1542,6 +1548,41 @@ struct CompanionPanel: View {
                 .padding(.top, 6)
         }
         .padding(16)
+    }
+
+    // A live swatch of exactly what the menu bar renders for the current mode, so the picker choice
+    // is visible before you commit to it. Mirrors MenuBarLabelView using the real usage snapshot.
+    @ViewBuilder private var menuBarPreview: some View {
+        let summary = model.menuBarSummary
+        Group {
+            switch model.menuBarMode {
+            case .icon:
+                Image(nsImage: statusBarIcon(healthy: model.isHealthy))
+                    .foregroundStyle(.primary)
+            case .gauge:
+                HStack(spacing: 4) {
+                    MenuBarGaugeView(fraction: (summary?.percent ?? 0) / 100, tint: summary?.tint ?? .secondary)
+                    if let percent = summary?.percent {
+                        Text("\(Int(percent))%").font(.system(size: 11, weight: .semibold))
+                            .monospacedDigit().foregroundStyle(summary?.tint ?? .primary)
+                    }
+                }
+            default:
+                if let summary {
+                    HStack(spacing: 4) {
+                        Circle().fill(summary.tint).frame(width: 6, height: 6)
+                        Text(summary.secondary.map { "\(summary.text) · \($0)" } ?? summary.text)
+                            .font(.system(size: 11, weight: .semibold)).monospacedDigit()
+                            .foregroundStyle(summary.tint)
+                    }
+                } else {
+                    Image(nsImage: statusBarIcon(healthy: model.isHealthy)).foregroundStyle(.primary)
+                }
+            }
+        }
+        .padding(.horizontal, 7).padding(.vertical, 4)
+        .background(Color.primary.opacity(0.06), in: Capsule())
+        .overlay(Capsule().stroke(Color.primary.opacity(0.08)))
     }
 
     private func settingsGroup<Content: View>(title: String, @ViewBuilder content: () -> Content) -> some View {
@@ -2274,6 +2315,37 @@ struct TouchscreenCard: View {
     }
 }
 
+// The menu-bar usage gauge: the same rounded KVM-screen silhouette as the plain icon, but the inner
+// screen fills left-to-right by `fraction` in the usage-band `tint`. The frame uses `.primary` so it
+// stays legible in both light and dark menu bars; the fill color carries the "how close am I" signal.
+// Shared by the live menu-bar label and the Settings preview.
+struct MenuBarGaugeView: View {
+    let fraction: Double
+    let tint: Color
+
+    var body: some View {
+        Canvas { context, size in
+            let body = Path(roundedRect: CGRect(x: 1.1, y: 1.0, width: size.width - 2.2,
+                                                height: size.height - 2.0), cornerRadius: 2.4)
+            context.stroke(body, with: .color(.primary), lineWidth: 1.3)
+
+            let screenRect = CGRect(x: 3.3, y: 3.1, width: size.width - 6.6, height: size.height - 6.2)
+            let screen = Path(roundedRect: screenRect, cornerRadius: 1.1)
+            context.fill(screen, with: .color(.primary.opacity(0.16)))  // empty track
+
+            let clamped = max(0, min(1, fraction))
+            let fillWidth = screenRect.width * clamped
+            if fillWidth > 0.4 {
+                context.clip(to: screen)
+                context.fill(Path(CGRect(x: screenRect.minX, y: screenRect.minY,
+                                         width: fillWidth, height: screenRect.height)),
+                             with: .color(tint))
+            }
+        }
+        .frame(width: 20, height: 14)
+    }
+}
+
 #if PREVIEW_APP
 @main
 struct KVMAIMonitorPreviewApp: App {
@@ -2295,6 +2367,18 @@ private struct MenuBarLabelView: View {
     var body: some View {
         if model.menuBarMode == .icon {
             Image(nsImage: statusBarIcon(healthy: model.isHealthy))
+        } else if model.menuBarMode == .gauge, let summary = model.menuBarSummary {
+            // The KVM-screen icon as a live battery/progress gauge: the screen fills with the
+            // most-constrained limit and recolors green → amber → red as it approaches the wall.
+            HStack(spacing: 4) {
+                MenuBarGaugeView(fraction: (summary.percent ?? 0) / 100, tint: summary.tint)
+                if let percent = summary.percent {
+                    Text("\(Int(percent))%")
+                        .font(.system(size: 12, weight: .semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(summary.tint)
+                }
+            }
         } else if let summary = model.menuBarSummary {
             HStack(spacing: 4) {
                 Circle()
