@@ -99,15 +99,30 @@ struct VisualEffectView: NSViewRepresentable {
 final class TranslucentEffectView: NSVisualEffectView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        clearWindowBackground()
-        // SwiftUI can re-set the window opaque right after we attach, so clear it again next runloop.
-        DispatchQueue.main.async { [weak self] in self?.clearWindowBackground() }
+        // Re-apply across a few runloops: SwiftUI attaches its opaque hosting layer after us, and the
+        // MenuBarExtra window is re-created each time the panel opens.
+        for delay in [0.0, 0.1, 0.3, 0.6] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in self?.makeTransparent() }
+        }
     }
 
-    private func clearWindowBackground() {
+    private func makeTransparent() {
         guard let window else { return }
         window.isOpaque = false
         window.backgroundColor = .clear
+        window.hasShadow = true
+        if let content = window.contentView { clearHostingBackground(content) }
+    }
+
+    // SwiftUI's NSHostingView paints an opaque backing that hides the behind-window blur. Clearing
+    // its layer background lets the desktop show through the panel's translucent areas.
+    private func clearHostingBackground(_ view: NSView) {
+        let name = String(describing: type(of: view))
+        if name.contains("HostingView") {
+            view.wantsLayer = true
+            view.layer?.backgroundColor = NSColor.clear.cgColor
+        }
+        view.subviews.forEach(clearHostingBackground)
     }
 }
 
@@ -2623,20 +2638,22 @@ struct MenuBarContent: View {
             let summary = model.menuBarSummary
             HStack(spacing: 4) {
                 GaugeIconView(fillPercent: summary?.fillPercent, colorPercent: summary?.colorPercent, colored: colored)
-                if summary?.fillPercent != nil { numeral(summary?.text ?? "", summary?.tint ?? .primary) }
+                // The bare icon carries the level; the number only clutters the menu bar. Show it in
+                // the Settings preview (colored) so the value is still legible there.
+                if colored, summary?.fillPercent != nil { numeral(summary?.text ?? "", summary?.tint ?? .primary) }
             }
         } else if let summary = model.menuBarSummary {
             switch model.menuBarMode {
             case .limitPercent:
                 HStack(spacing: 4) {
                     RingGaugeView(fillPercent: summary.fillPercent, colorPercent: summary.colorPercent, colored: colored)
-                    numeral(summary.text, summary.tint)
+                    if colored { numeral(summary.text, summary.tint) }
                 }
             case .dual:
                 HStack(spacing: 4) {
                     DualBarsView(sessionFill: summary.fillPercent, sessionColor: summary.colorPercent,
                                  weeklyFill: summary.secondaryFill, weeklyColor: summary.secondaryColor, colored: colored)
-                    numeral(summary.secondary.map { "\(summary.text) · \($0)" } ?? summary.text, summary.tint)
+                    if colored { numeral(summary.secondary.map { "\(summary.text) · \($0)" } ?? summary.text, summary.tint) }
                 }
             case .costToday:
                 HStack(spacing: 3) {
