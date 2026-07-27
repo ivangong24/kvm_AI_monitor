@@ -74,8 +74,6 @@ enum AppTheme: String, CaseIterable, Identifiable {
         case .graphite: return .clear
         }
     }
-    // Below 1 the glass fades toward direct desktop, so more shows through than the material alone.
-    var glassAlpha: CGFloat { 0.6 }
 }
 
 // A real macOS "glass" backing: blurs the desktop/windows behind the panel (behind-window blending),
@@ -330,6 +328,13 @@ final class MonitorModel: ObservableObject {
     @Published var appTheme: AppTheme =
         AppTheme(rawValue: UserDefaults.standard.string(forKey: "appTheme") ?? "") ?? .classic {
         didSet { UserDefaults.standard.set(appTheme.rawValue, forKey: "appTheme") }
+    }
+
+    // How solid the frosted-glass background is: 1 = fully frosted, lower lets more desktop through.
+    // User-adjustable in Settings; persisted.
+    @Published var glassOpacity: Double =
+        (UserDefaults.standard.object(forKey: "glassOpacity") as? Double) ?? 0.82 {
+        didSet { UserDefaults.standard.set(glassOpacity, forKey: "glassOpacity") }
     }
 
     // Native macOS alerts when the primary limit crosses a chosen percentage.
@@ -1470,7 +1475,7 @@ struct CompanionPanel: View {
         }
         .frame(width: 382, height: 560)
         .background(
-            VisualEffectView(material: model.appTheme.material, alpha: model.appTheme.glassAlpha)
+            VisualEffectView(material: model.appTheme.material, alpha: model.glassOpacity)
                 .overlay(model.appTheme.wash)
                 .ignoresSafeArea()
         )
@@ -1701,6 +1706,17 @@ struct CompanionPanel: View {
                 SettingRow(title: "Theme",
                            detail: "The companion app's look. Every preset sits on a frosted-glass background.") {
                     themeSelector
+                }
+                Divider()
+                SettingRow(title: "Transparency",
+                           detail: "How much of your desktop shows through the panel. Left is glassier.") {
+                    HStack(spacing: 6) {
+                        Image(systemName: "circle.dotted").font(.system(size: 11)).foregroundStyle(.secondary)
+                        Slider(value: Binding(get: { model.glassOpacity },
+                                              set: { model.glassOpacity = $0 }), in: 0.35...1.0)
+                            .frame(width: 108)
+                        Image(systemName: "circle.fill").font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
                 }
                 Divider()
                 SettingRow(title: "Open at login",
