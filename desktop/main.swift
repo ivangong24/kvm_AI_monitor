@@ -33,6 +33,66 @@ enum MenuBarMode: String, CaseIterable, Identifiable {
     }
 }
 
+// Preset looks for the companion app: each pairs an accent with a glass material and a subtle wash.
+// The window is always a real behind-window blur (see VisualEffectView); themes vary the character.
+enum AppTheme: String, CaseIterable, Identifiable {
+    case classic, modern, github, graphite
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .classic: return "Classic"
+        case .modern: return "Modern"
+        case .github: return "GitHub"
+        case .graphite: return "Graphite"
+        }
+    }
+    // The accent that drives buttons, selection, and highlights throughout the panel.
+    var accent: Color {
+        switch self {
+        case .classic: return Color(red: 0.22, green: 0.49, blue: 0.96)   // the original blue
+        case .modern: return Color(red: 0.46, green: 0.36, blue: 0.95)    // vivid indigo
+        case .github: return Color(red: 0.13, green: 0.55, blue: 0.27)    // GitHub primary green
+        case .graphite: return Color(red: 0.40, green: 0.44, blue: 0.52)  // neutral slate
+        }
+    }
+    // An adaptive vibrancy material (all resolve for light and dark) so the glass reads either way.
+    var material: NSVisualEffectView.Material {
+        switch self {
+        case .classic: return .sidebar
+        case .modern: return .underWindowBackground
+        case .github: return .menu
+        case .graphite: return .popover
+        }
+    }
+    // A faint color wash laid over the glass to give each theme its own temperature.
+    var wash: Color {
+        switch self {
+        case .classic: return .clear
+        case .modern: return Color(red: 0.46, green: 0.36, blue: 0.95).opacity(0.08)
+        case .github: return .clear
+        case .graphite: return Color.primary.opacity(0.05)
+        }
+    }
+}
+
+// A real macOS "glass" backing: blurs the desktop/windows behind the panel (behind-window blending),
+// unlike SwiftUI's in-window Materials. The theme picks the material.
+struct VisualEffectView: NSViewRepresentable {
+    var material: NSVisualEffectView.Material
+
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.blendingMode = .behindWindow
+        view.state = .active
+        view.material = material
+        return view
+    }
+
+    func updateNSView(_ view: NSVisualEffectView, context: Context) {
+        view.material = material
+    }
+}
+
 // Shared usage color bands so the menu bar, limit bars, and health gauges all agree.
 // <75 calm green · 75–90 amber · ≥90 red.
 func usageTint(_ percent: Double) -> Color {
@@ -245,6 +305,12 @@ final class MonitorModel: ObservableObject {
     @Published var menuBarMode: MenuBarMode =
         MenuBarMode(rawValue: UserDefaults.standard.string(forKey: "menuBarMode") ?? "") ?? .limitPercent {
         didSet { UserDefaults.standard.set(menuBarMode.rawValue, forKey: "menuBarMode") }
+    }
+
+    // The companion app's preset look (accent + glass). Persisted; drives colors panel-wide.
+    @Published var appTheme: AppTheme =
+        AppTheme(rawValue: UserDefaults.standard.string(forKey: "appTheme") ?? "") ?? .classic {
+        didSet { UserDefaults.standard.set(appTheme.rawValue, forKey: "appTheme") }
     }
 
     // Native macOS alerts when the primary limit crosses a chosen percentage.
@@ -968,6 +1034,50 @@ func statusBarIcon(healthy: Bool) -> NSImage {
     return image
 }
 
+// AppKit twin of usageTint, for drawing the gauge fill into an NSImage.
+func nsUsageTint(_ percent: Double) -> NSColor {
+    percent >= 90 ? NSColor(red: 0.9, green: 0.35, blue: 0.35, alpha: 1)
+        : percent >= 75 ? NSColor(red: 0.9, green: 0.6, blue: 0.25, alpha: 1)
+        : NSColor(red: 0.28, green: 0.7, blue: 0.55, alpha: 1)
+}
+
+private let gaugeIconSize = NSSize(width: 20, height: 14)
+private let gaugeScreenRect = NSRect(x: 3.3, y: 3.1, width: 13.4, height: 7.8)
+
+// The battery frame + empty track as a template, so it adopts the menu-bar (or panel) foreground
+// color in both light and dark. Drawn as two NSImages because a SwiftUI Canvas does not render
+// inside a MenuBarExtra label — only Image/Text do.
+func gaugeFrameIcon() -> NSImage {
+    let image = NSImage(size: gaugeIconSize)
+    image.lockFocus()
+    NSColor.black.setStroke()
+    let body = NSBezierPath(roundedRect: NSRect(x: 1.1, y: 1.0, width: 17.8, height: 12.0),
+                            xRadius: 2.4, yRadius: 2.4)
+    body.lineWidth = 1.3
+    body.stroke()
+    // Faint track: template art keeps the alpha, so this reads as a subtle tint of the fg color.
+    NSColor(white: 0, alpha: 0.16).setFill()
+    NSBezierPath(roundedRect: gaugeScreenRect, xRadius: 1.1, yRadius: 1.1).fill()
+    image.unlockFocus()
+    image.isTemplate = true
+    return image
+}
+
+// The colored fill bar sized to `percent`, transparent elsewhere. Non-template so its band color
+// survives; layered under the frame in a ZStack.
+func gaugeFillIcon(percent: Double) -> NSImage {
+    let image = NSImage(size: gaugeIconSize)
+    image.lockFocus()
+    NSBezierPath(roundedRect: gaugeScreenRect, xRadius: 1.1, yRadius: 1.1).addClip()
+    let clamped = max(0, min(1, percent / 100))
+    nsUsageTint(percent).setFill()
+    NSBezierPath(rect: NSRect(x: gaugeScreenRect.minX, y: gaugeScreenRect.minY,
+                              width: gaugeScreenRect.width * clamped,
+                              height: gaugeScreenRect.height)).fill()
+    image.unlockFocus()
+    return image
+}
+
 private struct BrandMark: View {
     var body: some View {
         ZStack {
@@ -1145,8 +1255,8 @@ private struct SettingRow<Control: View>: View {
 private struct ThresholdChip: View {
     let threshold: Int
     let on: Bool
+    var accent: Color = Color(red: 0.22, green: 0.49, blue: 0.96)
     let action: () -> Void
-    private let accent = Color(red: 0.22, green: 0.49, blue: 0.96)
 
     var body: some View {
         Button(action: action) {
@@ -1166,7 +1276,7 @@ private struct ThresholdChip: View {
 struct CompanionPanel: View {
     @ObservedObject var model: MonitorModel
 
-    private let accent = Color(red: 0.22, green: 0.49, blue: 0.96)
+    private var accent: Color { model.appTheme.accent }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1181,7 +1291,12 @@ struct CompanionPanel: View {
             footer
         }
         .frame(width: 382, height: 560)
-        .background(.regularMaterial)
+        .background(
+            VisualEffectView(material: model.appTheme.material)
+                .overlay(model.appTheme.wash)
+                .ignoresSafeArea()
+        )
+        .tint(accent)
         .onAppear { model.refresh(); model.loadUsage(force: true); model.checkForUpdatesIfDue() }
         .onReceive(Timer.publish(every: 20, on: .main, in: .common).autoconnect()) { _ in
             model.refresh()
@@ -1405,6 +1520,11 @@ struct CompanionPanel: View {
     private var settingsBody: some View {
         VStack(alignment: .leading, spacing: 6) {
             settingsGroup(title: "General") {
+                SettingRow(title: "Theme",
+                           detail: "The companion app's look. Every preset sits on a frosted-glass background.") {
+                    themeSelector
+                }
+                Divider()
                 SettingRow(title: "Open at login",
                            detail: "Keep the Comet Pro screen updating whenever your Mac is on.") {
                     Toggle("", isOn: Binding(get: { model.launchAtLogin }, set: { _ in model.toggleLaunchAtLogin() }))
@@ -1457,7 +1577,8 @@ struct CompanionPanel: View {
                         HStack(spacing: 6) {
                             ForEach([25, 50, 75, 90], id: \.self) { threshold in
                                 ThresholdChip(threshold: threshold,
-                                              on: model.notificationThresholds.contains(threshold)) {
+                                              on: model.notificationThresholds.contains(threshold),
+                                              accent: accent) {
                                     if model.notificationThresholds.contains(threshold) {
                                         model.notificationThresholds.remove(threshold)
                                     } else {
@@ -1550,6 +1671,37 @@ struct CompanionPanel: View {
         .padding(16)
     }
 
+    // Selectable theme swatches: a mini window mockup per preset (accent title bar + content lines),
+    // with a ring on the active one. Tapping applies the theme immediately.
+    @ViewBuilder private var themeSelector: some View {
+        HStack(spacing: 7) {
+            ForEach(AppTheme.allCases) { theme in
+                Button { model.appTheme = theme } label: {
+                    VStack(spacing: 0) {
+                        Rectangle().fill(theme.accent).frame(height: 7)
+                        VStack(alignment: .leading, spacing: 2) {
+                            RoundedRectangle(cornerRadius: 1).fill(theme.accent.opacity(0.5)).frame(width: 14, height: 2)
+                            RoundedRectangle(cornerRadius: 1).fill(Color.primary.opacity(0.25)).frame(width: 20, height: 2)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                        .padding(3)
+                    }
+                    .frame(width: 30, height: 26)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.primary.opacity(0.12)))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(theme.accent, lineWidth: 2).padding(-2.5)
+                            .opacity(model.appTheme == theme ? 1 : 0)
+                    )
+                }
+                .buttonStyle(.plain)
+                .help(theme.label)
+            }
+        }
+    }
+
     // A live swatch of exactly what the menu bar renders for the current mode, so the picker choice
     // is visible before you commit to it. Mirrors MenuBarLabelView using the real usage snapshot.
     @ViewBuilder private var menuBarPreview: some View {
@@ -1561,7 +1713,7 @@ struct CompanionPanel: View {
                     .foregroundStyle(.primary)
             case .gauge:
                 HStack(spacing: 4) {
-                    MenuBarGaugeView(fraction: (summary?.percent ?? 0) / 100, tint: summary?.tint ?? .secondary)
+                    GaugeIconView(percent: summary?.percent)
                     if let percent = summary?.percent {
                         Text("\(Int(percent))%").font(.system(size: 11, weight: .semibold))
                             .monospacedDigit().foregroundStyle(summary?.tint ?? .primary)
@@ -1873,7 +2025,7 @@ private struct DonutChart: View {
 
 struct UsagePanel: View {
     @ObservedObject var model: MonitorModel
-    private let accent = Color(red: 0.22, green: 0.49, blue: 0.96)
+    private var accent: Color { model.appTheme.accent }
 
     private var providers: [ProviderPayload] { model.appUsage?.providers ?? [] }
     private var selected: ProviderPayload? {
@@ -2315,32 +2467,16 @@ struct TouchscreenCard: View {
     }
 }
 
-// The menu-bar usage gauge: the same rounded KVM-screen silhouette as the plain icon, but the inner
-// screen fills left-to-right by `fraction` in the usage-band `tint`. The frame uses `.primary` so it
-// stays legible in both light and dark menu bars; the fill color carries the "how close am I" signal.
-// Shared by the live menu-bar label and the Settings preview.
-struct MenuBarGaugeView: View {
-    let fraction: Double
-    let tint: Color
+// The menu-bar usage gauge: the KVM-screen silhouette as a battery whose screen fills by usage.
+// Built from two NSImages (a template frame + a colored fill) so it renders in a MenuBarExtra label,
+// where a SwiftUI Canvas silently draws nothing. Shared by the live label and the Settings preview.
+struct GaugeIconView: View {
+    let percent: Double?
 
     var body: some View {
-        Canvas { context, size in
-            let body = Path(roundedRect: CGRect(x: 1.1, y: 1.0, width: size.width - 2.2,
-                                                height: size.height - 2.0), cornerRadius: 2.4)
-            context.stroke(body, with: .color(.primary), lineWidth: 1.3)
-
-            let screenRect = CGRect(x: 3.3, y: 3.1, width: size.width - 6.6, height: size.height - 6.2)
-            let screen = Path(roundedRect: screenRect, cornerRadius: 1.1)
-            context.fill(screen, with: .color(.primary.opacity(0.16)))  // empty track
-
-            let clamped = max(0, min(1, fraction))
-            let fillWidth = screenRect.width * clamped
-            if fillWidth > 0.4 {
-                context.clip(to: screen)
-                context.fill(Path(CGRect(x: screenRect.minX, y: screenRect.minY,
-                                         width: fillWidth, height: screenRect.height)),
-                             with: .color(tint))
-            }
+        ZStack {
+            if let percent { Image(nsImage: gaugeFillIcon(percent: percent)) }
+            Image(nsImage: gaugeFrameIcon())
         }
         .frame(width: 20, height: 14)
     }
@@ -2367,16 +2503,17 @@ private struct MenuBarLabelView: View {
     var body: some View {
         if model.menuBarMode == .icon {
             Image(nsImage: statusBarIcon(healthy: model.isHealthy))
-        } else if model.menuBarMode == .gauge, let summary = model.menuBarSummary {
+        } else if model.menuBarMode == .gauge {
             // The KVM-screen icon as a live battery/progress gauge: the screen fills with the
             // most-constrained limit and recolors green → amber → red as it approaches the wall.
+            let summary = model.menuBarSummary
             HStack(spacing: 4) {
-                MenuBarGaugeView(fraction: (summary.percent ?? 0) / 100, tint: summary.tint)
-                if let percent = summary.percent {
+                GaugeIconView(percent: summary?.percent)
+                if let percent = summary?.percent {
                     Text("\(Int(percent))%")
                         .font(.system(size: 12, weight: .semibold))
                         .monospacedDigit()
-                        .foregroundStyle(summary.tint)
+                        .foregroundStyle(summary?.tint ?? .primary)
                 }
             }
         } else if let summary = model.menuBarSummary {
