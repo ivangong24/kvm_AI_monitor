@@ -17,76 +17,75 @@ animated working indicator whenever an agent is actively processing on any enrol
 
 ![Wallpaper rendered on the KVM touchscreen (sample data)](docs/images/wallpaper-claude.png)
 
-## Prerequisites
+## What you need
 
-- A GL.iNet Comet Pro with its admin password (2FA supported), reachable on your LAN.
-- A macOS, Linux, or Windows machine with Node.js 22+ to run the setup wizard. On Windows you
-  also need [Git for Windows](https://git-scm.com/download/win) (the agent installer needs its
-  bundled `bash`/`tar`/`base64`), and the session token is stored in Windows Credential Manager
-  instead of the Keychain.
-- On Linux, `secret-tool` and an unlocked user keyring for securely storing the KVM session
-  token (on Debian/Ubuntu: `sudo apt install libsecret-tools`).
-- On each monitored device: Python 3 and the AI provider CLIs you want to monitor installed and
-  signed in (for example, Claude Code or Codex). Claude and Codex provide usage data; Copilot,
-  Gemini CLI, and Grok currently provide install/sign-in and activity detection only.
-- On Windows, Microsoft Store `python`/`python3` aliases are often non-runnable stubs. The setup
-  automatically finds Python installed from [python.org](https://www.python.org/downloads/)
-  (even when it was not added to `PATH`), `uv python install`, or the Python launcher. For a
-  custom location, set `KVM_PYTHON` to the full path of `python.exe`.
+- A **GL.iNet Comet Pro** with its admin password (2FA supported), reachable on your LAN.
+- On each computer you want to track: **Python 3** and the AI provider CLIs you use, installed and
+  signed in. Claude Code and Codex report full usage; Copilot, Gemini CLI, and Grok report
+  install/sign-in and activity only (their vendors expose no consumer quota API yet).
+- For the **macOS companion app**: [Homebrew](https://brew.sh) — the app uses it to install its
+  small command-line helper for you.
+- For the **command-line setup** (Linux, Windows, or Macs without the app): **Node.js 22+**, plus
+  the [platform notes](#platform-notes) below.
 
-## Install
+## Set up with the companion app (macOS — the easy way)
 
-Run the guided setup on any macOS, Linux, or Windows computer on the same network as the Comet.
+The menu-bar companion is the simplest way in. Install it, click **Set up**, and it does the
+rest — finds your Comet, signs you in, installs the on-device agent, switches the touchscreen to
+Wallpaper Only, and enrolls this Mac. No commands to copy.
 
-### Recommended: one command with npx
+**1. Install the app**
 
-With Node.js 22+ installed, no clone or install is needed — run the setup wizard straight from
-GitHub:
+- Download `KVM-AI-Monitor-v<latest>.zip` from the
+  [latest release](https://github.com/ivangong24/kvm_AI_monitor/releases/latest), unzip it, and
+  move **KVM AI Monitor.app** to your Applications folder. (Until the app is notarized, the first
+  launch needs right-click → **Open** to get past Gatekeeper.)
+- Or with Homebrew: `brew install --cask ivangong24/kvm-ai-monitor/kvm-ai-monitor`.
+
+**2. Open it and click *Set up***
+
+The app installs its `kvm-ai-monitor` helper and walks you through connecting the Comet. When
+prompted, enter the Comet admin password (and 2FA code, if enabled) and **give this Mac a name**.
+Usage starts pushing to the touchscreen within a minute — no manual helper commands.
+
+**3. Manage everything from the app**
+
+- **Home** — a plain-language status summary, your Comet Pro's health, a link to open its screen,
+  and **Update now** to push immediately.
+- **Add or fix a device** — re-runs setup to (re-)enroll this Mac, redeploy the agent, or repair a
+  connection.
+- **Settings** — which terminal to use for setup, open-at-login, push interval, an opt-in toggle
+  for precise Claude Code working-state hooks, and app updates: it checks GitHub for new releases
+  automatically and **Get update** downloads and installs them in place.
+
+To add another Mac, install the app on it and click **Set up** there too.
+
+## Set up from the command line (Linux, Windows, or without the app)
+
+Any macOS/Linux/Windows machine on the Comet's network can run the same guided wizard. Pick one:
 
 ```bash
+# One-off with npx (Node 22+, no clone)
 npx github:ivangong24/kvm_AI_monitor
-```
 
-It discovers the Comet, signs in (keeping only a revocable session token), installs the on-device
-agent, switches the touchscreen to Wallpaper Only, and enrolls this machine — the same flow as
-`npm run setup` below.
+# Homebrew (macOS/Linux)
+brew install ivangong24/kvm-ai-monitor/kvm-ai-monitor && kvm-ai-monitor
 
-### Homebrew
-
-Homebrew is supported on macOS and Linux:
-
-```bash
-brew install ivangong24/kvm-ai-monitor/kvm-ai-monitor
-kvm-ai-monitor
-```
-
-### Classic installation
-
-```bash
+# From a clone
 git clone https://github.com/ivangong24/kvm_AI_monitor.git
-cd kvm_AI_monitor
-npm install
-npm run setup
+cd kvm_AI_monitor && npm install && npm run setup
 ```
 
-The wizard discovers the Comet, signs in (only a revocable session token is kept, in your
-Keychain, Windows Credential Manager, or Linux libsecret keyring), installs the on-device
-agent, switches the touchscreen to Wallpaper Only, enrolls the machine it runs on as a push
-device (macOS, Windows, or Linux, with optional Claude Code hooks for exact working-state
-animation), and finishes with a health check.
+The wizard discovers the Comet, signs in (keeping only a revocable session token — in your
+Keychain, Windows Credential Manager, or Linux libsecret keyring), installs the on-device agent,
+switches the touchscreen to Wallpaper Only, enrolls the machine it runs on (you name it, with
+optional Claude Code hooks), and finishes with a health check.
 
-The management commands (`npm run helper:install`, `helper:status`, `helper:hooks`,
-`kvm:agent:install`, …) run on all three platforms — a Node dispatcher selects the right
-implementation and finds Git Bash / a runnable Python for you on Windows.
+### Enrolling more devices from the command line
 
-Usage from every enrolled device is summed on the KVM: daily token totals add up across
-machines, while plan and percentage limits come from the most recent push (they describe the
-Anthropic account, not the device, so they are not additive).
-
-### Enrolling more devices
-
-On the AI Usage page (`https://<comet-ip>/extras/ai-usage/`), use **Enroll a device** to get a
-device ID and one-time secret, then on that device run:
+The companion app enrolls the Mac it runs on; to enroll a **Linux or Windows** box (or a Mac
+without the app), open the AI Usage page (`https://<comet-ip>/extras/ai-usage/`) → **Enroll a
+device** for a device ID and one-time secret, then run on that device:
 
 ```bash
 # macOS
@@ -99,58 +98,47 @@ device ID and one-time secret, then on that device run:
 powershell -ExecutionPolicy Bypass -File helper\install-helper.ps1 -Kvm <comet-ip> -Device <device-id>
 ```
 
-Each installer schedules a per-minute usage push (LaunchAgent / systemd timer / Task
-Scheduler) and stores the secret in the platform vault (Keychain / libsecret / Windows DPAPI).
-On macOS it also schedules a lightweight activity poller that animates the working indicator for
-every provider — **including Claude** — without touching your editor config. Claude Code
-lifecycle hooks are **optional and off by default**; they only tighten the timing, and the
-installer prints the opt-in command (you can also toggle them from the menu bar app's Settings).
-Details: [`helper/README.md`](helper/README.md).
+Each installer schedules a per-minute usage push (LaunchAgent / systemd timer / Task Scheduler)
+and stores the secret in the platform vault (Keychain / libsecret / Windows DPAPI). It runs in the
+logged-in user's session, so pushes pause while that user is signed out and resume on sign-in.
+Details: [`helper/README.md`](helper/README.md). The management commands
+(`npm run helper:status`, `helper:hooks`, `kvm:agent:install`, …) work on all three platforms.
 
-Each scheduler runs in the logged-in user's session, so pushes pause while that user is signed
-out (the desktop is not counted until the next sign-in); they resume automatically. On Windows,
-`npm run helper:status` reads the scheduled task's `LastTaskResult` (`0` = last push succeeded).
+Alternatively a device can be read over **SSH** ("Connected device" on the page): enable Remote
+Login, authorize the KVM's public key, and enter the username. SSH devices provide install/auth
+and working-state presence; push devices provide full usage and are the recommended path.
 
-Optionally, a device can instead be read over SSH ("Connected device" on the page): enable
-Remote Login, authorize the KVM's public key, and enter the username. SSH devices provide
-install/auth detection and working-state presence; push devices provide full usage and are the
-recommended path.
+### Platform notes
 
-## Usage
+- **Windows** also needs [Git for Windows](https://git-scm.com/download/win) (the agent installer
+  uses its bundled `bash`/`tar`/`base64`). Microsoft Store `python`/`python3` aliases are often
+  non-runnable stubs; setup automatically finds Python from
+  [python.org](https://www.python.org/downloads/) (even if not on `PATH`), `uv python install`, or
+  the Python launcher. Set `KVM_PYTHON` to a full `python.exe` path to override.
+- **Linux** needs `secret-tool` and an unlocked user keyring for the session token (Debian/Ubuntu:
+  `sudo apt install libsecret-tools`).
 
-Manage everything at `https://<comet-ip>/extras/ai-usage/`:
+## What shows up, and the web console
 
-- **Display provider** — choose which subscription the touchscreen shows (Claude, Codex, …),
-  each with its own brand colors and working-glyph animation.
-- **Appearance** — customize the selected provider's wallpaper colors, working-glyph style, and
-  whether limit rows lead with percent used or time to reset, with an instant live preview;
-  themes are validated JSON stored on the KVM (export/import supported, one-click reset).
-- **Layouts** — pick a wallpaper arrangement (Classic, Detailed with a 7-day sparkline and
-  reset countdown, Compact with a clock, Multi-agent showing every provider's usage at once) or
-  build a custom one by assigning widgets — limit bars, token totals, sparkline, countdown,
-  clock, provider grid, plan — to named slots.
-- **Push devices** — enroll, rotate secrets, revoke, or delete devices; last-seen times shown.
-- **Display settings** — enable/disable the wallpaper, working animation, and refresh interval.
-- **Dashboard** — a crisp, animated preview of the touchscreen, rebuilt live in the browser as
-  vectors (not an upscaled screenshot) with the per-provider working glyph animating in real
-  time, plus device health.
-- **Updates** — the page shows the agent version and checks GitHub releases on demand; update
-  a Homebrew install with `brew upgrade kvm-ai-monitor && kvm-ai-monitor install-agent`, or a
-  classic install with `git pull && npm install && npm run kvm:agent:install`.
+Usage from every enrolled device is summed on the KVM: daily token totals add across machines,
+while plan and percentage limits come from the most recent push (they describe the account, not the
+device, so they aren't additive). The wallpaper shows current-session and weekly limit bars with
+reset times, today's and 30-day token totals, and animates while the selected agent is working on
+any enrolled device (120-second activity window; tightest timing with the optional Claude hooks).
+Usage is retained while a device is offline, and the animation pauses during active remote viewing.
 
-The wallpaper shows current-session and weekly limit bars with reset times, today's and
-30-day token totals, and animates while the selected agent is working on any enrolled device
-(120-second activity window; tightest per-turn timing when the optional Claude hooks are
-installed). Usage data is retained while a device is offline; the animation pauses during active
-remote viewing (`pauseWhenStreaming`).
+Beyond the companion app, the on-KVM console at `https://<comet-ip>/extras/ai-usage/` offers deeper
+customization:
 
-The macOS menu bar companion gives this Mac a compact control surface: a plain-language status
-summary, your Comet Pro with a link to open its screen, **Update now** / **Add or fix a device**
-actions, and a **Settings** page (open at login, plus an opt-in toggle for precise Claude
-working-state hooks). Build it with `./desktop/build.sh` and open the resulting
-`desktop/dist/KVM AI Monitor.app` — see [`desktop/README.md`](desktop/README.md). A signed
-Homebrew cask (`brew install --cask kvm-ai-monitor`) is planned once the app is Developer
-ID–signed and notarized; until then, build from source.
+- **Display provider** — choose which subscription the touchscreen shows (Claude, Codex, …).
+- **Appearance** — the selected provider's colors, working-glyph style, and whether limit rows lead
+  with percent used or time to reset, with a live preview; themes are validated JSON (export/import,
+  one-click reset).
+- **Layouts** — Classic, Detailed (7-day sparkline + reset countdown), Compact (with clock),
+  Multi-agent (every provider at once), or a custom layout built from widgets.
+- **Push devices** — enroll, rotate secrets, revoke, or delete devices, with last-seen times.
+- **Display settings** — toggle the wallpaper, working animation, and refresh interval.
+- **Dashboard** — a crisp, live vector preview of the touchscreen plus device health.
 
 ## Privacy
 
@@ -162,9 +150,12 @@ limits stays in memory on the device that owns it. Inspect exactly what would be
 
 ## Uninstall
 
+To stop a Mac from pushing, quit and drag **KVM AI Monitor.app** to the Trash, then remove its
+helper. To take the dashboard off the KVM entirely, remove the on-device agent:
+
 ```bash
-npm run kvm:agent:uninstall    # remove the KVM extension (config preserved on the KVM)
 npm run helper:uninstall       # remove this device's helper (--purge also removes secrets)
+npm run kvm:agent:uninstall    # remove the KVM extension (config preserved on the KVM)
 ```
 
 ## Development
