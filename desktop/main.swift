@@ -55,22 +55,23 @@ enum AppTheme: String, CaseIterable, Identifiable {
         case .graphite: return Color(red: 0.40, green: 0.44, blue: 0.52)  // neutral slate
         }
     }
-    // An adaptive vibrancy material (all resolve for light and dark) so the glass reads either way.
+    // The most translucent vibrancy materials, so the desktop reads clearly through the panel.
+    // .hudWindow and .underWindowBackground are the thinnest glass AppKit offers; all adapt.
     var material: NSVisualEffectView.Material {
         switch self {
-        case .classic: return .sidebar
-        case .modern: return .underWindowBackground
-        case .github: return .menu
-        case .graphite: return .popover
+        case .classic: return .underWindowBackground
+        case .modern: return .hudWindow
+        case .github: return .underWindowBackground
+        case .graphite: return .hudWindow
         }
     }
-    // A faint color wash laid over the glass to give each theme its own temperature.
+    // A very faint color wash for character — kept low so it doesn't reintroduce opacity.
     var wash: Color {
         switch self {
         case .classic: return .clear
-        case .modern: return Color(red: 0.46, green: 0.36, blue: 0.95).opacity(0.08)
+        case .modern: return Color(red: 0.46, green: 0.36, blue: 0.95).opacity(0.05)
         case .github: return .clear
-        case .graphite: return Color.primary.opacity(0.05)
+        case .graphite: return .clear
         }
     }
 }
@@ -101,17 +102,18 @@ func usageTint(_ percent: Double) -> Color {
         : Color(red: 0.28, green: 0.7, blue: 0.55)
 }
 
-// A live menu-bar summary derived from the most-constrained limit of the active provider.
+// A live menu-bar summary for the active provider's session limit. Fill and color are separate so
+// the gauge can show budget *remaining* (a draining battery) while still coloring by usage danger.
 struct MenuBarSummary {
     var text: String
     var secondary: String?
     var tint: Color
     var provider: String
     var working: Bool
-    // The most-constrained limit's used percent (0–100), so the gauge mode can draw a fill level.
-    var percent: Double?
-    // The weekly percent for the dual mode's second bar (percent carries the session value there).
-    var secondaryPercent: Double?
+    var fillPercent: Double?      // 0–100: how full the visual is — remaining budget, so it counts down
+    var colorPercent: Double?     // 0–100: used %, which drives the green→amber→red band color
+    var secondaryFill: Double?    // dual mode's weekly bar fill (remaining)
+    var secondaryColor: Double?   // dual mode's weekly bar color (used)
 }
 
 // A terminal the companion can open for the guided setup / device management. Terminal and iTerm are
@@ -426,7 +428,7 @@ final class MonitorModel: ObservableObject {
     }
 
     // The most-constrained limit (highest used %) for a provider — what "am I about to hit a wall?"
-    // really means. Ties break toward the shorter window (session before weekly).
+    // really means. Ties break toward the shorter window (session before weekly). Used for alerts.
     func primaryLimit(_ provider: ProviderPayload) -> LimitPayload? {
         (provider.limits ?? [])
             .filter { $0.usedPercent != nil }
@@ -435,6 +437,13 @@ final class MonitorModel: ObservableObject {
                 if l != r { return l < r }
                 return (lhs.windowMinutes ?? Int.max) > (rhs.windowMinutes ?? Int.max)
             }
+    }
+
+    // The session (shortest-window) limit — the "how much do I have right now?" number the menu bar
+    // tracks. Falls back to any available limit so single-window providers (e.g. Codex weekly) show.
+    func sessionLimit(_ provider: ProviderPayload) -> LimitPayload? {
+        let withPercent = (provider.limits ?? []).filter { $0.usedPercent != nil }
+        return withPercent.min { ($0.windowMinutes ?? Int.max) < ($1.windowMinutes ?? Int.max) }
     }
 
     var menuBarSummary: MenuBarSummary? {
@@ -452,26 +461,33 @@ final class MonitorModel: ObservableObject {
             return MenuBarSummary(text: String(format: "$%.2f", today), secondary: nil,
                                   tint: .primary, provider: provider.provider, working: working)
         case .dual:
+            // Session (shortest window) first, weekly second — both shown as remaining (counting down).
             let session = limits.first?.usedPercent
             let weekly = limits.count > 1 ? limits[1].usedPercent : nil
             let worst = max(session ?? 0, weekly ?? 0)
-            let text = session.map { "\(Int($0))%" } ?? "--"
-            let secondary = weekly.map { "\(Int($0))%" }
+            let text = session.map { "\(Int(100 - $0))%" } ?? "--"
+            let secondary = weekly.map { "\(Int(100 - $0))%" }
             return MenuBarSummary(text: text, secondary: secondary, tint: usageTint(worst),
                                   provider: provider.provider, working: working,
-                                  percent: session, secondaryPercent: weekly)
+                                  fillPercent: session.map { 100 - $0 }, colorPercent: session,
+                                  secondaryFill: weekly.map { 100 - $0 }, secondaryColor: weekly)
         case .limitPercent, .gauge:
             return limitSummary(provider, working: working)
         }
     }
 
+    // Session budget as *remaining* (100 − used) so the gauge reads as a countdown/draining battery,
+    // colored by usage so it still goes amber → red as the session fills.
     private func limitSummary(_ provider: ProviderPayload, working: Bool) -> MenuBarSummary? {
-        guard let limit = primaryLimit(provider), let percent = limit.usedPercent else {
+        guard let limit = sessionLimit(provider), let used = limit.usedPercent else {
             return MenuBarSummary(text: "--", secondary: nil, tint: .primary,
-                                  provider: provider.provider, working: working, percent: nil)
+                                  provider: provider.provider, working: working,
+                                  fillPercent: nil, colorPercent: nil)
         }
-        return MenuBarSummary(text: "\(Int(percent))%", secondary: nil, tint: usageTint(percent),
-                              provider: provider.provider, working: working, percent: percent)
+        let remaining = max(0, 100 - used)
+        return MenuBarSummary(text: "\(Int(remaining))%", secondary: nil, tint: usageTint(used),
+                              provider: provider.provider, working: working,
+                              fillPercent: remaining, colorPercent: used)
     }
 
     // MARK: Burn-rate projection
@@ -1066,14 +1082,14 @@ func gaugeFrameIcon() -> NSImage {
     return image
 }
 
-// The colored fill bar sized to `percent`, transparent elsewhere. Non-template so its band color
-// survives; layered under the frame in a ZStack.
-func gaugeFillIcon(percent: Double) -> NSImage {
+// The colored fill bar: width = `fillPercent` (remaining), color from `colorPercent` (used). Non-
+// template so the band color survives.
+func gaugeFillIcon(fillPercent: Double, colorPercent: Double) -> NSImage {
     let image = NSImage(size: gaugeIconSize)
     image.lockFocus()
     NSBezierPath(roundedRect: gaugeScreenRect, xRadius: 1.1, yRadius: 1.1).addClip()
-    let clamped = max(0, min(1, percent / 100))
-    nsUsageTint(percent).setFill()
+    let clamped = max(0, min(1, fillPercent / 100))
+    nsUsageTint(colorPercent).setFill()
     NSBezierPath(rect: NSRect(x: gaugeScreenRect.minX, y: gaugeScreenRect.minY,
                               width: gaugeScreenRect.width * clamped,
                               height: gaugeScreenRect.height)).fill()
@@ -1100,18 +1116,19 @@ func ringTrackIcon() -> NSImage {
     return image
 }
 
-// Colored arc from 12 o'clock, clockwise, covering `percent` of the circle.
-func ringArcIcon(percent: Double) -> NSImage {
+// Colored arc from 12 o'clock, clockwise, covering `fillPercent` (remaining) of the circle, colored
+// by `colorPercent` (used).
+func ringArcIcon(fillPercent: Double, colorPercent: Double) -> NSImage {
     let image = NSImage(size: ringIconSize)
     image.lockFocus()
-    let clamped = max(0, min(1, percent / 100))
+    let clamped = max(0, min(1, fillPercent / 100))
     if clamped > 0.001 {
         let arc = NSBezierPath()
         arc.appendArc(withCenter: ringCenter, radius: ringRadius,
                       startAngle: 90, endAngle: 90 - clamped * 360, clockwise: true)
         arc.lineWidth = 2.2
         arc.lineCapStyle = .round
-        nsUsageTint(percent).setStroke()
+        nsUsageTint(colorPercent).setStroke()
         arc.stroke()
     }
     image.unlockFocus()
@@ -1138,13 +1155,15 @@ func dualTrackIcon() -> NSImage {
     return image
 }
 
-func dualFillIcon(session: Double?, weekly: Double?) -> NSImage {
+func dualFillIcon(sessionFill: Double?, sessionColor: Double?,
+                  weeklyFill: Double?, weeklyColor: Double?) -> NSImage {
     let image = NSImage(size: dualIconSize)
     image.lockFocus()
-    for (x, pct) in zip(dualBarXs, [session, weekly]) {
-        guard let pct else { continue }
-        let height = max(1.6, dualBarMaxHeight * max(0, min(1, pct / 100)))
-        nsUsageTint(pct).setFill()
+    let bars = [(dualBarXs[0], sessionFill, sessionColor), (dualBarXs[1], weeklyFill, weeklyColor)]
+    for (x, fill, color) in bars {
+        guard let fill, let color else { continue }
+        let height = max(1.6, dualBarMaxHeight * max(0, min(1, fill / 100)))
+        nsUsageTint(color).setFill()
         NSBezierPath(roundedRect: NSRect(x: x, y: dualBarBottom, width: dualBarWidth,
                                          height: height), xRadius: 1.6, yRadius: 1.6).fill()
     }
@@ -2513,38 +2532,51 @@ struct TouchscreenCard: View {
 // menu-bar/panel color) under a colored fill — because a SwiftUI Canvas draws nothing in a
 // MenuBarExtra label, while Image/Text render reliably.
 
-// Battery: the KVM-screen silhouette whose screen fills by usage. (Usage gauge mode.)
+// Battery draining with remaining budget. `.renderingMode(.original)` keeps the band color from
+// being flattened to the menu bar's monochrome tint. (Usage gauge mode.)
 struct GaugeIconView: View {
-    let percent: Double?
+    let fillPercent: Double?
+    let colorPercent: Double?
     var body: some View {
         ZStack {
             Image(nsImage: gaugeFrameIcon())
-            if let percent { Image(nsImage: gaugeFillIcon(percent: percent)) }
+            if let fillPercent, let colorPercent {
+                Image(nsImage: gaugeFillIcon(fillPercent: fillPercent, colorPercent: colorPercent))
+                    .renderingMode(.original)
+            }
         }
         .frame(width: 20, height: 14)
     }
 }
 
-// Circular ring that fills clockwise by usage. (Limit % mode.)
+// Circular ring showing remaining budget. (Limit % mode.)
 struct RingGaugeView: View {
-    let percent: Double?
+    let fillPercent: Double?
+    let colorPercent: Double?
     var body: some View {
         ZStack {
             Image(nsImage: ringTrackIcon())
-            if let percent { Image(nsImage: ringArcIcon(percent: percent)) }
+            if let fillPercent, let colorPercent {
+                Image(nsImage: ringArcIcon(fillPercent: fillPercent, colorPercent: colorPercent))
+                    .renderingMode(.original)
+            }
         }
         .frame(width: 15, height: 14)
     }
 }
 
-// Two bars, one per window, each colored by its own level. (Session + weekly mode.)
+// Two bars (session, weekly), each showing remaining budget and colored by its own usage.
 struct DualBarsView: View {
-    let session: Double?
-    let weekly: Double?
+    let sessionFill: Double?
+    let sessionColor: Double?
+    let weeklyFill: Double?
+    let weeklyColor: Double?
     var body: some View {
         ZStack {
             Image(nsImage: dualTrackIcon())
-            Image(nsImage: dualFillIcon(session: session, weekly: weekly))
+            Image(nsImage: dualFillIcon(sessionFill: sessionFill, sessionColor: sessionColor,
+                                        weeklyFill: weeklyFill, weeklyColor: weeklyColor))
+                .renderingMode(.original)
         }
         .frame(width: 14, height: 14)
     }
@@ -2565,16 +2597,20 @@ struct MenuBarContent: View {
         } else if model.menuBarMode == .gauge {
             let summary = model.menuBarSummary
             HStack(spacing: 4) {
-                GaugeIconView(percent: summary?.percent)
-                if let percent = summary?.percent { numeral("\(Int(percent))%", summary?.tint ?? .primary) }
+                GaugeIconView(fillPercent: summary?.fillPercent, colorPercent: summary?.colorPercent)
+                if summary?.fillPercent != nil { numeral(summary?.text ?? "", summary?.tint ?? .primary) }
             }
         } else if let summary = model.menuBarSummary {
             switch model.menuBarMode {
             case .limitPercent:
-                HStack(spacing: 4) { RingGaugeView(percent: summary.percent); numeral(summary.text, summary.tint) }
+                HStack(spacing: 4) {
+                    RingGaugeView(fillPercent: summary.fillPercent, colorPercent: summary.colorPercent)
+                    numeral(summary.text, summary.tint)
+                }
             case .dual:
                 HStack(spacing: 4) {
-                    DualBarsView(session: summary.percent, weekly: summary.secondaryPercent)
+                    DualBarsView(sessionFill: summary.fillPercent, sessionColor: summary.colorPercent,
+                                 weeklyFill: summary.secondaryFill, weeklyColor: summary.secondaryColor)
                     numeral(summary.secondary.map { "\(summary.text) · \($0)" } ?? summary.text, summary.tint)
                 }
             case .costToday:
