@@ -77,12 +77,14 @@ enum AppTheme: String, CaseIterable, Identifiable {
 }
 
 // A real macOS "glass" backing: blurs the desktop/windows behind the panel (behind-window blending),
-// unlike SwiftUI's in-window Materials. The theme picks the material.
+// unlike SwiftUI's in-window Materials. Behind-window vibrancy only shows through when the hosting
+// window is itself non-opaque, which SwiftUI's MenuBarExtra window is not by default — so the view
+// clears its window's background once attached.
 struct VisualEffectView: NSViewRepresentable {
     var material: NSVisualEffectView.Material
 
     func makeNSView(context: Context) -> NSVisualEffectView {
-        let view = NSVisualEffectView()
+        let view = TranslucentEffectView()
         view.blendingMode = .behindWindow
         view.state = .active
         view.material = material
@@ -91,6 +93,21 @@ struct VisualEffectView: NSViewRepresentable {
 
     func updateNSView(_ view: NSVisualEffectView, context: Context) {
         view.material = material
+    }
+}
+
+final class TranslucentEffectView: NSVisualEffectView {
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        clearWindowBackground()
+        // SwiftUI can re-set the window opaque right after we attach, so clear it again next runloop.
+        DispatchQueue.main.async { [weak self] in self?.clearWindowBackground() }
+    }
+
+    private func clearWindowBackground() {
+        guard let window else { return }
+        window.isOpaque = false
+        window.backgroundColor = .clear
     }
 }
 
@@ -1647,7 +1664,7 @@ struct CompanionPanel: View {
                 SettingRow(title: "Menu bar shows",
                            detail: "What appears in the macOS menu bar. Each metric is drawn live — a battery gauge, a ring, twin bars, or a cost badge — and recolors as you approach a limit.") {
                     HStack(spacing: 8) {
-                        MenuBarContent(model: model)
+                        MenuBarContent(model: model, colored: true)
                             .padding(.horizontal, 7).padding(.vertical, 4)
                             .background(Color.primary.opacity(0.06), in: Capsule())
                             .overlay(Capsule().stroke(Color.primary.opacity(0.08)))
@@ -2532,17 +2549,19 @@ struct TouchscreenCard: View {
 // menu-bar/panel color) under a colored fill — because a SwiftUI Canvas draws nothing in a
 // MenuBarExtra label, while Image/Text render reliably.
 
-// Battery draining with remaining budget. `.renderingMode(.original)` keeps the band color from
-// being flattened to the menu bar's monochrome tint. (Usage gauge mode.)
+// Battery draining with remaining budget. In the menu bar the fill renders `.template` (clean
+// monochrome — the menu bar flattens colors anyway); the Settings preview passes colored: true for
+// the full band color. (Usage gauge mode.)
 struct GaugeIconView: View {
     let fillPercent: Double?
     let colorPercent: Double?
+    var colored: Bool = false
     var body: some View {
         ZStack {
             Image(nsImage: gaugeFrameIcon())
             if let fillPercent, let colorPercent {
                 Image(nsImage: gaugeFillIcon(fillPercent: fillPercent, colorPercent: colorPercent))
-                    .renderingMode(.original)
+                    .renderingMode(colored ? .original : .template)
             }
         }
         .frame(width: 20, height: 14)
@@ -2553,12 +2572,13 @@ struct GaugeIconView: View {
 struct RingGaugeView: View {
     let fillPercent: Double?
     let colorPercent: Double?
+    var colored: Bool = false
     var body: some View {
         ZStack {
             Image(nsImage: ringTrackIcon())
             if let fillPercent, let colorPercent {
                 Image(nsImage: ringArcIcon(fillPercent: fillPercent, colorPercent: colorPercent))
-                    .renderingMode(.original)
+                    .renderingMode(colored ? .original : .template)
             }
         }
         .frame(width: 15, height: 14)
@@ -2571,12 +2591,13 @@ struct DualBarsView: View {
     let sessionColor: Double?
     let weeklyFill: Double?
     let weeklyColor: Double?
+    var colored: Bool = false
     var body: some View {
         ZStack {
             Image(nsImage: dualTrackIcon())
             Image(nsImage: dualFillIcon(sessionFill: sessionFill, sessionColor: sessionColor,
                                         weeklyFill: weeklyFill, weeklyColor: weeklyColor))
-                .renderingMode(.original)
+                .renderingMode(colored ? .original : .template)
         }
         .frame(width: 14, height: 14)
     }
@@ -2586,9 +2607,13 @@ struct DualBarsView: View {
 // the Settings preview so the two never drift.
 struct MenuBarContent: View {
     @ObservedObject var model: MonitorModel
+    // Menu bar flattens colors to monochrome, so the live label stays mono; the Settings preview
+    // (colored: true) shows the real band color and colored numbers.
+    var colored: Bool = false
 
     private func numeral(_ text: String, _ tint: Color) -> some View {
-        Text(text).font(.system(size: 12, weight: .semibold)).monospacedDigit().foregroundStyle(tint)
+        Text(text).font(.system(size: 12, weight: .semibold)).monospacedDigit()
+            .foregroundStyle(colored ? tint : .primary)
     }
 
     var body: some View {
@@ -2597,20 +2622,20 @@ struct MenuBarContent: View {
         } else if model.menuBarMode == .gauge {
             let summary = model.menuBarSummary
             HStack(spacing: 4) {
-                GaugeIconView(fillPercent: summary?.fillPercent, colorPercent: summary?.colorPercent)
+                GaugeIconView(fillPercent: summary?.fillPercent, colorPercent: summary?.colorPercent, colored: colored)
                 if summary?.fillPercent != nil { numeral(summary?.text ?? "", summary?.tint ?? .primary) }
             }
         } else if let summary = model.menuBarSummary {
             switch model.menuBarMode {
             case .limitPercent:
                 HStack(spacing: 4) {
-                    RingGaugeView(fillPercent: summary.fillPercent, colorPercent: summary.colorPercent)
+                    RingGaugeView(fillPercent: summary.fillPercent, colorPercent: summary.colorPercent, colored: colored)
                     numeral(summary.text, summary.tint)
                 }
             case .dual:
                 HStack(spacing: 4) {
                     DualBarsView(sessionFill: summary.fillPercent, sessionColor: summary.colorPercent,
-                                 weeklyFill: summary.secondaryFill, weeklyColor: summary.secondaryColor)
+                                 weeklyFill: summary.secondaryFill, weeklyColor: summary.secondaryColor, colored: colored)
                     numeral(summary.secondary.map { "\(summary.text) · \($0)" } ?? summary.text, summary.tint)
                 }
             case .costToday:
