@@ -1203,6 +1203,76 @@ func dualFillIcon(sessionFill: Double?, sessionColor: Double?,
     return image
 }
 
+// --- Single-image *template* menu-bar icons -------------------------------------------------------
+// One template NSImage each (outline/track + a solid fill to `remaining`), so the menu bar tints the
+// whole thing to a crisp white/black. Full fill = 100% budget left, empty = 0% — mirroring the app's
+// own icon, whose screen is solid white when healthy.
+func gaugeMonoIcon(remaining: Double?) -> NSImage {
+    let image = NSImage(size: gaugeIconSize)
+    image.lockFocus()
+    NSColor.black.setStroke()
+    let body = NSBezierPath(roundedRect: NSRect(x: 1.1, y: 1.0, width: 17.8, height: 12.0),
+                            xRadius: 2.4, yRadius: 2.4)
+    body.lineWidth = 1.3
+    body.stroke()
+    NSColor(white: 0, alpha: 0.18).setFill()
+    NSBezierPath(roundedRect: gaugeScreenRect, xRadius: 1.1, yRadius: 1.1).fill()
+    if let remaining {
+        NSGraphicsContext.saveGraphicsState()
+        NSBezierPath(roundedRect: gaugeScreenRect, xRadius: 1.1, yRadius: 1.1).addClip()
+        NSColor.black.setFill()
+        let width = gaugeScreenRect.width * max(0, min(1, remaining / 100))
+        NSBezierPath(rect: NSRect(x: gaugeScreenRect.minX, y: gaugeScreenRect.minY,
+                                  width: width, height: gaugeScreenRect.height)).fill()
+        NSGraphicsContext.restoreGraphicsState()
+    }
+    image.unlockFocus()
+    image.isTemplate = true
+    return image
+}
+
+func ringMonoIcon(remaining: Double?) -> NSImage {
+    let image = NSImage(size: ringIconSize)
+    image.lockFocus()
+    let track = NSBezierPath()
+    track.appendArc(withCenter: ringCenter, radius: ringRadius, startAngle: 0, endAngle: 360)
+    track.lineWidth = 2.2
+    NSColor(white: 0, alpha: 0.22).setStroke()
+    track.stroke()
+    if let remaining, remaining > 0.5 {
+        let arc = NSBezierPath()
+        arc.appendArc(withCenter: ringCenter, radius: ringRadius,
+                      startAngle: 90, endAngle: 90 - max(0, min(1, remaining / 100)) * 360, clockwise: true)
+        arc.lineWidth = 2.2
+        arc.lineCapStyle = .round
+        NSColor.black.setStroke()
+        arc.stroke()
+    }
+    image.unlockFocus()
+    image.isTemplate = true
+    return image
+}
+
+func dualMonoIcon(sessionRemaining: Double?, weeklyRemaining: Double?) -> NSImage {
+    let image = NSImage(size: dualIconSize)
+    image.lockFocus()
+    NSColor(white: 0, alpha: 0.22).setFill()
+    for x in dualBarXs {
+        NSBezierPath(roundedRect: NSRect(x: x, y: dualBarBottom, width: dualBarWidth,
+                                         height: dualBarMaxHeight), xRadius: 1.6, yRadius: 1.6).fill()
+    }
+    NSColor.black.setFill()
+    for (x, remaining) in zip(dualBarXs, [sessionRemaining, weeklyRemaining]) {
+        guard let remaining else { continue }
+        let height = max(1.6, dualBarMaxHeight * max(0, min(1, remaining / 100)))
+        NSBezierPath(roundedRect: NSRect(x: x, y: dualBarBottom, width: dualBarWidth,
+                                         height: height), xRadius: 1.6, yRadius: 1.6).fill()
+    }
+    image.unlockFocus()
+    image.isTemplate = true
+    return image
+}
+
 private struct BrandMark: View {
     var body: some View {
         ZStack {
@@ -2572,14 +2642,18 @@ struct GaugeIconView: View {
     let colorPercent: Double?
     var colored: Bool = false
     var body: some View {
-        ZStack {
-            Image(nsImage: gaugeFrameIcon())
-            if let fillPercent, let colorPercent {
-                Image(nsImage: gaugeFillIcon(fillPercent: fillPercent, colorPercent: colorPercent))
-                    .renderingMode(colored ? .original : .template)
+        if colored {
+            ZStack {
+                Image(nsImage: gaugeFrameIcon())
+                if let fillPercent, let colorPercent {
+                    Image(nsImage: gaugeFillIcon(fillPercent: fillPercent, colorPercent: colorPercent))
+                        .renderingMode(.original)
+                }
             }
+            .frame(width: 20, height: 14)
+        } else {
+            Image(nsImage: gaugeMonoIcon(remaining: fillPercent)).frame(width: 20, height: 14)
         }
-        .frame(width: 20, height: 14)
     }
 }
 
@@ -2589,14 +2663,18 @@ struct RingGaugeView: View {
     let colorPercent: Double?
     var colored: Bool = false
     var body: some View {
-        ZStack {
-            Image(nsImage: ringTrackIcon())
-            if let fillPercent, let colorPercent {
-                Image(nsImage: ringArcIcon(fillPercent: fillPercent, colorPercent: colorPercent))
-                    .renderingMode(colored ? .original : .template)
+        if colored {
+            ZStack {
+                Image(nsImage: ringTrackIcon())
+                if let fillPercent, let colorPercent {
+                    Image(nsImage: ringArcIcon(fillPercent: fillPercent, colorPercent: colorPercent))
+                        .renderingMode(.original)
+                }
             }
+            .frame(width: 15, height: 14)
+        } else {
+            Image(nsImage: ringMonoIcon(remaining: fillPercent)).frame(width: 15, height: 14)
         }
-        .frame(width: 15, height: 14)
     }
 }
 
@@ -2608,13 +2686,18 @@ struct DualBarsView: View {
     let weeklyColor: Double?
     var colored: Bool = false
     var body: some View {
-        ZStack {
-            Image(nsImage: dualTrackIcon())
-            Image(nsImage: dualFillIcon(sessionFill: sessionFill, sessionColor: sessionColor,
-                                        weeklyFill: weeklyFill, weeklyColor: weeklyColor))
-                .renderingMode(colored ? .original : .template)
+        if colored {
+            ZStack {
+                Image(nsImage: dualTrackIcon())
+                Image(nsImage: dualFillIcon(sessionFill: sessionFill, sessionColor: sessionColor,
+                                            weeklyFill: weeklyFill, weeklyColor: weeklyColor))
+                    .renderingMode(.original)
+            }
+            .frame(width: 14, height: 14)
+        } else {
+            Image(nsImage: dualMonoIcon(sessionRemaining: sessionFill, weeklyRemaining: weeklyFill))
+                .frame(width: 14, height: 14)
         }
-        .frame(width: 14, height: 14)
     }
 }
 
