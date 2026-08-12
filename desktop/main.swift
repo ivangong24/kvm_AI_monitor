@@ -33,15 +33,15 @@ enum MenuBarMode: String, CaseIterable, Identifiable {
     }
 }
 
-// Preset looks for the companion app: each pairs an accent with a glass material and a subtle wash.
-// The window is always a real behind-window blur (see VisualEffectView); themes vary the character.
+// Preset looks for the companion app. Themes change controls and highlights, while the window
+// itself always uses AppKit's semantic menu material so its glass stays neutral and system-native.
 enum AppTheme: String, CaseIterable, Identifiable {
     case classic, modern, github, graphite
     var id: String { rawValue }
     var label: String {
         switch self {
-        case .classic: return "Classic"
-        case .modern: return "Modern"
+        case .classic: return "UniFi"
+        case .modern: return "Indigo"
         case .github: return "GitHub"
         case .graphite: return "Graphite"
         }
@@ -49,30 +49,16 @@ enum AppTheme: String, CaseIterable, Identifiable {
     // The accent that drives buttons, selection, and highlights throughout the panel.
     var accent: Color {
         switch self {
-        case .classic: return Color(red: 0.22, green: 0.49, blue: 0.96)   // the original blue
+        case .classic: return Color(red: 0.02, green: 0.47, blue: 0.94)   // UniFi / system blue
         case .modern: return Color(red: 0.46, green: 0.36, blue: 0.95)    // vivid indigo
         case .github: return Color(red: 0.13, green: 0.55, blue: 0.27)    // GitHub primary green
         case .graphite: return Color(red: 0.40, green: 0.44, blue: 0.52)  // neutral slate
         }
     }
-    // The most translucent vibrancy materials, so the desktop reads clearly through the panel.
-    // .hudWindow and .underWindowBackground are the thinnest glass AppKit offers; all adapt.
+    // AppKit documents this as the material used by menus. It matches Battery, Wi-Fi, Bluetooth,
+    // and other menu-extra dropdown surfaces more closely than the brighter NSPopover material.
     var material: NSVisualEffectView.Material {
-        switch self {
-        case .classic: return .underWindowBackground
-        case .modern: return .hudWindow
-        case .github: return .underWindowBackground
-        case .graphite: return .hudWindow
-        }
-    }
-    // A very faint color wash for character — kept low so it doesn't reintroduce opacity.
-    var wash: Color {
-        switch self {
-        case .classic: return .clear
-        case .modern: return Color(red: 0.46, green: 0.36, blue: 0.95).opacity(0.05)
-        case .github: return .clear
-        case .graphite: return .clear
-        }
+        .menu
     }
 }
 
@@ -104,6 +90,26 @@ final class TranslucentEffectView: NSVisualEffectView {
         // Our own NSPanel already sets this; harmless reinforcement.
         window?.isOpaque = false
         window?.backgroundColor = .clear
+    }
+}
+
+// Shared surface treatment for the compact dashboard. It keeps cards legible on real desktop blur
+// in both appearances without layering heavy shadows or decorative gradients over the glass.
+private struct PanelSurfaceModifier: ViewModifier {
+    @Environment(\.colorScheme) private var colorScheme
+    let radius: CGFloat
+
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
+        content
+            .background(colorScheme == .dark ? Color.white.opacity(0.045) : Color.white.opacity(0.34), in: shape)
+            .overlay(shape.stroke(colorScheme == .dark ? Color.white.opacity(0.075) : Color.black.opacity(0.07), lineWidth: 0.75))
+    }
+}
+
+private extension View {
+    func panelSurface(radius: CGFloat = 14) -> some View {
+        modifier(PanelSurfaceModifier(radius: radius))
     }
 }
 
@@ -330,10 +336,10 @@ final class MonitorModel: ObservableObject {
         didSet { UserDefaults.standard.set(appTheme.rawValue, forKey: "appTheme") }
     }
 
-    // How solid the frosted-glass background is: 1 = fully frosted, lower lets more desktop through.
-    // User-adjustable in Settings; persisted.
+    // Full-strength semantic material matches the system menu-bar popover. Lower values remain an
+    // intentional user override that lets more of the desktop show through.
     @Published var glassOpacity: Double =
-        (UserDefaults.standard.object(forKey: "glassOpacity") as? Double) ?? 0.82 {
+        (UserDefaults.standard.object(forKey: "glassOpacity") as? Double) ?? 1.0 {
         didSet { UserDefaults.standard.set(glassOpacity, forKey: "glassOpacity") }
     }
 
@@ -1081,38 +1087,58 @@ func nsUsageTint(_ percent: Double) -> NSColor {
 }
 
 private let gaugeIconSize = NSSize(width: 20, height: 14)
-private let gaugeScreenRect = NSRect(x: 3.3, y: 3.1, width: 13.4, height: 7.8)
+private let gaugeSegmentArea = NSRect(x: 1.0, y: 3.0, width: 18.0, height: 8.0)
+private let gaugeSegmentCount = 4
+private let gaugeSegmentGap: CGFloat = 1.0
 
-// The battery frame + empty track as a template, so it adopts the menu-bar (or panel) foreground
-// color in both light and dark. Drawn as two NSImages because a SwiftUI Canvas does not render
+private func gaugeSegmentRect(_ index: Int) -> NSRect {
+    let gaps = CGFloat(gaugeSegmentCount - 1) * gaugeSegmentGap
+    let width = (gaugeSegmentArea.width - gaps) / CGFloat(gaugeSegmentCount)
+    return NSRect(x: gaugeSegmentArea.minX + CGFloat(index) * (width + gaugeSegmentGap),
+                  y: gaugeSegmentArea.minY, width: width, height: gaugeSegmentArea.height)
+}
+
+// Fill a four-cell capacity meter from left to right. A partially filled final cell preserves the
+// continuous percentage while the gaps make the level readable at macOS menu-bar size.
+private func drawGaugeFill(percent: Double, color: NSColor) {
+    let progress = max(0, min(1, percent / 100)) * Double(gaugeSegmentCount)
+    color.setFill()
+    for index in 0..<gaugeSegmentCount {
+        let cellProgress = max(0, min(1, progress - Double(index)))
+        guard cellProgress > 0 else { continue }
+        let cell = gaugeSegmentRect(index)
+        NSGraphicsContext.saveGraphicsState()
+        NSBezierPath(roundedRect: cell, xRadius: 1.6, yRadius: 1.6).addClip()
+        NSBezierPath(rect: NSRect(x: cell.minX, y: cell.minY,
+                                  width: cell.width * CGFloat(cellProgress),
+                                  height: cell.height)).fill()
+        NSGraphicsContext.restoreGraphicsState()
+    }
+}
+
+// Four quiet capacity cells as a template, so they adopt the menu-bar (or panel) foreground color
+// in both light and dark. The compact bullet-meter silhouette stays legible at 14 pt and avoids the
+// old generic battery/device outline. Drawn as two NSImages because a SwiftUI Canvas does not render
 // inside a MenuBarExtra label — only Image/Text do.
 func gaugeFrameIcon() -> NSImage {
     let image = NSImage(size: gaugeIconSize)
     image.lockFocus()
-    NSColor.black.setStroke()
-    let body = NSBezierPath(roundedRect: NSRect(x: 1.1, y: 1.0, width: 17.8, height: 12.0),
-                            xRadius: 2.4, yRadius: 2.4)
-    body.lineWidth = 1.3
-    body.stroke()
-    // Faint track: template art keeps the alpha, so this reads as a subtle tint of the fg color.
+    // Template art keeps the alpha, so empty cells read as a subtle tint of the foreground color.
     NSColor(white: 0, alpha: 0.16).setFill()
-    NSBezierPath(roundedRect: gaugeScreenRect, xRadius: 1.1, yRadius: 1.1).fill()
+    for index in 0..<gaugeSegmentCount {
+        NSBezierPath(roundedRect: gaugeSegmentRect(index), xRadius: 1.6, yRadius: 1.6).fill()
+    }
     image.unlockFocus()
     image.isTemplate = true
     return image
 }
 
-// The colored fill bar: width = `fillPercent` (remaining), color from `colorPercent` (used). Non-
-// template so the band color survives.
+// The colored capacity cells: fill = remaining, color = used. Non-template so the status color
+// survives in the Settings preview.
 func gaugeFillIcon(fillPercent: Double, colorPercent: Double) -> NSImage {
     let image = NSImage(size: gaugeIconSize)
     image.lockFocus()
-    NSBezierPath(roundedRect: gaugeScreenRect, xRadius: 1.1, yRadius: 1.1).addClip()
-    let clamped = max(0, min(1, fillPercent / 100))
-    nsUsageTint(colorPercent).setFill()
-    NSBezierPath(rect: NSRect(x: gaugeScreenRect.minX, y: gaugeScreenRect.minY,
-                              width: gaugeScreenRect.width * clamped,
-                              height: gaugeScreenRect.height)).fill()
+    drawGaugeFill(percent: fillPercent, color: nsUsageTint(colorPercent))
     image.unlockFocus()
     return image
 }
@@ -1192,27 +1218,18 @@ func dualFillIcon(sessionFill: Double?, sessionColor: Double?,
 }
 
 // --- Single-image *template* menu-bar icons -------------------------------------------------------
-// One template NSImage each (outline/track + a solid fill to `remaining`), so the menu bar tints the
+// One template NSImage each (track + a solid fill to `remaining`), so the menu bar tints the
 // whole thing to a crisp white/black. Full fill = 100% budget left, empty = 0% — mirroring the app's
 // own icon, whose screen is solid white when healthy.
 func gaugeMonoIcon(remaining: Double?) -> NSImage {
     let image = NSImage(size: gaugeIconSize)
     image.lockFocus()
-    NSColor.black.setStroke()
-    let body = NSBezierPath(roundedRect: NSRect(x: 1.1, y: 1.0, width: 17.8, height: 12.0),
-                            xRadius: 2.4, yRadius: 2.4)
-    body.lineWidth = 1.3
-    body.stroke()
     NSColor(white: 0, alpha: 0.18).setFill()
-    NSBezierPath(roundedRect: gaugeScreenRect, xRadius: 1.1, yRadius: 1.1).fill()
+    for index in 0..<gaugeSegmentCount {
+        NSBezierPath(roundedRect: gaugeSegmentRect(index), xRadius: 1.6, yRadius: 1.6).fill()
+    }
     if let remaining {
-        NSGraphicsContext.saveGraphicsState()
-        NSBezierPath(roundedRect: gaugeScreenRect, xRadius: 1.1, yRadius: 1.1).addClip()
-        NSColor.black.setFill()
-        let width = gaugeScreenRect.width * max(0, min(1, remaining / 100))
-        NSBezierPath(rect: NSRect(x: gaugeScreenRect.minX, y: gaugeScreenRect.minY,
-                                  width: width, height: gaugeScreenRect.height)).fill()
-        NSGraphicsContext.restoreGraphicsState()
+        drawGaugeFill(percent: remaining, color: .black)
     }
     image.unlockFocus()
     image.isTemplate = true
@@ -1262,24 +1279,27 @@ func dualMonoIcon(sessionRemaining: Double?, weeklyRemaining: Double?) -> NSImag
 }
 
 private struct BrandMark: View {
+    let tint: Color
+
     var body: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(.white.opacity(0.14))
+                .fill(tint.opacity(0.12))
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(.white.opacity(0.22), lineWidth: 1)
+                .stroke(tint.opacity(0.22), lineWidth: 1)
             // A boxy Comet Pro silhouette with a lit screen.
             ZStack {
                 RoundedRectangle(cornerRadius: 4, style: .continuous)
-                    .stroke(.white.opacity(0.85), lineWidth: 2)
+                    .stroke(tint, lineWidth: 1.7)
                     .frame(width: 26, height: 20)
                 RoundedRectangle(cornerRadius: 2, style: .continuous)
-                    .fill(.white)
+                    .fill(tint)
                     .frame(width: 16, height: 7)
                     .offset(y: -1)
             }
         }
-        .frame(width: 44, height: 44)
+        .frame(width: 40, height: 40)
+        .accessibilityHidden(true)
     }
 }
 
@@ -1290,8 +1310,9 @@ private struct StatusOrb: View {
         Circle()
             .fill(healthy ? Color.green : Color.orange)
             .frame(width: 8, height: 8)
-            .overlay(Circle().stroke(.white.opacity(0.8), lineWidth: 1))
-            .shadow(color: (healthy ? Color.green : Color.orange).opacity(0.5), radius: 4)
+            .overlay(Circle().stroke(Color.primary.opacity(0.18), lineWidth: 1))
+            .shadow(color: (healthy ? Color.green : Color.orange).opacity(0.28), radius: 3)
+            .accessibilityHidden(true)
     }
 }
 
@@ -1323,8 +1344,7 @@ private struct MetricCard: View {
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 13).stroke(Color.primary.opacity(0.07)))
+        .panelSurface()
     }
 }
 
@@ -1338,10 +1358,7 @@ private struct KVMRow: View {
             HStack(spacing: 12) {
                 ZStack {
                     RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .fill(LinearGradient(
-                            colors: [Color(red: 0.14, green: 0.18, blue: 0.25), .black],
-                            startPoint: .topLeading, endPoint: .bottomTrailing
-                        ))
+                        .fill(Color(red: 0.09, green: 0.12, blue: 0.17))
                     RoundedRectangle(cornerRadius: 3)
                         .fill(Color.blue.opacity(0.7))
                         .frame(width: 23, height: 9)
@@ -1370,22 +1387,43 @@ private struct KVMRow: View {
         }
         .buttonStyle(.plain)
         .padding(12)
-        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 13).stroke(Color.primary.opacity(0.07)))
+        .panelSurface()
+        .accessibilityHint("Opens the AI Usage dashboard for \(host)")
     }
 }
 
 private struct PrimaryActionStyle: ButtonStyle {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.isEnabled) private var isEnabled
     let tint: Color
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 12, weight: .semibold))
-            .foregroundStyle(.white)
+            .foregroundStyle(.white.opacity(isEnabled ? 1 : 0.72))
             .frame(maxWidth: .infinity)
             .padding(.vertical, 10)
-            .background(tint.opacity(configuration.isPressed ? 0.76 : 1), in: RoundedRectangle(cornerRadius: 10))
-            .scaleEffect(configuration.isPressed ? 0.985 : 1)
+            .background(tint.opacity(isEnabled ? (configuration.isPressed ? 0.76 : 1) : 0.38), in: RoundedRectangle(cornerRadius: 10))
+            .scaleEffect(reduceMotion ? 1 : (configuration.isPressed ? 0.985 : 1))
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: configuration.isPressed)
+    }
+}
+
+private struct SecondaryActionStyle: ButtonStyle {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.isEnabled) private var isEnabled
+    let tint: Color
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(tint.opacity(isEnabled ? 1 : 0.46))
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 10)
+            .background(tint.opacity(isEnabled ? (configuration.isPressed ? 0.12 : 0.065) : 0.035), in: RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(tint.opacity(isEnabled ? 0.18 : 0.08), lineWidth: 0.75))
+            .scaleEffect(reduceMotion ? 1 : (configuration.isPressed ? 0.985 : 1))
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: configuration.isPressed)
     }
 }
 
@@ -1460,6 +1498,20 @@ struct CompanionPanel: View {
     @ObservedObject var model: MonitorModel
 
     private var accent: Color { model.appTheme.accent }
+    private var usesLiquidGlass: Bool {
+        if #available(macOS 26.0, *) { return true }
+        return false
+    }
+    private var panelCornerRadius: CGFloat { usesLiquidGlass ? 24 : 14 }
+
+    @ViewBuilder private var panelBackdrop: some View {
+        if usesLiquidGlass {
+            // The AppDelegate embeds this entire view inside NSGlassEffectView on macOS 26+.
+            Color.clear
+        } else {
+            VisualEffectView(material: model.appTheme.material, alpha: model.glassOpacity)
+        }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1475,10 +1527,18 @@ struct CompanionPanel: View {
         }
         .frame(width: 382, height: 560)
         .background(
-            VisualEffectView(material: model.appTheme.material, alpha: model.glassOpacity)
-                .overlay(model.appTheme.wash)
+            panelBackdrop
                 .ignoresSafeArea()
         )
+        .overlay {
+            if !usesLiquidGlass {
+                // NSGlassEffectView owns edge lighting on macOS 26. The legacy material needs a
+                // semantic separator so it remains defined against bright desktop backgrounds.
+                RoundedRectangle(cornerRadius: panelCornerRadius, style: .continuous)
+                    .strokeBorder(Color(nsColor: .separatorColor).opacity(0.72), lineWidth: 0.5)
+                    .allowsHitTesting(false)
+            }
+        }
         .tint(accent)
         .onAppear { model.refresh(); model.loadUsage(force: true); model.checkForUpdatesIfDue() }
         .onReceive(Timer.publish(every: 20, on: .main, in: .common).autoconnect()) { _ in
@@ -1491,14 +1551,13 @@ struct CompanionPanel: View {
 
     private var header: some View {
         HStack(spacing: 12) {
-            BrandMark()
+            BrandMark(tint: accent)
             VStack(alignment: .leading, spacing: 2) {
                 Text("KVM AI Monitor")
-                    .font(.system(size: 16, weight: .bold, design: .rounded))
-                    .foregroundStyle(.white)
+                    .font(.system(size: 15, weight: .semibold))
                 Text(headerSubtitle)
                     .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.67))
+                    .foregroundStyle(.secondary)
             }
             Spacer()
             HStack(spacing: 6) {
@@ -1507,18 +1566,17 @@ struct CompanionPanel: View {
                     .font(.system(size: 9, weight: .bold))
                     .tracking(0.8)
             }
-            .foregroundStyle(.white.opacity(0.9))
+            .foregroundStyle(Color.primary.opacity(0.78))
             .padding(.horizontal, 9)
             .padding(.vertical, 6)
-            .background(.white.opacity(0.11), in: Capsule())
+            .background((model.isHealthy ? Color.green : Color.orange).opacity(0.10), in: Capsule())
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(model.isHealthy ? "Connection live" : "Connection needs attention")
         }
-        .padding(16)
-        .background(
-            LinearGradient(
-                colors: [Color(red: 0.08, green: 0.15, blue: 0.29), Color(red: 0.13, green: 0.32, blue: 0.65)],
-                startPoint: .topLeading, endPoint: .bottomTrailing
-            )
-        )
+        .padding(.horizontal, 16)
+        .padding(.vertical, 13)
+        .background(Color.primary.opacity(0.025))
+        .overlay(alignment: .bottom) { Rectangle().fill(Color.primary.opacity(0.085)).frame(height: 0.75) }
     }
 
     // MARK: Home
@@ -1589,8 +1647,7 @@ struct CompanionPanel: View {
                 }
                 .padding(14)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 13))
-                .overlay(RoundedRectangle(cornerRadius: 13).stroke(Color.primary.opacity(0.07)))
+                .panelSurface()
             }
         }
     }
@@ -1694,7 +1751,7 @@ struct CompanionPanel: View {
             Button { model.runSetupInTerminal() } label: {
                 Label(model.kvms.isEmpty ? "Set up" : "Add or fix a device", systemImage: "plus.circle.fill")
             }
-            .buttonStyle(PrimaryActionStyle(tint: Color(red: 0.24, green: 0.27, blue: 0.33)))
+            .buttonStyle(SecondaryActionStyle(tint: Color.primary.opacity(0.78)))
         }
     }
 
@@ -1709,13 +1766,30 @@ struct CompanionPanel: View {
                 }
                 Divider()
                 SettingRow(title: "Transparency",
-                           detail: "How much of your desktop shows through the panel. Left is glassier.") {
-                    HStack(spacing: 6) {
-                        Image(systemName: "circle.dotted").font(.system(size: 11)).foregroundStyle(.secondary)
-                        Slider(value: Binding(get: { model.glassOpacity },
-                                              set: { model.glassOpacity = $0 }), in: 0.35...1.0)
-                            .frame(width: 108)
-                        Image(systemName: "circle.fill").font(.system(size: 11)).foregroundStyle(.secondary)
+                           detail: usesLiquidGlass
+                               ? "macOS controls the native Liquid Glass blur, refraction, and contrast automatically."
+                               : "Native uses the same menu blur as macOS menu extras. Move left to reveal more desktop.") {
+                    if usesLiquidGlass {
+                        Label("Liquid Glass", systemImage: "sparkles")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .accessibilityLabel("System Liquid Glass appearance")
+                    } else {
+                        HStack(spacing: 6) {
+                            Image(systemName: "circle.dotted").font(.system(size: 11)).foregroundStyle(.secondary)
+                            Slider(value: Binding(get: { model.glassOpacity },
+                                                  set: { model.glassOpacity = $0 }), in: 0.35...1.0)
+                                .frame(width: 108)
+                                .accessibilityLabel("Panel transparency")
+                                .accessibilityValue(model.glassOpacity >= 0.995
+                                                    ? "Native macOS menu"
+                                                    : "\(Int((model.glassOpacity * 100).rounded())) percent")
+                            Text(model.glassOpacity >= 0.995 ? "Native" : "\(Int((model.glassOpacity * 100).rounded()))%")
+                                .font(.system(size: 9.5, weight: .semibold))
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                                .frame(width: 38, alignment: .trailing)
+                        }
                     }
                 }
                 Divider()
@@ -1895,6 +1969,8 @@ struct CompanionPanel: View {
                 }
                 .buttonStyle(.plain)
                 .help(theme.label)
+                .accessibilityLabel("\(theme.label) theme")
+                .accessibilityValue(model.appTheme == theme ? "Selected" : "")
             }
         }
     }
@@ -1909,8 +1985,7 @@ struct CompanionPanel: View {
             VStack(alignment: .leading, spacing: 0) { content() }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 2)
-                .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 13).stroke(Color.primary.opacity(0.07)))
+                .panelSurface()
         }
         .padding(.bottom, 10)
     }
@@ -1943,37 +2018,50 @@ struct CompanionPanel: View {
     }
 
     private func navButton(_ target: Panel, _ title: String, _ icon: String) -> some View {
-        Button {
+        let selected = model.panel == target
+        return Button {
             model.panel = target
             if target == .usage { model.loadUsage() }
         } label: {
-            Label(title, systemImage: icon)
+            Label(title, systemImage: selected ? "\(icon).fill" : icon)
                 .labelStyle(.titleAndIcon)
-                .foregroundStyle(model.panel == target ? accent : Color.secondary)
+                .font(.system(size: 11, weight: selected ? .semibold : .medium))
+                .foregroundStyle(selected ? accent : Color.secondary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .background(selected ? accent.opacity(0.11) : .clear, in: Capsule())
+                .contentShape(Capsule())
         }
         .buttonStyle(.plain)
+        .accessibilityValue(selected ? "Selected" : "")
     }
 
     private var footer: some View {
-        HStack(spacing: 14) {
+        HStack(spacing: 4) {
             navButton(.home, "Home", "house")
             navButton(.usage, "Usage", "chart.bar")
             navButton(.settings, "Settings", "gearshape")
             Spacer()
-            Button { model.refresh(); model.loadUsage(force: true) } label: { Image(systemName: "arrow.clockwise") }
+            Button { model.refresh(); model.loadUsage(force: true) } label: {
+                Image(systemName: "arrow.clockwise").frame(width: 28, height: 28)
+                    .background(Color.primary.opacity(0.055), in: Circle())
+            }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
                 .help("Refresh")
-            Button { NSApplication.shared.terminate(nil) } label: { Image(systemName: "power") }
+                .accessibilityLabel("Refresh usage")
+            Button { NSApplication.shared.terminate(nil) } label: {
+                Image(systemName: "power").frame(width: 28, height: 28)
+            }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
                 .help("Quit KVM AI Monitor")
+                .accessibilityLabel("Quit KVM AI Monitor")
         }
-        .font(.system(size: 11, weight: .medium))
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
-        .background(Color.primary.opacity(0.035))
-        .overlay(alignment: .top) { Divider() }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(Color.primary.opacity(0.025))
+        .overlay(alignment: .top) { Rectangle().fill(Color.primary.opacity(0.085)).frame(height: 0.75) }
     }
 }
 
@@ -2085,30 +2173,228 @@ private struct UsageLimitBar: View {
     }
 }
 
-private struct DailyBars: View {
-    let values: [Double]
+private struct ContributionDay: Identifiable {
+    let date: Date
+    let key: String
+    let tokens: Double
+    let inputTokens: Double
+    let outputTokens: Double
+    let cacheReadTokens: Double
+    let cacheCreationTokens: Double
+    var id: String { key }
+
+    var breakdown: [(String, Double)] {
+        [
+            ("Input", inputTokens), ("Output", outputTokens),
+            ("Cache read", cacheReadTokens), ("Cache write", cacheCreationTokens),
+        ].filter { $0.1 > 0 }
+    }
+}
+
+// A calendar-faithful 30-day series. Provider payloads omit quiet days, so fill those gaps with
+// zeroes before laying the values out like GitHub's Sunday-through-Saturday contribution graph.
+private func contributionDays(from daily: [DailyPayload], now: Date = Date(), calendar: Calendar = .current) -> [ContributionDay] {
+    let payloads = Dictionary(daily.map { ($0.date, $0) }, uniquingKeysWith: { _, latest in latest })
+    let today = calendar.startOfDay(for: now)
+    return (-29...0).compactMap { offset in
+        guard let date = calendar.date(byAdding: .day, value: offset, to: today) else { return nil }
+        let parts = calendar.dateComponents([.year, .month, .day], from: date)
+        guard let year = parts.year, let month = parts.month, let day = parts.day else { return nil }
+        let key = String(format: "%04d-%02d-%02d", year, month, day)
+        let payload = payloads[key]
+        let input = max(0, payload?.inputTokens ?? 0)
+        let output = max(0, payload?.outputTokens ?? 0)
+        let cacheRead = max(0, payload?.cacheReadTokens ?? 0)
+        let cacheCreation = max(0, payload?.cacheCreationTokens ?? 0)
+        let componentTotal = input + output + cacheRead + cacheCreation
+        return ContributionDay(date: date, key: key,
+                               tokens: max(0, payload?.totalTokens ?? componentTotal),
+                               inputTokens: input, outputTokens: output,
+                               cacheReadTokens: cacheRead, cacheCreationTokens: cacheCreation)
+    }
+}
+
+private struct ContributionGrid: View {
+    let daily: [DailyPayload]
     let tint: Color
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var selectedKey: String?
+    @State private var hoveredKey: String?
+
+    private var days: [ContributionDay] { contributionDays(from: daily) }
+    private var peak: Double { days.map(\.tokens).max() ?? 0 }
+    private var maxValue: Double { max(peak, 1) }
+    private var total: Double { days.reduce(0) { $0 + $1.tokens } }
+    private var activeDays: Int { days.filter { $0.tokens > 0 }.count }
+    private var selectedDay: ContributionDay? { days.first { $0.key == selectedKey } }
+
+    private var weeks: [[ContributionDay?]] {
+        guard let first = days.first else { return [] }
+        let leading = Calendar.current.component(.weekday, from: first.date) - 1
+        var slots = Array<ContributionDay?>(repeating: nil, count: leading)
+        slots.append(contentsOf: days.map(Optional.some))
+        let trailing = (7 - slots.count % 7) % 7
+        slots.append(contentsOf: Array(repeating: nil, count: trailing))
+        return stride(from: 0, to: slots.count, by: 7).map {
+            Array(slots[$0..<min($0 + 7, slots.count)])
+        }
+    }
+
+    private func fill(for tokens: Double) -> Color {
+        guard tokens > 0 else { return Color.primary.opacity(0.075) }
+        let ratio = sqrt(tokens / maxValue)
+        let opacity: Double = ratio < 0.35 ? 0.30 : ratio < 0.60 ? 0.50 : ratio < 0.82 ? 0.72 : 1
+        return tint.opacity(opacity)
+    }
+
     var body: some View {
-        let maxValue = max(values.max() ?? 1, 1)
-        VStack(alignment: .leading, spacing: 6) {
-            GeometryReader { geo in
-                HStack(alignment: .bottom, spacing: 3) {
-                    ForEach(Array(values.enumerated()), id: \.offset) { _, value in
-                        RoundedRectangle(cornerRadius: 2)
-                            .fill(tint.opacity(0.85))
-                            .frame(maxWidth: .infinity)
-                            .frame(height: max(2, geo.size.height * CGFloat(value / maxValue)))
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 14) {
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(alignment: .top, spacing: 4) {
+                        VStack(spacing: 4) {
+                            ForEach(Array(["", "M", "", "W", "", "F", ""].enumerated()), id: \.offset) { _, label in
+                                Text(label)
+                                    .font(.system(size: 8, weight: .medium))
+                                    .foregroundStyle(.tertiary)
+                                    .frame(width: 9, height: 16)
+                            }
+                        }
+                        HStack(alignment: .top, spacing: 4) {
+                            ForEach(Array(weeks.enumerated()), id: \.offset) { _, week in
+                                VStack(spacing: 4) {
+                                    ForEach(Array(week.enumerated()), id: \.offset) { _, day in
+                                        if let day {
+                                            let selected = selectedKey == day.key
+                                            let hovered = hoveredKey == day.key
+                                            Button {
+                                                select(day)
+                                            } label: {
+                                                RoundedRectangle(cornerRadius: 3.5, style: .continuous)
+                                                    .fill(fill(for: day.tokens))
+                                                    .overlay {
+                                                        RoundedRectangle(cornerRadius: 3.5, style: .continuous)
+                                                            .stroke(selected ? tint : Color.primary.opacity(day.tokens > 0 ? 0.06 : 0.10),
+                                                                    lineWidth: selected ? 1.5 : 0.5)
+                                                    }
+                                                    .shadow(color: tint.opacity(selected ? 0.34 : hovered ? 0.20 : 0),
+                                                            radius: selected ? 4 : 2)
+                                                    .scaleEffect(reduceMotion ? 1 : selected ? 1.12 : hovered ? 1.06 : 1)
+                                                    .frame(width: 16, height: 16)
+                                                    .contentShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                                            }
+                                            .buttonStyle(.plain)
+                                            .onHover { inside in
+                                                if inside { hoveredKey = day.key }
+                                                else if hoveredKey == day.key { hoveredKey = nil }
+                                            }
+                                            .animation(reduceMotion ? nil : .spring(response: 0.22, dampingFraction: 0.76),
+                                                       value: selected)
+                                            .animation(reduceMotion ? nil : .easeOut(duration: 0.14), value: hovered)
+                                            .help("\(day.date.formatted(.dateTime.month(.wide).day().year())) · \(tokenShort(day.tokens)) tokens · Click for details")
+                                            .accessibilityLabel("\(day.date.formatted(date: .long, time: .omitted)), \(Int(day.tokens)) tokens")
+                                            .accessibilityHint("Shows detailed token usage for this day")
+                                            .accessibilityValue(selected ? "Selected" : "")
+                                        } else {
+                                            Color.clear.frame(width: 16, height: 16)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    HStack {
+                        if let first = days.first {
+                            Text(first.date, format: .dateTime.month(.abbreviated).day())
+                        }
+                        Spacer()
+                        Text("Today")
+                    }
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                VStack(alignment: .leading, spacing: 10) {
+                    contributionStat(tokenShort(total), "TOTAL TOKENS")
+                    contributionStat("\(activeDays) / 30", "ACTIVE DAYS")
+                    contributionStat(tokenShort(peak), "PEAK DAY")
+                }
+                .frame(width: 82, alignment: .leading)
+            }
+            HStack(spacing: 4) {
+                Text("Less")
+                RoundedRectangle(cornerRadius: 2.5).fill(Color.primary.opacity(0.075)).frame(width: 11, height: 11)
+                ForEach([0.30, 0.50, 0.72, 1.0], id: \.self) { opacity in
+                    RoundedRectangle(cornerRadius: 2.5).fill(tint.opacity(opacity)).frame(width: 11, height: 11)
+                }
+                Text("More")
+            }
+            .font(.system(size: 9, weight: .medium))
+            .foregroundStyle(.secondary)
+            Divider()
+            Group {
+                if let selectedDay {
+                    dayDetail(selectedDay)
+                } else {
+                    HStack(spacing: 6) {
+                        Image(systemName: "info.circle").foregroundStyle(tint)
+                        Text("Click a square to inspect that day’s token details.")
+                            .foregroundStyle(.secondary)
+                    }
+                    .font(.system(size: 10.5, weight: .medium))
+                    .frame(maxWidth: .infinity, minHeight: 42, alignment: .leading)
+                }
+            }
+            .transition(.opacity)
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: selectedKey)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("30-day usage activity")
+        .accessibilityValue("\(activeDays) active days, \(tokenShort(total)) total tokens, \(tokenShort(peak)) peak day")
+    }
+
+    private func contributionStat(_ value: String, _ label: String) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(value).font(.system(size: 13, weight: .semibold, design: .rounded)).monospacedDigit()
+            Text(label).font(.system(size: 7.5, weight: .bold)).tracking(0.45).foregroundStyle(.secondary)
+        }
+    }
+
+    private func select(_ day: ContributionDay) {
+        let update = { selectedKey = selectedKey == day.key ? nil : day.key }
+        if reduceMotion { update() }
+        else { withAnimation(.spring(response: 0.24, dampingFraction: 0.82), update) }
+    }
+
+    private func dayDetail(_ day: ContributionDay) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Text(day.date, format: .dateTime.weekday(.wide).month(.abbreviated).day())
+                    .font(.system(size: 11, weight: .semibold))
+                Spacer()
+                Text("\(tokenShort(day.tokens)) tokens")
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+            }
+            if day.breakdown.isEmpty {
+                Text(day.tokens > 0 ? "This provider reports the daily total without a token-type breakdown."
+                                    : "No token usage was recorded on this day.")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+            } else {
+                HStack(spacing: 12) {
+                    ForEach(Array(day.breakdown.enumerated()), id: \.offset) { _, item in
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(item.0.uppercased()).font(.system(size: 7.5, weight: .bold)).foregroundStyle(.secondary)
+                            Text(tokenShort(item.1)).font(.system(size: 10.5, weight: .semibold)).monospacedDigit()
+                        }
                     }
                 }
             }
-            .frame(height: 70)
-            HStack {
-                Text("peak \(tokenShort(maxValue))").font(.system(size: 10)).foregroundStyle(.secondary)
-                Spacer()
-                Text("today \(tokenShort(values.last ?? 0))").font(.system(size: 10)).foregroundStyle(.secondary)
-            }
         }
+        .frame(maxWidth: .infinity, minHeight: 42, alignment: .leading)
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -2136,52 +2422,128 @@ private struct HeroRing: View {
 }
 
 private struct DonutSlice: Identifiable {
-    let id = UUID()
     let label: String
     let value: Double
     let color: Color
+    var id: String { label }
 }
 
 private struct DonutChart: View {
     let slices: [DonutSlice]
 
-    private var total: Double { max(slices.reduce(0) { $0 + $1.value }, 1) }
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var selectedID: String?
+    @State private var hoveredID: String?
 
-    private struct Arc: Identifiable { let id = UUID(); let start: CGFloat; let end: CGFloat; let color: Color }
+    private var total: Double { max(slices.reduce(0) { $0 + $1.value }, 1) }
+    private var selectedSlice: DonutSlice? { slices.first { $0.id == selectedID } }
+
+    private struct Arc: Identifiable {
+        let id: String
+        let start: CGFloat
+        let end: CGFloat
+        let slice: DonutSlice
+    }
 
     private var arcs: [Arc] {
         var accumulated: CGFloat = 0
         var result: [Arc] = []
         for slice in slices {
             let fraction = CGFloat(slice.value / total)
-            result.append(Arc(start: accumulated, end: accumulated + fraction, color: slice.color))
+            result.append(Arc(id: slice.id, start: accumulated, end: accumulated + fraction, slice: slice))
             accumulated += fraction
         }
         return result
     }
 
     var body: some View {
-        HStack(spacing: 16) {
+        HStack(alignment: .top, spacing: 14) {
             ZStack {
+                Circle().stroke(Color.primary.opacity(0.07), lineWidth: 12)
                 ForEach(arcs) { arc in
+                    let selected = selectedID == arc.id
+                    let hovered = hoveredID == arc.id
                     Circle()
                         .trim(from: arc.start, to: arc.end)
-                        .stroke(arc.color, style: StrokeStyle(lineWidth: 13, lineCap: .butt))
+                        .stroke(arc.slice.color.opacity(hoveredID == nil || selected || hovered ? 1 : 0.42),
+                                style: StrokeStyle(lineWidth: selected ? 15 : hovered ? 14 : 12, lineCap: .butt))
                         .rotationEffect(.degrees(-90))
+                        .scaleEffect(reduceMotion ? 1 : selected ? 1.035 : hovered ? 1.018 : 1)
+                        .shadow(color: arc.slice.color.opacity(selected ? 0.32 : hovered ? 0.18 : 0),
+                                radius: selected ? 5 : 3)
+                        .onTapGesture { select(arc.id) }
+                        .onHover { inside in updateHover(arc.id, inside: inside) }
+                        .help("\(arc.slice.label) · \(tokenShort(arc.slice.value)) tokens · Click for details")
+                        .accessibilityHidden(true)
+                        .animation(reduceMotion ? nil : .spring(response: 0.24, dampingFraction: 0.78),
+                                   value: selected)
+                        .animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: hovered)
+                }
+                VStack(spacing: 0) {
+                    Text(tokenShort(selectedSlice?.value ?? total))
+                        .font(.system(size: 11, weight: .bold, design: .rounded))
+                        .monospacedDigit()
+                    Text(selectedSlice.map { "\(Int(($0.value / total * 100).rounded()))%" } ?? "TOTAL")
+                        .font(.system(size: 7.5, weight: .bold))
+                        .tracking(0.35)
+                        .foregroundStyle(.secondary)
                 }
             }
-            .frame(width: 78, height: 78)
-            VStack(alignment: .leading, spacing: 6) {
+            .frame(width: 88, height: 88)
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: selectedID)
+
+            VStack(alignment: .leading, spacing: 4) {
                 ForEach(slices) { slice in
-                    HStack(spacing: 7) {
-                        Circle().fill(slice.color).frame(width: 8, height: 8)
-                        Text(slice.label).font(.system(size: 11)).foregroundStyle(.secondary)
-                        Spacer()
-                        Text("\(Int((slice.value / total * 100).rounded()))%").font(.system(size: 11, weight: .semibold))
+                    let selected = selectedID == slice.id
+                    let hovered = hoveredID == slice.id
+                    Button { select(slice.id) } label: {
+                        HStack(spacing: 7) {
+                            Circle().fill(slice.color).frame(width: 8, height: 8)
+                            Text(slice.label)
+                                .font(.system(size: 11, weight: selected ? .semibold : .regular))
+                                .foregroundStyle(selected ? Color.primary : Color.secondary)
+                                .lineLimit(1)
+                            Spacer()
+                            Text(selected ? tokenShort(slice.value) : "\(Int((slice.value / total * 100).rounded()))%")
+                                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                                .monospacedDigit()
+                        }
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 4)
+                        .background(selected ? slice.color.opacity(0.12) : hovered ? Color.primary.opacity(0.045) : .clear,
+                                    in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        .contentShape(Rectangle())
                     }
+                    .buttonStyle(.plain)
+                    .onHover { inside in updateHover(slice.id, inside: inside) }
+                    .help("\(slice.label) · \(tokenShort(slice.value)) tokens · \(Int((slice.value / total * 100).rounded()))%")
+                    .accessibilityLabel("\(slice.label), \(Int(slice.value)) tokens, \(Int((slice.value / total * 100).rounded())) percent")
+                    .accessibilityHint("Selects this category in the chart")
+                    .accessibilityValue(selected ? "Selected" : "")
                 }
+                Text(selectedSlice == nil ? "Click a segment or row for exact usage." : "Click again to clear the selection.")
+                    .font(.system(size: 9.5))
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 6)
+                    .padding(.top, 2)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Usage breakdown")
+        .accessibilityValue(selectedSlice.map { "\($0.label), \(Int($0.value)) tokens" }
+                            ?? "\(Int(total)) total tokens across \(slices.count) categories")
+    }
+
+    private func select(_ id: String) {
+        let update = { selectedID = selectedID == id ? nil : id }
+        if reduceMotion { update() }
+        else { withAnimation(.spring(response: 0.24, dampingFraction: 0.80), update) }
+    }
+
+    private func updateHover(_ id: String, inside: Bool) {
+        if inside { hoveredID = id }
+        else if hoveredID == id { hoveredID = nil }
     }
 }
 
@@ -2342,6 +2704,7 @@ struct UsagePanel: View {
         }
         .pickerStyle(.segmented)
         .labelsHidden()
+        .accessibilityLabel("Usage provider")
     }
 
     // Headline "how close am I to a wall" view: the most-constrained limit as a ring with its reset
@@ -2416,12 +2779,13 @@ struct UsagePanel: View {
     }
 
     private func dailyCard(_ provider: ProviderPayload) -> some View {
-        let values = Array((provider.daily ?? []).suffix(14)).map { $0.totalTokens ?? 0 }
-        return card("Daily tokens · last \(values.count) days") {
-            if values.isEmpty {
+        let daily = provider.daily ?? []
+        return card("Usage activity · last 30 days") {
+            if daily.isEmpty {
                 Text("No daily history yet.").font(.system(size: 12)).foregroundStyle(.secondary)
             } else {
-                DailyBars(values: values, tint: accent)
+                ContributionGrid(daily: daily, tint: accent)
+                    .id(provider.provider)
             }
         }
     }
@@ -2465,8 +2829,7 @@ struct UsagePanel: View {
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 13))
-        .overlay(RoundedRectangle(cornerRadius: 13).stroke(Color.primary.opacity(0.07)))
+        .panelSurface()
     }
 
     private func infoCard(_ title: String, _ detail: String) -> some View {
@@ -2477,6 +2840,7 @@ struct UsagePanel: View {
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(accent.opacity(0.06), in: RoundedRectangle(cornerRadius: 13))
+        .overlay(RoundedRectangle(cornerRadius: 13).stroke(accent.opacity(0.14), lineWidth: 0.75))
     }
 
     private var loadingView: some View {
@@ -2633,26 +2997,36 @@ struct TouchscreenCard: View {
 // menu-bar/panel color) under a colored fill — because a SwiftUI Canvas draws nothing in a
 // MenuBarExtra label, while Image/Text render reliably.
 
-// Battery draining with remaining budget. In the menu bar the fill renders `.template` (clean
-// monochrome — the menu bar flattens colors anyway); the Settings preview passes colored: true for
-// the full band color. (Usage gauge mode.)
+// Segmented capacity meter draining with remaining budget. In the menu bar the fill renders as a
+// template (clean monochrome — the menu bar flattens colors anyway); the Settings preview passes
+// colored: true for the full status color. (Usage gauge mode.)
 struct GaugeIconView: View {
     let fillPercent: Double?
     let colorPercent: Double?
     var colored: Bool = false
+
+    private var spokenValue: String {
+        fillPercent.map { "\(Int($0.rounded())) percent remaining" } ?? "No usage data"
+    }
+
     var body: some View {
-        if colored {
-            ZStack {
-                Image(nsImage: gaugeFrameIcon())
-                if let fillPercent, let colorPercent {
-                    Image(nsImage: gaugeFillIcon(fillPercent: fillPercent, colorPercent: colorPercent))
-                        .renderingMode(.original)
+        Group {
+            if colored {
+                ZStack {
+                    Image(nsImage: gaugeFrameIcon())
+                    if let fillPercent, let colorPercent {
+                        Image(nsImage: gaugeFillIcon(fillPercent: fillPercent, colorPercent: colorPercent))
+                            .renderingMode(.original)
+                    }
                 }
+                .frame(width: 20, height: 14)
+            } else {
+                Image(nsImage: gaugeMonoIcon(remaining: fillPercent)).frame(width: 20, height: 14)
             }
-            .frame(width: 20, height: 14)
-        } else {
-            Image(nsImage: gaugeMonoIcon(remaining: fillPercent)).frame(width: 20, height: 14)
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Usage capacity")
+        .accessibilityValue(spokenValue)
     }
 }
 
@@ -2786,19 +3160,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         statusItem.button?.action = #selector(togglePanel)
 
         let content = NSHostingView(rootView: CompanionPanel(model: model))
-        content.wantsLayer = true
-        content.layer?.cornerRadius = 12
-        content.layer?.masksToBounds = true
+        let panelSize = NSSize(width: 382, height: 560)
+        content.frame = NSRect(origin: .zero, size: panelSize)
+        content.autoresizingMask = [.width, .height]
 
-        panel = TransparentPanel(contentRect: NSRect(x: 0, y: 0, width: 382, height: 560),
+        let panelContent: NSView
+        if #available(macOS 26.0, *) {
+            // Tahoe's system menu extras use the new dynamic Liquid Glass renderer. Embedding the
+            // entire hosting view as NSGlassEffectView.contentView gives us the same wallpaper-aware
+            // blur, refraction, edge lighting, and contrast adaptation instead of approximating it.
+            let glass = NSGlassEffectView(frame: NSRect(origin: .zero, size: panelSize))
+            glass.style = .regular
+            glass.cornerRadius = 24
+            glass.tintColor = nil
+            glass.contentView = content
+            glass.autoresizingMask = [.width, .height]
+            panelContent = glass
+        } else {
+            content.wantsLayer = true
+            content.layer?.cornerRadius = 14
+            content.layer?.cornerCurve = .continuous
+            content.layer?.masksToBounds = true
+            panelContent = content
+        }
+
+        panel = TransparentPanel(contentRect: NSRect(origin: .zero, size: panelSize),
                                  styleMask: [.borderless, .nonactivatingPanel],
                                  backing: .buffered, defer: false)
         panel.isOpaque = false
         panel.backgroundColor = .clear
-        panel.hasShadow = true
+        // NSGlassEffectView supplies its own rounded depth. NSWindow's legacy shadow follows the
+        // rectangular window bounds and otherwise leaves a visible square halo around the glass.
+        if #available(macOS 26.0, *) { panel.hasShadow = false }
+        else { panel.hasShadow = true }
         panel.level = .statusBar
         panel.isMovable = false
-        panel.contentView = content
+        panel.contentView = panelContent
         panel.delegate = self
 
         // Keep the menu-bar glyph current as usage and the chosen mode change.
@@ -2816,22 +3213,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let summary = model.menuBarSummary
         button.title = ""
         button.imagePosition = .imageOnly
+        button.toolTip = nil
         switch model.menuBarMode {
         case .icon:
             button.image = statusBarIcon(healthy: model.isHealthy)
+            button.toolTip = model.isHealthy ? "KVM AI Monitor — connected" : "KVM AI Monitor — setup required"
         case .gauge:
             button.image = gaugeMonoIcon(remaining: summary?.fillPercent)
+            button.toolTip = "Usage capacity — \(summary?.text ?? "--") remaining"
         case .limitPercent:
             button.image = ringMonoIcon(remaining: summary?.fillPercent)
+            button.toolTip = "Usage limit — \(summary?.text ?? "--") remaining"
         case .dual:
             button.image = dualMonoIcon(sessionRemaining: summary?.fillPercent,
                                         weeklyRemaining: summary?.secondaryFill)
+            button.toolTip = "Session \(summary?.text ?? "--") · Weekly \(summary?.secondary ?? "--") remaining"
         case .costToday:
             let dollar = NSImage(systemSymbolName: "dollarsign.circle.fill", accessibilityDescription: nil)
             dollar?.isTemplate = true
             button.image = dollar
             button.title = " " + (summary?.text ?? "")
             button.imagePosition = .imageLeading
+            button.toolTip = "Today’s AI cost — \(summary?.text ?? "--")"
         }
     }
 

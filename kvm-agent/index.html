@@ -7,9 +7,9 @@
     <title>AI Usage</title>
     <style>
       :root {
-        --accent: #006fff; --accent-soft: rgba(0, 111, 255, .09); --accent-strong: #0059d6;
+        --accent: #006bf5; --accent-soft: rgba(0, 107, 245, .09); --accent-strong: #0059d6;
         --bg: #f4f5f7; --surface: #ffffff; --line: #e4e7ec;
-        --text: #212327; --muted: #7d8590;
+        --text: #212327; --muted: #66707c;
         --good: #2f9e63; --warn: #cf8b12; --bad: #dd4f4f;
         --track-soft: #e9ecf1;
         --shadow-sm: 0 1px 2px rgba(16, 24, 40, .05), 0 1px 3px rgba(16, 24, 40, .04);
@@ -23,6 +23,7 @@
       button, select, input, a { font: inherit; }
       :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
       h1, h2, p { margin: 0; }
+      .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 
       .app { display: flex; min-height: 100vh; }
       .sidebar { width: 212px; flex: none; background: var(--surface); border-right: 1px solid var(--line); padding: 16px 12px; display: flex; flex-direction: column; gap: 18px; position: sticky; top: 0; height: 100vh; }
@@ -177,11 +178,12 @@
       .login-error { color: var(--bad); font-size: 12.5px; min-height: 16px; margin: 0; }
 
       /* Usage visualization card */
+      .usage-card { border-color: color-mix(in srgb, var(--accent) 18%, var(--line)); box-shadow: var(--shadow-md); }
       .usage-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
       .usage-provider, #usage-provider { color: var(--muted); font-weight: 500; }
       .usage-plan { padding: 4px 10px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-size: 11px; font-weight: 700; letter-spacing: .05em; white-space: nowrap; }
       .usage-limits { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin: 14px 0 6px; }
-      .limit-ring { display: flex; align-items: center; gap: 14px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 13px; background: linear-gradient(180deg, var(--surface), var(--bg)); }
+      .limit-ring { display: flex; align-items: center; gap: 14px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 13px; background: color-mix(in srgb, var(--bg) 64%, var(--surface)); }
       .limit-ring svg { width: 72px; height: 72px; flex: none; }
       .limit-ring svg circle.ring-value { transition: stroke-dashoffset .6s cubic-bezier(.2,.7,.2,1); }
       .limit-ring .limit-meta { min-width: 0; }
@@ -191,14 +193,58 @@
       .limit-ring .limit-reset::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex: none; }
       .limit-ring .limit-proj { font-size: 11px; font-weight: 600; margin-top: 4px; }
 
-      .usage-chart-block { margin-top: 12px; }
       .chart-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 8px; }
       .chart-head span:last-child { text-transform: none; letter-spacing: 0; font-size: 12px; font-weight: 600; color: var(--text); }
-      .usage-chart { display: block; width: 100%; height: 150px; }
-      .usage-chart rect.bar { transition: height .5s cubic-bezier(.2,.7,.2,1), y .5s cubic-bezier(.2,.7,.2,1); }
-      .chart-axis { display: flex; justify-content: space-between; font-size: 10.5px; color: var(--muted); margin-top: 5px; }
 
-      .usage-compose { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
+      /* Calendar contribution heatmap — continuous data with click/keyboard drill-down. */
+      .usage-activity { margin-top: 14px; padding: 16px; border: 1px solid var(--line); border-radius: 15px; background: color-mix(in srgb, var(--bg) 72%, var(--surface)); }
+      .activity-layout { display: grid; grid-template-columns: minmax(330px, 1fr) 176px; align-items: start; gap: 18px; }
+      .heatmap-region { min-width: 0; }
+      .heatmap-shell { display: grid; grid-template-columns: 25px minmax(0, 1fr); gap: 0 7px; align-items: start; }
+      .heatmap-weekdays { display: grid; grid-template-rows: repeat(7, 44px); color: var(--muted); font-size: 9.5px; font-weight: 600; }
+      .heatmap-weekdays span { display: flex; align-items: center; }
+      .usage-heatmap { display: grid; grid-template-rows: repeat(7, 44px); grid-auto-flow: column; grid-auto-columns: 44px; justify-content: start; }
+      .heatmap-cell, .heatmap-spacer { width: 44px; height: 44px; }
+      .heatmap-cell { position: relative; border: 0; padding: 5px; border-radius: 10px; color: inherit; background: transparent; cursor: pointer; touch-action: manipulation; }
+      .heatmap-cell::before { content: ""; display: block; width: 100%; height: 100%; border-radius: 7px; background: var(--track-soft); border: 1px solid color-mix(in srgb, var(--line) 72%, transparent); transition: transform .18s ease, box-shadow .18s ease, border-color .18s ease, background-color .18s ease; }
+      .heatmap-cell.level-1::before { background: color-mix(in srgb, var(--accent) 25%, var(--surface)); }
+      .heatmap-cell.level-2::before { background: color-mix(in srgb, var(--accent) 48%, var(--surface)); }
+      .heatmap-cell.level-3::before { background: color-mix(in srgb, var(--accent) 72%, var(--surface)); }
+      .heatmap-cell.level-4::before { background: var(--accent); }
+      .heatmap-cell:hover::before, .heatmap-cell:focus-visible::before { transform: scale(1.10); border-color: color-mix(in srgb, var(--accent) 68%, var(--line)); box-shadow: 0 3px 10px color-mix(in srgb, var(--accent) 25%, transparent); }
+      .heatmap-cell.selected::before { transform: scale(1.10); border-color: var(--surface); box-shadow: 0 0 0 2px var(--accent), 0 4px 12px color-mix(in srgb, var(--accent) 30%, transparent); }
+      .heatmap-cell:focus-visible { outline-offset: -2px; }
+      .heatmap-range { display: flex; justify-content: space-between; gap: 12px; margin: 3px 0 0 32px; color: var(--muted); font-size: 10.5px; }
+      .heatmap-legend { display: flex; align-items: center; gap: 3px; margin: 10px 0 0 32px; color: var(--muted); font-size: 10.5px; }
+      .legend-cell { width: 14px; height: 14px; border-radius: 4px; border: 1px solid color-mix(in srgb, var(--line) 72%, transparent); background: var(--track-soft); }
+      .legend-cell.level-1 { background: color-mix(in srgb, var(--accent) 25%, var(--surface)); }
+      .legend-cell.level-2 { background: color-mix(in srgb, var(--accent) 48%, var(--surface)); }
+      .legend-cell.level-3 { background: color-mix(in srgb, var(--accent) 72%, var(--surface)); }
+      .legend-cell.level-4 { background: var(--accent); }
+      .activity-kpis { display: grid; gap: 8px; }
+      .activity-kpi { min-width: 0; padding: 11px 12px; border: 1px solid var(--line); border-radius: 11px; background: var(--surface); }
+      .activity-kpi span { display: block; color: var(--muted); font-size: 9.5px; font-weight: 650; letter-spacing: .055em; text-transform: uppercase; }
+      .activity-kpi strong { display: block; margin-top: 3px; font-size: 16px; font-variant-numeric: tabular-nums; letter-spacing: -.015em; overflow-wrap: anywhere; }
+      .usage-day-detail { min-height: 76px; margin-top: 14px; padding: 13px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+      .day-empty { min-height: 48px; display: flex; align-items: center; gap: 9px; color: var(--muted); font-size: 12.5px; }
+      .day-empty svg { width: 18px; height: 18px; flex: none; color: var(--accent); }
+      .day-detail-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+      .day-detail-head strong { font-size: 13.5px; }
+      .day-detail-head span { font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; }
+      .day-breakdown { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 11px; }
+      .day-token { min-width: 0; padding-top: 8px; border-top: 2px solid var(--token-color, var(--line)); }
+      .day-token span { display: block; color: var(--muted); font-size: 9.5px; text-transform: uppercase; letter-spacing: .04em; }
+      .day-token strong { display: block; margin-top: 2px; font-size: 12px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+      .usage-data-disclosure { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+      .usage-data-disclosure summary { width: fit-content; padding: 4px 0; color: var(--accent); font-size: 11.5px; font-weight: 600; cursor: pointer; }
+      .usage-table-scroll { margin-top: 8px; max-height: 270px; overflow: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+      .usage-data-table { width: 100%; border-collapse: collapse; font-size: 11.5px; font-variant-numeric: tabular-nums; }
+      .usage-data-table th, .usage-data-table td { padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+      .usage-data-table th:first-child, .usage-data-table td:first-child { text-align: left; }
+      .usage-data-table th { position: sticky; top: 0; z-index: 1; background: var(--surface); color: var(--muted); font-size: 9.5px; text-transform: uppercase; letter-spacing: .045em; }
+      .usage-data-table tr:last-child td { border-bottom: 0; }
+
+      .usage-compose { margin-top: 14px; padding: 16px; border: 1px solid var(--line); border-radius: 15px; background: color-mix(in srgb, var(--bg) 72%, var(--surface)); }
       .compose-bar { display: flex; height: 14px; border-radius: 7px; overflow: hidden; background: var(--track-soft); }
       .compose-bar span { display: block; height: 100%; transition: width .5s cubic-bezier(.2,.7,.2,1); }
       .compose-legend { display: flex; flex-wrap: wrap; gap: 12px 20px; margin-top: 12px; }
@@ -254,6 +300,7 @@
         .kvm-product-visual { width: 102px; height: 70px; }
         .kvm-quick-facts { grid-column: 2 / 4; grid-row: 2; width: 100%; min-width: 0; padding-bottom: 3px; }
         .kvm-row-chevron { grid-column: 3; grid-row: 1; }
+        .activity-layout { grid-template-columns: minmax(300px, 1fr) 160px; }
         input[type="text"] { min-width: 0; width: 100%; }
         .device-control { width: 100%; flex-wrap: wrap; }
       }
@@ -268,12 +315,30 @@
         .gauge-tile { background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 92%, #fff), var(--surface)); }
       }
       @media (max-width: 520px) {
+        .topbar { align-items: flex-start; }
+        .top-status { flex-wrap: wrap; justify-content: flex-end; }
         .kvm-device-row { grid-template-columns: 82px minmax(0, 1fr) 16px; gap: 12px; padding: 12px; }
         .kvm-product-visual { width: 82px; height: 62px; }
         .kvm-summary > p { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .kvm-quick-facts { gap: 14px; }
+        .usage-card { padding: 16px; }
+        .usage-head { flex-wrap: wrap; }
+        .usage-activity, .usage-compose { padding: 13px; }
+        .chart-head { align-items: flex-start; flex-direction: column; gap: 3px; }
+        .activity-layout { grid-template-columns: 1fr; gap: 14px; }
+        .activity-kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+        .activity-kpi { padding: 9px 8px; }
+        .activity-kpi strong { font-size: 13px; }
+        .heatmap-shell { grid-template-columns: 18px minmax(0, 1fr); gap: 0 1px; }
+        .heatmap-weekdays span { justify-content: flex-end; }
+        .heatmap-range, .heatmap-legend { margin-left: 19px; }
+        .day-detail-head { align-items: flex-start; flex-direction: column; gap: 2px; }
+        .day-breakdown { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       }
-      @media (prefers-reduced-motion: reduce) { .kvm-product-image, .kvm-row-chevron, .kvm-drawer, .drawer-backdrop { transition: none; } }
+      @media (prefers-reduced-motion: reduce) {
+        .kvm-product-image, .kvm-row-chevron, .kvm-drawer, .drawer-backdrop, .heatmap-cell::before { transition: none; }
+        .heatmap-cell:hover::before, .heatmap-cell:focus-visible::before, .heatmap-cell.selected::before { transform: none; }
+      }
     </style>
   </head>
   <body>
@@ -397,10 +462,36 @@
               <span class="usage-plan" id="usage-plan" hidden></span>
             </div>
             <div class="usage-limits" id="usage-limits"></div>
-            <div class="usage-chart-block">
-              <div class="chart-head"><span id="usage-chart-title">Daily tokens · last 30 days</span><span id="usage-chart-sum"></span></div>
-              <svg id="usage-chart" class="usage-chart" viewBox="0 0 640 150" preserveAspectRatio="none" role="img" aria-label="Daily token usage, last 30 days"></svg>
-              <div class="chart-axis" id="usage-chart-axis"></div>
+            <div class="usage-activity" id="usage-activity">
+              <div class="chart-head"><span>Contribution activity · last 30 days</span><span id="usage-chart-sum"></span></div>
+              <div class="activity-layout">
+                <div class="heatmap-region" role="region" aria-label="Daily token contribution heatmap">
+                  <div class="heatmap-shell">
+                    <div class="heatmap-weekdays" aria-hidden="true"><span></span><span>Mon</span><span></span><span>Wed</span><span></span><span>Fri</span><span></span></div>
+                    <div class="usage-heatmap" id="usage-heatmap" role="group" aria-label="Daily token usage for the last 30 days"></div>
+                  </div>
+                  <div class="heatmap-range" id="heatmap-range"></div>
+                  <div class="heatmap-legend" aria-label="Activity intensity from no usage to highest usage">
+                    <span>Less</span><i class="legend-cell" title="No usage"></i><i class="legend-cell level-1" title="Low usage"></i><i class="legend-cell level-2" title="Medium usage"></i><i class="legend-cell level-3" title="High usage"></i><i class="legend-cell level-4" title="Highest usage"></i><span>More</span>
+                  </div>
+                </div>
+                <div class="activity-kpis" aria-label="30-day usage summary">
+                  <div class="activity-kpi"><span>Total tokens</span><strong id="heatmap-total">—</strong></div>
+                  <div class="activity-kpi"><span>Active days</span><strong id="heatmap-active">—</strong></div>
+                  <div class="activity-kpi"><span>Peak day</span><strong id="heatmap-peak">—</strong></div>
+                </div>
+              </div>
+              <div class="usage-day-detail" id="usage-day-detail" aria-live="polite"></div>
+              <details class="usage-data-disclosure">
+                <summary>View accessible daily data table</summary>
+                <div class="usage-table-scroll" tabindex="0" role="region" aria-label="Scrollable daily usage table">
+                  <table class="usage-data-table">
+                    <caption class="sr-only">Daily token usage for the last 30 days</caption>
+                    <thead><tr><th scope="col">Date</th><th scope="col">Total</th><th scope="col">Input</th><th scope="col">Output</th><th scope="col">Cache read</th><th scope="col">Cache write</th></tr></thead>
+                    <tbody id="usage-data-body"></tbody>
+                  </table>
+                </div>
+              </details>
             </div>
             <div class="usage-compose" id="usage-compose" hidden>
               <div class="chart-head"><span>Today's token mix</span><span id="usage-compose-total"></span></div>
@@ -594,6 +685,8 @@
       let current = null;
       let saving = false;
       let devices = [];
+      let heatmapSignature = null;
+      const selectedUsageDate = new Map();
 
       function humanizeTime(isoString) {
         if (!isoString) return "never";
@@ -862,7 +955,7 @@
         document.getElementById("health-extra").textContent = "";
       }
 
-      // --- usage visualizations (limit rings, 30-day bar chart, today's token mix) --------
+      // --- usage visualizations (limit rings, contribution heatmap, today's token mix) ----
       function escapeHtml(value) {
         return String(value).replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
       }
@@ -883,6 +976,121 @@
         ["Input", "todayInputTokens", "#3d8bff"], ["Output", "todayOutputTokens", "#2f9e63"],
         ["Cache read", "todayCacheReadTokens", "#8b5cf6"], ["Cache write", "todayCacheWriteTokens", "#e0982f"],
       ];
+
+      const DAILY_TOKEN_TYPES = [
+        ["Input", "inputTokens", "#3d8bff"], ["Output", "outputTokens", "#2f9e63"],
+        ["Cache read", "cacheReadTokens", "#8b5cf6"], ["Cache write", "cacheCreationTokens", "#e0982f"],
+      ];
+
+      function dateFromKey(key) {
+        const parts = String(key).split("-").map(Number);
+        return new Date(Date.UTC(parts[0], (parts[1] || 1) - 1, parts[2] || 1, 12));
+      }
+
+      function dateKey(date) { return date.toISOString().slice(0, 10); }
+
+      function dayLabel(key, compact = false) {
+        return new Intl.DateTimeFormat(undefined, compact
+          ? { month: "short", day: "numeric", timeZone: "UTC" }
+          : { weekday: "long", month: "long", day: "numeric", year: "numeric", timeZone: "UTC" })
+          .format(dateFromKey(key));
+      }
+
+      function exactTokens(value) {
+        return Math.max(0, Number(value) || 0).toLocaleString(undefined, { maximumFractionDigits: 0 });
+      }
+
+      function normalizeContributionDays(daily) {
+        const byDate = new Map(daily.filter(day => day && day.date).map(day => [String(day.date), day]));
+        const sourceKeys = [...byDate.keys()].sort();
+        const anchor = sourceKeys.length ? dateFromKey(sourceKeys[sourceKeys.length - 1]) : new Date();
+        return Array.from({ length: 30 }, (_, index) => {
+          const date = new Date(anchor);
+          date.setUTCDate(anchor.getUTCDate() - (29 - index));
+          const key = dateKey(date);
+          const source = byDate.get(key) || {};
+          return {
+            date: key,
+            totalTokens: Math.max(0, Number(source.totalTokens) || 0),
+            inputTokens: Math.max(0, Number(source.inputTokens) || 0),
+            outputTokens: Math.max(0, Number(source.outputTokens) || 0),
+            cacheReadTokens: Math.max(0, Number(source.cacheReadTokens) || 0),
+            cacheCreationTokens: Math.max(0, Number(source.cacheCreationTokens) || 0),
+          };
+        });
+      }
+
+      function intensityLevel(value, peak) {
+        if (value <= 0 || peak <= 0) return 0;
+        const ratio = Math.sqrt(value / peak);
+        if (ratio < .38) return 1;
+        if (ratio < .62) return 2;
+        if (ratio < .84) return 3;
+        return 4;
+      }
+
+      function renderDayDetail(providerId, days) {
+        const target = document.getElementById("usage-day-detail");
+        const selected = days.find(day => day.date === selectedUsageDate.get(providerId));
+        if (!selected) {
+          target.innerHTML = `<div class="day-empty"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 10.5v6M12 7.5h.01"/></svg><span>Select a contribution square to inspect that day’s exact token usage.</span></div>`;
+          return;
+        }
+        const breakdown = DAILY_TOKEN_TYPES.map(([label, key, color]) =>
+          `<div class="day-token" style="--token-color:${color}"><span>${label}</span><strong>${exactTokens(selected[key])}</strong></div>`).join("");
+        target.innerHTML = `<div class="day-detail-head"><strong>${escapeHtml(dayLabel(selected.date))}</strong><span>${exactTokens(selected.totalTokens)} tokens</span></div><div class="day-breakdown">${breakdown}</div>`;
+      }
+
+      function renderContributionHeatmap(daily, usage, providerId) {
+        const days = normalizeContributionDays(daily);
+        const total = days.reduce((sum, day) => sum + day.totalTokens, 0);
+        const active = days.filter(day => day.totalTokens > 0).length;
+        const peakDay = days.reduce((peak, day) => day.totalTokens > peak.totalTokens ? day : peak, days[0]);
+        const peak = Math.max(1, peakDay.totalTokens);
+        const cost = usage.last30DaysCostUSD;
+        document.getElementById("usage-chart-sum").textContent =
+          `${formatTokens(total)} total${cost != null ? ` · ~$${Number(cost).toFixed(2)} est.` : ""}`;
+        document.getElementById("heatmap-total").textContent = formatTokens(total);
+        document.getElementById("heatmap-active").textContent = `${active} / 30`;
+        document.getElementById("heatmap-peak").textContent = peakDay.totalTokens > 0 ? formatTokens(peakDay.totalTokens) : "—";
+        document.getElementById("heatmap-range").innerHTML = `<span>${escapeHtml(dayLabel(days[0].date, true))}</span><span>${escapeHtml(dayLabel(days[days.length - 1].date, true))}</span>`;
+
+        const signature = JSON.stringify([providerId, days]);
+        const heatmap = document.getElementById("usage-heatmap");
+        if (signature !== heatmapSignature) {
+          heatmapSignature = signature;
+          const leading = dateFromKey(days[0].date).getUTCDay();
+          const slots = [...Array(leading).fill(null), ...days];
+          while (slots.length % 7) slots.push(null);
+          heatmap.innerHTML = slots.map(day => {
+            if (!day) return `<span class="heatmap-spacer" aria-hidden="true"></span>`;
+            const level = intensityLevel(day.totalTokens, peak);
+            const label = `${dayLabel(day.date)}, ${exactTokens(day.totalTokens)} tokens`;
+            return `<button class="heatmap-cell level-${level}" type="button" data-date="${day.date}" aria-label="${escapeHtml(label)}" aria-pressed="false" title="${escapeHtml(label)} · Click for details"></button>`;
+          }).join("");
+          heatmap.querySelectorAll(".heatmap-cell").forEach(button => {
+            button.addEventListener("click", () => {
+              const date = button.dataset.date;
+              selectedUsageDate.set(providerId, selectedUsageDate.get(providerId) === date ? null : date);
+              heatmap.querySelectorAll(".heatmap-cell").forEach(cell => {
+                const selected = cell.dataset.date === selectedUsageDate.get(providerId);
+                cell.classList.toggle("selected", selected);
+                cell.setAttribute("aria-pressed", String(selected));
+              });
+              renderDayDetail(providerId, days);
+            });
+          });
+        }
+
+        heatmap.querySelectorAll(".heatmap-cell").forEach(cell => {
+          const selected = cell.dataset.date === selectedUsageDate.get(providerId);
+          cell.classList.toggle("selected", selected);
+          cell.setAttribute("aria-pressed", String(selected));
+        });
+        renderDayDetail(providerId, days);
+        document.getElementById("usage-data-body").innerHTML = [...days].reverse().map(day =>
+          `<tr><th scope="row">${escapeHtml(dayLabel(day.date, true))}</th><td>${exactTokens(day.totalTokens)}</td><td>${exactTokens(day.inputTokens)}</td><td>${exactTokens(day.outputTokens)}</td><td>${exactTokens(day.cacheReadTokens)}</td><td>${exactTokens(day.cacheCreationTokens)}</td></tr>`).join("");
+      }
 
       function renderUsage(state) {
         const card = document.getElementById("usage-card");
@@ -917,25 +1125,10 @@
           </div></div>`;
         }).join("");
 
-        const chart = document.getElementById("usage-chart");
-        const block = document.querySelector(".usage-chart-block");
-        const count = daily.length;
-        if (count) {
-          block.hidden = false;
-          const W = 640, H = 150, max = Math.max(1, ...daily.map(day => day.totalTokens || 0));
-          const gap = count > 1 ? 3 : 0, barWidth = (W - gap * (count - 1)) / count;
-          chart.innerHTML = daily.map((day, index) => {
-            const height = Math.max(2, (day.totalTokens || 0) / max * (H - 6));
-            const x = index * (barWidth + gap), today = index === count - 1;
-            const fill = today ? "var(--accent)" : "color-mix(in srgb, var(--accent) 38%, transparent)";
-            return `<rect class="bar" x="${x.toFixed(1)}" y="${(H - height).toFixed(1)}" width="${barWidth.toFixed(1)}" height="${height.toFixed(1)}" rx="1.5" fill="${fill}"><title>${escapeHtml(day.date)}: ${formatTokens(day.totalTokens)}</title></rect>`;
-          }).join("");
-          const sum = daily.reduce((total, day) => total + (day.totalTokens || 0), 0);
-          const cost = usage.last30DaysCostUSD;
-          document.getElementById("usage-chart-sum").textContent =
-            `${formatTokens(sum)} total${cost != null ? ` · ~$${Number(cost).toFixed(2)} est.` : ""}`;
-          document.getElementById("usage-chart-axis").innerHTML = `<span>${escapeHtml(daily[0].date)}</span><span>${escapeHtml(daily[count - 1].date)}</span>`;
-        } else { block.hidden = true; }
+        const activity = document.getElementById("usage-activity");
+        activity.hidden = !daily.length;
+        if (daily.length) renderContributionHeatmap(daily, usage, id);
+        else heatmapSignature = null;
 
         const parts = TOKEN_TYPES.map(([name, key, color]) => ({ name, color, value: usage[key] || 0 }));
         const composeTotal = parts.reduce((total, part) => total + part.value, 0);
