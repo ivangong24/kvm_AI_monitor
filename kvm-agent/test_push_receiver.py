@@ -180,6 +180,25 @@ class PushReceiverTests(unittest.TestCase):
         self.assertFalse(overlay["limitsStale"])
         self.assertEqual(overlay["limits"][0]["usedPercent"], 31)
 
+    def test_a_freshly_measured_reading_outranks_a_replayed_one(self):
+        # The failure this was written for: a Mac whose Claude login died pushes every minute with
+        # no limits, so the receiver replays its last reading — and that replay kept winning the
+        # merge against a second Mac that had just measured a real one.
+        dead = self.store.create("mini")
+        live = self.store.create("laptop")
+        self.receiver.handle_usage(dead, {
+            "schemaVersion": 1, "provider": "claude", "loggedIn": True,
+            "limits": [{"label": "Weekly limit", "usedPercent": 11, "windowMinutes": 10080}]})
+        self.time += 600
+        self.receiver.handle_usage(live, {
+            "schemaVersion": 1, "provider": "claude", "loggedIn": True,
+            "limits": [{"label": "Weekly limit", "usedPercent": 42, "windowMinutes": 10080}]})
+        self.time += 60
+        self.receiver.handle_usage(dead, {"schemaVersion": 1, "provider": "claude", "loggedIn": True})
+        overlay = self.receiver.usage_overlay()["claude"]
+        self.assertEqual(overlay["limits"][0]["usedPercent"], 42)
+        self.assertEqual(overlay["limitsAgeSeconds"], 60)
+
     def test_carried_forward_limits_keep_their_measurement_time(self):
         device = self.store.create("laptop")
         limits = [{"label": "Weekly limit", "usedPercent": 13, "windowMinutes": 10080}]

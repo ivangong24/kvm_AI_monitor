@@ -432,7 +432,13 @@ class PushReceiver:
             # reporting, while the quota bars age from the snapshot the limits themselves came
             # from (which may be an older device, or an older push on the same device).
             newest_epoch = _snapshot_epoch(ordered[-1]) if ordered else None
-            limits_snapshot = next((s for s in reversed(ordered) if s.get("limits")), None)
+            # By measurement time, not arrival time: a device replaying carried-forward limits
+            # pushes them as often as a device that just measured, and must not outrank it.
+            limits_snapshot = max(
+                (s for s in ordered if s.get("limits")),
+                key=lambda s: (_snapshot_epoch(s, "limitsAtEpoch") or 0, _snapshot_epoch(s) or 0),
+                default=None,
+            )
             limits_epoch = _snapshot_epoch(limits_snapshot, "limitsAtEpoch") if limits_snapshot else None
             limits = expire_limits(limits_snapshot.get("limits") if limits_snapshot else [], now)
             totals: dict[str, dict[str, object]] = {}
