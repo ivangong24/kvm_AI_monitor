@@ -211,6 +211,19 @@ class StaleUsageTests(unittest.TestCase):
         self.assertNotIn("usageStale", provider)
         self.assertEqual(provider["limits"][0]["usedPercent"], 78)
 
+    def test_bars_age_from_the_limits_not_from_the_push(self):
+        # A device whose Claude login died keeps pushing every minute with no limits to report, so
+        # the panel's numbers are ancient while the device is plainly online. The bars must age
+        # from the reading they show, not from the last push.
+        provider = self._provider(usageStale=False, usageAgeSeconds=30,
+                                  limitsStale=True, limitsAgeSeconds=6 * 86400)
+        self.assertEqual(agent.age_label(agent.limits_age_seconds(provider)), "6D AGO")
+        self.assertEqual(agent.status_chip_text(provider), "READY")
+        # With nothing pushing at all, the push age is the best available answer.
+        offline = self._provider(usageStale=True, usageAgeSeconds=3600)
+        self.assertEqual(agent.age_label(agent.limits_age_seconds(offline)), "60M AGO")
+        self.assertIsNone(agent.limits_age_seconds(self._provider()))
+
     def test_expired_limit_renders_as_unknown_not_as_a_number(self):
         past = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
         provider = self._provider(limits=[

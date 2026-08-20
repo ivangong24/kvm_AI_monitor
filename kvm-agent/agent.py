@@ -1067,6 +1067,8 @@ def summarize_provider(provider: dict[str, object]) -> dict[str, object]:
         "usageStale": provider.get("usageStale") is True,
         "usageAgeSeconds": provider.get("usageAgeSeconds"),
         "usageLastPushAt": provider.get("usageLastPushAt"),
+        "limitsStale": provider.get("limitsStale") is True,
+        "limitsAgeSeconds": limits_age_seconds(provider),
         "capabilityNote": provider.get("capabilityNote"),
         "installation": installation,
         "authentication": authentication,
@@ -1121,6 +1123,17 @@ def render_setup(draw: ImageDraw.ImageDraw, provider: dict[str, object], theme: 
                            fill=str(theme.get("bar", theme["accent"])))
     draw_text(draw, (218 * s, 136 * s), "MANAGE AT /EXTRAS/AI-USAGE/", label_font,
               str(theme["muted"]), "la")
+
+
+def limits_age_seconds(provider: dict[str, object]) -> object:
+    """Age of the quota numbers on screen, or None while they are current. Prefers the limits'
+    own measurement age over the device's push age: a device can go on pushing long after the
+    reading it carries stopped being refreshed."""
+    if provider.get("limitsStale") is True:
+        return provider.get("limitsAgeSeconds")
+    if provider.get("usageStale") is True:
+        return provider.get("usageAgeSeconds")
+    return None
 
 
 def status_chip_text(provider: dict[str, object]) -> str:
@@ -1316,8 +1329,10 @@ def compose_wallpaper(snapshot: dict[str, object], provider_id: str = "claude",
 
     is_active = provider.get("working") is True
     connection_state = str(provider.get("connectionState", ""))
-    usage_stale = provider.get("usageStale") is True
-    stale_note = age_label(provider.get("usageAgeSeconds")) if usage_stale else None
+    # Two different kinds of old: nothing is pushing at all (chip), or something is still pushing
+    # but its quota reading is ancient — a device whose Claude login died keeps reporting, with no
+    # limits to report. The bars age from the limits, which is the number actually on screen.
+    stale_note = age_label(limits_age_seconds(provider))
     status_text = status_chip_text(provider)
     status_color = str(theme["secondary"]) if is_active else str(theme["muted"])
     # Working-status chip: a rounded pill with a leading dot behind the WORK/READY label, mirroring

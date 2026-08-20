@@ -831,7 +831,9 @@
           setScreenText(`bar${i}-pct`, percent == null ? "--" : `${percent}%`);
           if (fill) fill.setAttribute("width", String(percent == null ? 0 : Math.max(0, Math.min(246, 246 * percent / 100))));
           setScreenText(`bar${i}-window`, limit.windowLabel || "");
-          const staleNote = provider.usageStale === true ? ageLabel(provider.usageAgeSeconds) : null;
+          // limitsAgeSeconds is the age of the numbers on screen (null while they are current):
+          // a device can keep pushing long after its quota reading stopped refreshing.
+          const staleNote = ageLabel(provider.limitsAgeSeconds);
           setScreenText(`bar${i}-reset`, limit.resetLabel ? `RESETS IN ${limit.resetLabel}`
             : (percent == null ? (staleNote || "WAITING FOR DATA") : ""));
         }
@@ -1123,7 +1125,9 @@
 
         const limitsEl = document.getElementById("usage-limits");
         limitsEl.hidden = !limits.length;
-        const staleNote = provider.usageStale === true ? ageLabel(provider.usageAgeSeconds) : null;
+        // limitsAgeSeconds is the age of the numbers on screen (null while they are current):
+        // a device can keep pushing long after its quota reading stopped refreshing.
+        const staleNote = ageLabel(provider.limitsAgeSeconds);
         limitsEl.innerHTML = limits.slice(0, 3).map(limit => {
           const pct = limit.usedPercent;
           const color = pct == null ? "var(--muted)" : bandColor(pct, 70, 90);

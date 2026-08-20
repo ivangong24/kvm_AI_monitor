@@ -312,6 +312,14 @@ class TokenRefreshTests(unittest.TestCase):
             self.assertEqual(helper.claude_access_token(), "fresh")
         refresh.assert_called_once()
 
+    def test_expired_token_is_withheld_when_refresh_fails(self):
+        # A refresh token expires too, and then only a fresh sign-in helps. Handing the caller the
+        # dead access token would just spend a call on the rate-limited usage endpoint.
+        raw = self._creds("stale", int((time.time() - 10) * 1000))
+        with mock.patch("kvm_ai_push.read_claude_credentials", return_value=raw), \
+             mock.patch("kvm_ai_push.refresh_oauth_token", return_value=None):
+            self.assertIsNone(helper.claude_access_token())
+
     def test_refresh_posts_grant_and_persists_rotated_tokens(self):
         raw = self._creds("stale", int((time.time() - 10) * 1000), refresh="old-refresh")
         response = mock.MagicMock()

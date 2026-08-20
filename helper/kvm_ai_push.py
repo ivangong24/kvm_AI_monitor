@@ -567,6 +567,10 @@ def claude_access_token():
         refreshed = refresh_oauth_token(raw)
         if refreshed:
             return refreshed
+        # Refresh failed on a credential we know has expired (a refresh token eventually expires
+        # too, and then only a fresh sign-in helps). Sending the dead token anyway would spend a
+        # request on a rate-limited endpoint to be told what we already know.
+        return None
     token = section.get("accessToken") or section.get("access_token")
     return token if isinstance(token, str) and token else None
 
