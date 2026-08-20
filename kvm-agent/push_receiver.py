@@ -22,6 +22,14 @@ NONCE_TTL_SECONDS = 600
 RATE_LIMIT_WINDOW_SECONDS = 60
 RATE_LIMIT_MAX_REQUESTS = 120
 ACTIVITY_WINDOW_SECONDS = 120
+# A device that stopped pushing (asleep, shut down, helper stopped) leaves its last snapshot
+# behind. Past this many seconds without a push the snapshot is reported as stale so the display
+# can say so instead of presenting frozen numbers as live. Generous enough for the slowest
+# supported push cadence (15 min) to miss two pushes before the screen changes.
+USAGE_STALE_SECONDS = 1800
+# Slack before a limit window counts as ended, so a reset a few seconds away isn't called expired
+# while the next push is still in flight.
+WINDOW_EXPIRY_GRACE_SECONDS = 60
 NONCE_RE = re.compile(r"[0-9a-f]{16,64}")
 SIGNATURE_RE = re.compile(r"[0-9a-f]{64}")
 TIMESTAMP_RE = re.compile(r"[0-9]{1,20}")
@@ -56,6 +64,49 @@ def _valid_iso(value: object, limit: int = 40) -> str | None:
     if not isinstance(value, str) or not ISO_RE.fullmatch(value):
         return None
     return value[:limit]
+
+
+def _iso_epoch(value: object) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _snapshot_epoch(snapshot: dict[str, object], key: str = "receivedAtEpoch") -> float | None:
+    """Epoch of a stored snapshot, falling back to its ISO stamp for state written before the
+    epoch fields existed."""
+    value = _finite(snapshot.get(key))
+    if value is not None:
+        return value
+    return _iso_epoch(snapshot.get("receivedAt"))
+
+
+def expire_limits(limits: object, now: float) -> list[dict[str, object]]:
+    """Strip percentages whose measurement window has already ended.
+
+    A pushed limit describes one window (Claude's 5-hour session, a weekly quota). Once its
+    resetsAt has passed, the counter behind it has rolled over and the last number the device
+    sent no longer describes anything current — it is not merely old, it is wrong. The entry is
+    kept (so the display still shows its title and window) but marked expired with no percentage,
+    which renders as "--" rather than a stale figure.
+    """
+    result: list[dict[str, object]] = []
+    for item in limits if isinstance(limits, list) else []:
+        if not isinstance(item, dict):
+            continue
+        entry = dict(item)
+        resets_at = _iso_epoch(entry.get("resetsAt"))
+        if resets_at is not None and resets_at <= now - WINDOW_EXPIRY_GRACE_SECONDS:
+            entry.pop("usedPercent", None)
+            entry["expired"] = True
+        result.append(entry)
+    return result
 
 
 class DeviceStore:
@@ -302,13 +353,18 @@ class PushReceiver:
                 value = _finite(item.get(key))
                 entry[key] = value if value is not None and value >= 0 else 0
             daily.append(entry)
+        now = self.clock()
+        limits_epoch = now
         if not limits:
             # A device whose limits fetch transiently failed still pushes plan/daily data;
-            # keep the last known limits instead of blanking the display's quota bars.
+            # keep the last known limits instead of blanking the display's quota bars. Their
+            # original measurement time is carried too, so a run of limit-less pushes cannot
+            # make old quota numbers look freshly measured.
             with self.lock:
                 previous = self.usage.get((device["id"], provider))
             if previous and isinstance(previous.get("limits"), list):
                 limits = previous["limits"]
+                limits_epoch = _snapshot_epoch(previous, "limitsAtEpoch") or now
         snapshot = {
             "collectedAt": _valid_iso(body.get("collectedAt")),
             "plan": plan,
@@ -316,7 +372,8 @@ class PushReceiver:
             "limits": limits,
             "daily": daily,
             "receivedAt": _utc_now(),
-            "receivedAtEpoch": self.clock(),
+            "receivedAtEpoch": now,
+            "limitsAtEpoch": limits_epoch,
         }
         with self.lock:
             self.usage[(device["id"], provider)] = snapshot
@@ -359,6 +416,7 @@ class PushReceiver:
         return result
 
     def usage_overlay(self) -> dict[str, dict[str, object] | None]:
+        now = self.clock()
         with self.lock:
             snapshots = dict(self.usage)
         by_provider: dict[str, list[dict[str, object]]] = {}
@@ -370,7 +428,13 @@ class PushReceiver:
                 continue
             ordered = sorted(snaps, key=lambda item: item.get("receivedAtEpoch") or 0)
             plan = next((s.get("plan") for s in reversed(ordered) if s.get("plan")), None)
-            limits = next((s.get("limits") for s in reversed(ordered) if s.get("limits")), [])
+            # Freshness is per-source: the newest push overall says whether any device is still
+            # reporting, while the quota bars age from the snapshot the limits themselves came
+            # from (which may be an older device, or an older push on the same device).
+            newest_epoch = _snapshot_epoch(ordered[-1]) if ordered else None
+            limits_snapshot = next((s for s in reversed(ordered) if s.get("limits")), None)
+            limits_epoch = _snapshot_epoch(limits_snapshot, "limitsAtEpoch") if limits_snapshot else None
+            limits = expire_limits(limits_snapshot.get("limits") if limits_snapshot else [], now)
             totals: dict[str, dict[str, object]] = {}
             for snapshot in snaps:
                 for day in snapshot.get("daily") or []:
@@ -381,11 +445,17 @@ class PushReceiver:
                     })
                     for key in ("totalTokens", "inputTokens", "outputTokens", "cacheReadTokens", "cacheCreationTokens"):
                         bucket[key] += day.get(key) or 0
+            age = max(0.0, now - newest_epoch) if newest_epoch is not None else None
+            limits_age = max(0.0, now - limits_epoch) if limits_epoch is not None else None
             result[provider] = {
                 "plan": plan,
                 "limits": limits,
                 "daily": [totals[key] for key in sorted(totals)],
                 "loggedIn": any(s.get("loggedIn") for s in snaps),
                 "lastPushAt": ordered[-1].get("receivedAt") if ordered else None,
+                "ageSeconds": age,
+                "stale": age is None or age > USAGE_STALE_SECONDS,
+                "limitsAgeSeconds": limits_age,
+                "limitsStale": bool(limits) and (limits_age is None or limits_age > USAGE_STALE_SECONDS),
             }
         return result

@@ -769,10 +769,11 @@
         }
       }
 
-      function buildScreenSVG(id, theme, working) {
+      function buildScreenSVG(id, theme, working, stale) {
         const glyphColor = working ? theme.secondary : theme.muted;
         const statusColor = working ? theme.secondary : theme.muted;
-        const statusText = working ? "WORK" : "READY";
+        // Mirrors the agent's chip: no device has reported in a while, so the panel is history.
+        const statusText = working ? "WORK" : stale ? "OFFLINE" : "READY";
         const brand = PROVIDER_BRAND[id] || { brand: (PROVIDER_LABELS[id] || id).toUpperCase(), sub: "" };
         const pillW = statusText.length * 6.4 + 20;
         const bar = (i, y) => `
@@ -804,6 +805,16 @@
 
       function setScreenText(id, value) { const el = document.getElementById(id); if (el) el.textContent = value; }
 
+      // "18M AGO" — how long ago the last push landed, matching the agent's age_label().
+      function ageLabel(seconds) {
+        if (seconds == null || !isFinite(seconds) || seconds < 0) return null;
+        const minutes = Math.floor(seconds / 60);
+        if (minutes < 1) return "JUST NOW";
+        if (minutes < 120) return `${minutes}M AGO`;
+        const hours = Math.floor(minutes / 60);
+        return hours < 48 ? `${hours}H AGO` : `${Math.floor(hours / 24)}D AGO`;
+      }
+
       function updateScreenValues(id, provider, usage) {
         setScreenText("scr-plan", provider.plan ? String(provider.plan).toUpperCase().slice(0, 14) : "");
         setScreenText("scr-today", formatTokens(usage.todayTokens));
@@ -820,7 +831,9 @@
           setScreenText(`bar${i}-pct`, percent == null ? "--" : `${percent}%`);
           if (fill) fill.setAttribute("width", String(percent == null ? 0 : Math.max(0, Math.min(246, 246 * percent / 100))));
           setScreenText(`bar${i}-window`, limit.windowLabel || "");
-          setScreenText(`bar${i}-reset`, limit.resetLabel ? `RESETS IN ${limit.resetLabel}` : "");
+          const staleNote = provider.usageStale === true ? ageLabel(provider.usageAgeSeconds) : null;
+          setScreenText(`bar${i}-reset`, limit.resetLabel ? `RESETS IN ${limit.resetLabel}`
+            : (percent == null ? (staleNote || "WAITING FOR DATA") : ""));
         }
       }
 
@@ -882,10 +895,11 @@
         const provider = (state.providers || []).find(item => item.id === id) || {};
         const usage = provider.usage || {};
         const working = provider.working === true;
+        const stale = provider.usageStale === true;
         const theme = screenTheme(id);
-        const signature = JSON.stringify([id, working, theme]);
+        const signature = JSON.stringify([id, working, stale, theme]);
         if (signature !== screenSig) {
-          svg.innerHTML = buildScreenSVG(id, theme, working);
+          svg.innerHTML = buildScreenSVG(id, theme, working, stale);
           screenSig = signature;
         }
         updateScreenValues(id, provider, usage);
@@ -1109,13 +1123,17 @@
 
         const limitsEl = document.getElementById("usage-limits");
         limitsEl.hidden = !limits.length;
+        const staleNote = provider.usageStale === true ? ageLabel(provider.usageAgeSeconds) : null;
         limitsEl.innerHTML = limits.slice(0, 3).map(limit => {
           const pct = limit.usedPercent;
           const color = pct == null ? "var(--muted)" : bandColor(pct, 70, 90);
-          // Prefer a live per-second countdown from the reset instant; fall back to the static label.
-          const reset = limit.resetsAt
-            ? `<div class="limit-reset" data-reset="${limit.resetsAt}">${formatCountdown(limit.resetsAt)}</div>`
-            : (limit.resetLabel ? `<div class="limit-reset">Resets in ${escapeHtml(limit.resetLabel)}</div>` : "");
+          // Prefer a live per-second countdown from the reset instant; fall back to the static
+          // label. An expired window has no countdown left to run — it reports its age instead.
+          const reset = limit.expired
+            ? `<div class="limit-reset">Window ended${staleNote ? ` · last push ${staleNote.toLowerCase()}` : ""}</div>`
+            : limit.resetsAt
+              ? `<div class="limit-reset" data-reset="${limit.resetsAt}">${formatCountdown(limit.resetsAt)}</div>`
+              : (limit.resetLabel ? `<div class="limit-reset">Resets in ${escapeHtml(limit.resetLabel)}</div>` : "");
           const proj = projectionText(limit);
           return `<div class="limit-ring">${ringGauge(pct, color)}<div class="limit-meta">
             <div class="limit-name">${escapeHtml(limit.label || "Limit")}</div>

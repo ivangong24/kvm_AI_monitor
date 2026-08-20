@@ -7,6 +7,7 @@ import json
 import os
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest import mock
 
@@ -131,6 +132,93 @@ class PrimaryStorageTests(unittest.TestCase):
              mock.patch("agent.shutil.disk_usage", return_value=SimpleNamespace(total=int(1e9), free=int(5e8))):
             stats = agent.primary_storage_stats()
         self.assertEqual(stats["diskMount"], "/")
+
+
+class StaleUsageTests(unittest.TestCase):
+    """What the screen says once the enrolled device stops reporting: the frozen snapshot must
+    read as history, and any quota whose window has since rolled over must stop showing a number."""
+
+    def _provider(self, **overrides):
+        provider = {"id": "claude", "name": "Claude Code", "connectionState": "ready",
+                    "limits": [], "activity": {}}
+        provider.update(overrides)
+        return provider
+
+    def test_chip_reports_offline_when_no_device_has_pushed_recently(self):
+        self.assertEqual(agent.status_chip_text(self._provider()), "READY")
+        self.assertEqual(agent.status_chip_text(self._provider(usageStale=True)), "OFFLINE")
+        # A device that is working is by definition reporting; setup states still win.
+        self.assertEqual(agent.status_chip_text(self._provider(usageStale=True, working=True)), "WORK")
+        self.assertEqual(
+            agent.status_chip_text(self._provider(usageStale=True, connectionState="not_installed")),
+            "SETUP")
+
+    def test_reset_label_stops_counting_down_to_a_moment_already_past(self):
+        now = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+        self.assertEqual(agent.reset_label((now + timedelta(hours=3)).isoformat(), now), "RESETS IN 3H")
+        self.assertEqual(agent.reset_label((now - timedelta(hours=3)).isoformat(), now), "WAITING FOR DATA")
+        self.assertEqual(agent.short_reset((now - timedelta(hours=3)).isoformat()), "--")
+
+    def test_age_label_wording(self):
+        self.assertEqual(agent.age_label(30), "JUST NOW")
+        self.assertEqual(agent.age_label(18 * 60), "18M AGO")
+        self.assertEqual(agent.age_label(5 * 3600), "5H AGO")
+        self.assertEqual(agent.age_label(3 * 86400), "3D AGO")
+        self.assertIsNone(agent.age_label(None))
+
+    def test_overlay_carries_freshness_onto_the_provider(self):
+        snapshot = {"providers": [self._provider()]}
+        agent.Agent.apply_usage_overlay(snapshot, {"claude": {
+            "plan": "Max", "limits": [{"label": "Weekly limit", "usedPercent": 20}], "daily": [],
+            "loggedIn": True, "stale": True, "ageSeconds": 7200,
+            "lastPushAt": "2026-08-20T10:00:00Z", "limitsStale": True, "limitsAgeSeconds": 7200,
+        }})
+        provider = snapshot["providers"][0]
+        self.assertTrue(provider["usageStale"])
+        self.assertEqual(provider["usageAgeSeconds"], 7200)
+        self.assertEqual(agent.status_chip_text(provider), "OFFLINE")
+        self.assertTrue(agent.summarize_provider(provider)["usageStale"])
+
+    def _stale_republish(self, minutes_since_success, limit):
+        """Drive Agent.republish_as_stale() against a stub instance (a real Agent needs the KVM)."""
+        import threading
+        provider = self._provider(limits=[limit])
+        stub = SimpleNamespace(
+            lock=threading.Lock(),
+            snapshot={"providers": [provider]},
+            state={"lastSuccessAt": (datetime.now(timezone.utc)
+                                     - timedelta(minutes=minutes_since_success)).isoformat()},
+            republished=False,
+        )
+        stub.republish = lambda: setattr(stub, "republished", True)
+        agent.Agent.republish_as_stale(stub)
+        return stub, provider
+
+    def test_unreachable_device_redraws_its_last_reading_as_history(self):
+        past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+        stub, provider = self._stale_republish(180, {
+            "label": "Current session", "usedPercent": 78, "windowMinutes": 300, "resetsAt": past})
+        self.assertTrue(stub.republished)
+        self.assertTrue(provider["usageStale"])
+        self.assertEqual(agent.status_chip_text(provider), "OFFLINE")
+        self.assertNotIn("usedPercent", provider["limits"][0])
+
+    def test_a_brief_outage_is_not_yet_stale(self):
+        future = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+        stub, provider = self._stale_republish(5, {
+            "label": "Current session", "usedPercent": 78, "windowMinutes": 300, "resetsAt": future})
+        self.assertFalse(stub.republished)
+        self.assertNotIn("usageStale", provider)
+        self.assertEqual(provider["limits"][0]["usedPercent"], 78)
+
+    def test_expired_limit_renders_as_unknown_not_as_a_number(self):
+        past = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+        provider = self._provider(limits=[
+            {"label": "Current session", "windowMinutes": 300, "resetsAt": past, "expired": True}])
+        limit = agent.summarize_usage(provider)["limits"][0]
+        self.assertIsNone(limit["usedPercent"])
+        self.assertIsNone(limit["resetLabel"])
+        self.assertTrue(limit["expired"])
 
 
 if __name__ == "__main__":

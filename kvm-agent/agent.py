@@ -27,7 +27,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from PIL import Image, ImageColor, ImageDraw, ImageFont
-from push_receiver import DeviceStore, PushReceiver
+from push_receiver import (
+    USAGE_STALE_SECONDS,
+    WINDOW_EXPIRY_GRACE_SECONDS,
+    DeviceStore,
+    PushReceiver,
+    expire_limits,
+)
 from ssh_collector import SshCollector, build_usage_snapshot
 
 
@@ -493,15 +499,37 @@ def compact_number(value: object) -> str:
 
 def reset_label(value: object, now: datetime | None = None) -> str:
     reset = parse_timestamp(value)
+    current = now or datetime.now(timezone.utc)
     if reset is None:
         return "WAITING FOR DATA"
-    current = now or datetime.now(timezone.utc)
+    if (current - reset).total_seconds() > WINDOW_EXPIRY_GRACE_SECONDS:
+        # The window this reset belonged to has ended and no device has reported the new one,
+        # so counting down to a moment already past would be fiction.
+        return "WAITING FOR DATA"
     minutes = max(0, round((reset - current).total_seconds() / 60))
     if minutes >= 2880:
         return f"RESETS IN {round(minutes / 1440)}D"
     if minutes >= 120:
         return f"RESETS IN {round(minutes / 60)}H"
     return f"RESETS IN {minutes}M"
+
+
+def age_label(seconds: object) -> str | None:
+    """How long ago a reading was taken, e.g. "18M AGO" — shown when the reporting device has
+    gone quiet, so a frozen panel reads as history instead of as the current state."""
+    try:
+        total = float(seconds)
+    except (TypeError, ValueError):
+        return None
+    if total != total or total < 0:
+        return None
+    minutes = int(total // 60)
+    if minutes < 1:
+        return "JUST NOW"
+    if minutes < 120:
+        return f"{minutes}M AGO"
+    hours = minutes // 60
+    return f"{hours}H AGO" if hours < 48 else f"{hours // 24}D AGO"
 
 
 def window_label(limit: dict[str, object] | None, fallback: str) -> str:
@@ -691,12 +719,17 @@ def widget_limit_bar(draw, image, rect, ctx, theme, s, options):
         bar_color = blend_color(bar_color, str(theme["background"]), 0.62)
     percent, has_percent = limit_percent(limit)
     resets_at = limit.get("resetsAt") if limit else None
+    # With no reporting device the numbers stop being current; say when they were last measured
+    # rather than counting down to a reset nobody can confirm.
+    no_data = str(ctx.get("staleNote") or "WAITING FOR DATA")
     if ctx["emphasis"] == "time":
         hero_value = short_reset(resets_at)
-        footer_right = f"{round(percent)}% USED" if has_percent else "WAITING FOR DATA"
+        footer_right = f"{round(percent)}% USED" if has_percent else no_data
     else:
         hero_value = f"{round(percent)}%" if has_percent else "--"
         footer_right = reset_label(resets_at)
+        if footer_right == "WAITING FOR DATA":
+            footer_right = no_data
     x, y, w = rect["x"], rect["y"], rect["w"]
     x1 = x + w
     draw_text(draw, (x * s, (y + 6) * s), title, load_font(FONT_UI_SEMIBOLD, 11 * s),
@@ -801,7 +834,8 @@ def widget_reset_countdown(draw, image, rect, ctx, theme, s, options):
     hero = short_reset(limit.get("resetsAt") if limit else None)
     draw_text(draw, (x * s, (y + 20) * s), hero, load_font(FONT_UI_DISPLAY, 26 * s),
               str(theme.get("bar", theme["accent"])), "la")
-    footer = f"{round(percent)}% USED" if has_percent else "WAITING FOR DATA"
+    footer = (f"{round(percent)}% USED" if has_percent
+              else str(ctx.get("staleNote") or "WAITING FOR DATA"))
     draw_text(draw, (x * s, (y + 51) * s), footer, load_font(FONT_UI_MEDIUM, 9 * s),
               str(theme["muted"]), "la")
 
@@ -971,13 +1005,16 @@ def summarize_usage(provider: dict[str, object]) -> dict[str, object]:
         percent, has_percent = limit_percent(item)
         window = window_label(item, "")
         window_minutes = item.get("windowMinutes")
+        # An elapsed reset is not a countdown any more, so the console gets no label to render.
+        reset_text = short_reset(item.get("resetsAt")) if item.get("resetsAt") else None
         limits.append({
             "label": item.get("label"),
             "usedPercent": round(percent) if has_percent else None,
             "windowLabel": window or None,
             "windowMinutes": int(window_minutes) if isinstance(window_minutes, (int, float)) else None,
             "resetsAt": item.get("resetsAt"),
-            "resetLabel": short_reset(item.get("resetsAt")) if item.get("resetsAt") else None,
+            "resetLabel": reset_text if reset_text and reset_text != "--" else None,
+            "expired": item.get("expired") is True,
         })
     activity = provider.get("activity") if isinstance(provider.get("activity"), dict) else {}
     today = activity.get("today") if isinstance(activity.get("today"), dict) else {}
@@ -1027,6 +1064,9 @@ def summarize_provider(provider: dict[str, object]) -> dict[str, object]:
         "deviceWorking": provider.get("deviceWorking") is True,
         "authorizedDeviceWorking": provider.get("authorizedDeviceWorking") is True,
         "activityState": provider.get("activityState", "standby"),
+        "usageStale": provider.get("usageStale") is True,
+        "usageAgeSeconds": provider.get("usageAgeSeconds"),
+        "usageLastPushAt": provider.get("usageLastPushAt"),
         "capabilityNote": provider.get("capabilityNote"),
         "installation": installation,
         "authentication": authentication,
@@ -1081,6 +1121,19 @@ def render_setup(draw: ImageDraw.ImageDraw, provider: dict[str, object], theme: 
                            fill=str(theme.get("bar", theme["accent"])))
     draw_text(draw, (218 * s, 136 * s), "MANAGE AT /EXTRAS/AI-USAGE/", label_font,
               str(theme["muted"]), "la")
+
+
+def status_chip_text(provider: dict[str, object]) -> str:
+    """Header chip wording. OFFLINE means no device has reported recently: the panel below is the
+    last known reading, not the live state, and saying READY there would be a quiet lie."""
+    connection_state = str(provider.get("connectionState", ""))
+    if connection_state and connection_state != "ready":
+        return "SETUP" if connection_state == "not_installed" else "CHECK"
+    if provider.get("working") is True:
+        return "WORK"
+    if provider.get("usageStale") is True:
+        return "OFFLINE"
+    return "READY"
 
 
 def usage_panel_visible(provider: dict[str, object], limits: list[object]) -> bool:
@@ -1263,10 +1316,9 @@ def compose_wallpaper(snapshot: dict[str, object], provider_id: str = "claude",
 
     is_active = provider.get("working") is True
     connection_state = str(provider.get("connectionState", ""))
-    if connection_state and connection_state != "ready":
-        status_text = "SETUP" if connection_state == "not_installed" else "CHECK"
-    else:
-        status_text = "WORK" if is_active else "READY"
+    usage_stale = provider.get("usageStale") is True
+    stale_note = age_label(provider.get("usageAgeSeconds")) if usage_stale else None
+    status_text = status_chip_text(provider)
     status_color = str(theme["secondary"]) if is_active else str(theme["muted"])
     # Working-status chip: a rounded pill with a leading dot behind the WORK/READY label, mirroring
     # the web console's live-view design so the two surfaces match.
@@ -1292,7 +1344,7 @@ def compose_wallpaper(snapshot: dict[str, object], provider_id: str = "claude",
     if usage_panel_visible(provider, limits):
         ctx = {"provider": provider, "activity": activity, "today": today,
                "limits": limits, "by_label": by_label, "snapshot": snapshot,
-               "emphasis": emphasis}
+               "emphasis": emphasis, "staleNote": stale_note}
         layout = resolve_layout(layout_override if layout_override is not None else LAYOUT)
         if layout.get("divider"):
             draw.line((204 * s, 14 * s, 204 * s, 146 * s), fill=str(theme["line"]), width=s)
@@ -1575,6 +1627,10 @@ class Agent:
             if collect_error and not has_usage:
                 with self.lock:
                     self.state.update({"deviceOnline": False, "lastError": collect_error})
+                # The collected device is unreachable and nothing pushed in its place. The last
+                # wallpaper stays up, but it is redrawn as history rather than left claiming to
+                # be live.
+                self.republish_as_stale()
                 return self.status()
             try:
                 # Compose and pre-render frames outside refresh_lock: the snapshot is still
@@ -1670,6 +1726,13 @@ class Agent:
             if pushed.get("limits"):
                 provider["limits"] = pushed["limits"]
                 provider["exactSubscriptionUsage"] = True
+            # Freshness travels with the data: everything downstream (wallpaper, /api/status,
+            # the web console) reads these instead of assuming a snapshot is current.
+            provider["usageStale"] = pushed.get("stale") is True
+            provider["usageAgeSeconds"] = pushed.get("ageSeconds")
+            provider["usageLastPushAt"] = pushed.get("lastPushAt")
+            provider["limitsStale"] = pushed.get("limitsStale") is True
+            provider["limitsAgeSeconds"] = pushed.get("limitsAgeSeconds")
             daily = pushed.get("daily")
             if daily:
                 today = next((day for day in daily if day.get("date") == today_key), {
@@ -1699,6 +1762,36 @@ class Agent:
                 provider["connectionState"] = "ready"
                 provider["source"] = "Device helper push"
                 provider["usageAvailable"] = True
+
+    def republish_as_stale(self) -> None:
+        """Redraw the last snapshot as history after a failed collection.
+
+        Nothing new can be measured, so the numbers stand — but they are aged: the chip turns
+        OFFLINE, footers report when the reading was taken, and any quota window that has since
+        ended stops showing a percentage."""
+        with self.lock:
+            snapshot = self.snapshot
+            last_success = self.state.get("lastSuccessAt")
+        if not snapshot:
+            return
+        collected = parse_timestamp(last_success) or parse_timestamp(snapshot.get("generatedAt"))
+        age = ((datetime.now(timezone.utc) - collected).total_seconds()
+               if collected else USAGE_STALE_SECONDS)
+        if age <= USAGE_STALE_SECONDS:
+            return  # Still within the freshness window: a brief outage is not yet stale.
+        now = time.time()
+        with self.lock:
+            for provider in snapshot.get("providers", []):
+                if not isinstance(provider, dict):
+                    continue
+                provider["usageStale"] = True
+                provider["usageAgeSeconds"] = age
+                provider["limits"] = expire_limits(provider.get("limits"), now)
+            self.state["providers"] = [
+                summarize_provider(provider) for provider in snapshot.get("providers", [])
+                if isinstance(provider, dict) and provider.get("id") in PROVIDER_IDS
+            ]
+        self.republish()
 
     def republish(self) -> None:
         """Re-render and publish the wallpaper with the currently applied theme."""

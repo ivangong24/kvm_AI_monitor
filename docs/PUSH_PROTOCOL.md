@@ -164,7 +164,18 @@ Storage: latest accepted snapshot per (device, provider) is persisted atomically
      `connectionState` becomes `ready` and `source` becomes `"Device helper push"`.
 3. **Degraded rendering**: `verification_required` with local token totals available renders the
    normal usage panel (status text stays `CHECK`), not the setup screen.
-4. Last successful aggregates are retained when a device goes offline; only working state expires.
+4. Last successful aggregates are retained when a device goes offline, but they are never
+   presented as current:
+   - **Freshness**: the overlay reports `ageSeconds` / `stale` from the newest push for the
+     provider, and `limitsAgeSeconds` / `limitsStale` from the push the `limits` were measured in
+     (a limit-less push that carries limits forward keeps the original measurement time). Past
+     `USAGE_STALE_SECONDS` (30 min) the status chip reads `OFFLINE` instead of `READY` and the
+     quota footers show the reading's age ("5H AGO").
+   - **Expired windows**: once a limit's `resetsAt` has passed (60 s grace) the counter behind it
+     has rolled over, so the entry is marked `expired` and its `usedPercent` is dropped — the bar
+     renders empty at `--` rather than repeating a number that no longer describes any window. A
+     limit whose window is still open (e.g. weekly) keeps its percentage.
+   - Working state still expires on its own after 120 s.
 
 ## Admin API (behind the existing Comet-authenticated location)
 

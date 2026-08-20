@@ -5,7 +5,7 @@ import hmac
 import json
 import tempfile
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from push_receiver import DeviceStore, PushReceiver
@@ -117,6 +117,82 @@ class PushReceiverTests(unittest.TestCase):
         self.assertTrue(self.receiver.handle_usage(
             device, {"schemaVersion": 1, "provider": "claude", "loggedIn": True}))
         overlay = self.receiver.usage_overlay()["claude"]
+        self.assertEqual(overlay["limits"][0]["usedPercent"], 13)
+
+    def iso(self, offset_seconds: float) -> str:
+        return datetime.fromtimestamp(self.time + offset_seconds, timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def test_expired_limit_window_drops_its_percentage(self):
+        device = self.store.create("laptop")
+        self.receiver.handle_usage(device, {
+            "schemaVersion": 1, "provider": "claude", "loggedIn": True,
+            "limits": [
+                {"label": "Current session", "usedPercent": 78, "windowMinutes": 300,
+                 "resetsAt": self.iso(600)},
+                {"label": "Weekly limit", "usedPercent": 41, "windowMinutes": 10080,
+                 "resetsAt": self.iso(86400)},
+            ],
+        })
+        session, weekly = self.receiver.usage_overlay()["claude"]["limits"]
+        self.assertEqual(session["usedPercent"], 78)
+        self.assertFalse(session.get("expired"))
+        # The device goes off; its session window ends while nothing is reporting.
+        self.time += 3600
+        session, weekly = self.receiver.usage_overlay()["claude"]["limits"]
+        self.assertNotIn("usedPercent", session)
+        self.assertTrue(session["expired"])
+        self.assertEqual(session["label"], "Current session")
+        # The weekly window has not rolled over, so its number still stands.
+        self.assertEqual(weekly["usedPercent"], 41)
+        self.assertFalse(weekly.get("expired"))
+
+    def test_overlay_reports_age_and_staleness(self):
+        device = self.store.create("laptop")
+        self.receiver.handle_usage(device, {
+            "schemaVersion": 1, "provider": "claude", "loggedIn": True,
+            "limits": [{"label": "Weekly limit", "usedPercent": 20, "windowMinutes": 10080}],
+        })
+        overlay = self.receiver.usage_overlay()["claude"]
+        self.assertFalse(overlay["stale"])
+        self.assertEqual(overlay["ageSeconds"], 0)
+        self.time += 1799
+        self.assertFalse(self.receiver.usage_overlay()["claude"]["stale"])
+        self.time += 2
+        overlay = self.receiver.usage_overlay()["claude"]
+        self.assertTrue(overlay["stale"])
+        self.assertTrue(overlay["limitsStale"])
+        self.assertEqual(overlay["ageSeconds"], 1801)
+
+    def test_a_live_device_keeps_the_provider_fresh(self):
+        offline = self.store.create("laptop")
+        live = self.store.create("mini")
+        self.receiver.handle_usage(offline, {
+            "schemaVersion": 1, "provider": "claude", "loggedIn": True,
+            "limits": [{"label": "Weekly limit", "usedPercent": 20, "windowMinutes": 10080}],
+        })
+        self.time += 7200
+        self.receiver.handle_usage(live, {
+            "schemaVersion": 1, "provider": "claude", "loggedIn": True,
+            "limits": [{"label": "Weekly limit", "usedPercent": 31, "windowMinutes": 10080}],
+        })
+        overlay = self.receiver.usage_overlay()["claude"]
+        self.assertFalse(overlay["stale"])
+        self.assertFalse(overlay["limitsStale"])
+        self.assertEqual(overlay["limits"][0]["usedPercent"], 31)
+
+    def test_carried_forward_limits_keep_their_measurement_time(self):
+        device = self.store.create("laptop")
+        limits = [{"label": "Weekly limit", "usedPercent": 13, "windowMinutes": 10080}]
+        self.receiver.handle_usage(
+            device, {"schemaVersion": 1, "provider": "claude", "loggedIn": True, "limits": limits})
+        self.time += 3600
+        # Still pushing, but the limits fetch keeps failing: the device is live, the quota is not.
+        self.receiver.handle_usage(
+            device, {"schemaVersion": 1, "provider": "claude", "loggedIn": True})
+        overlay = self.receiver.usage_overlay()["claude"]
+        self.assertFalse(overlay["stale"])
+        self.assertTrue(overlay["limitsStale"])
+        self.assertEqual(overlay["limitsAgeSeconds"], 3600)
         self.assertEqual(overlay["limits"][0]["usedPercent"], 13)
 
     def test_daily_date_window_filtering(self):

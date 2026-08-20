@@ -28,6 +28,7 @@ jobs:
           python -m pip install --quiet pillow  # the Comet firmware ships Pillow for the renderer
           python kvm-agent/test_push_receiver.py
           python kvm-agent/test_ssh_collector.py
+          python kvm-agent/test_agent.py
       - name: Node tests (Comet client, CLI, cross-language HMAC vector)
         run: npm test
       - name: Shell syntax checks
